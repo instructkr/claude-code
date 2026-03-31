@@ -260,4 +260,4 @@ const DEFAULT_BACKOFF: BackoffConfig = {
 
 - [컨텍스트 압축 & 토큰 관리](./context-compression.md)
 - [인증 흐름 분석 (OAuth 2.0)](./oauth-auth.md)
-- [Level 2: 아키텍처 개요](../level-2-architecture/)
+- [Level 2: 아키텍처 개요](../level-1-overview/architecture.md)

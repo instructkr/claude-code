@@ -315,13 +315,13 @@ SDK(`QueryEngine`) 경로에서는 모든 처리 완료 후 다음 형식의 최
 
 | 단계 | 주제 | Level 2 문서 |
 |---|---|---|
-| 단계 1 | CLI 부트스트랩 및 기동 시퀀스 | [CLI 부트스트랩 상세](../level-2-components/cli-bootstrap.md) |
-| 단계 2 | 입력 처리 및 슬래시 커맨드 | [입력 처리 상세](../level-2-components/input-processing.md) |
-| 단계 3 | 컨텍스트 수집 및 시스템 프롬프트 | [컨텍스트 수집 상세](../level-2-components/context-collection.md) |
-| 단계 4 | QueryEngine 및 LLM 통신 | [QueryEngine 상세](../level-2-components/query-engine.md) |
-| 단계 5 | 도구 권한 및 실행 | [Tool 실행 상세](../level-2-components/tool-execution.md) |
-| 단계 6 | 에이전트 루프 제어 | [에이전트 루프 상세](../level-2-components/agent-loop.md) |
-| 단계 7 | Ink 렌더링 파이프라인 | [렌더링 상세](../level-2-components/rendering.md) |
+| 단계 1 | CLI 부트스트랩 및 기동 시퀀스 | [CLI 부트스트랩 상세](../level-2-systems/query-engine.md) |
+| 단계 2 | 입력 처리 및 슬래시 커맨드 | [입력 처리 상세](../level-2-systems/command-system.md) |
+| 단계 3 | 컨텍스트 수집 및 시스템 프롬프트 | [컨텍스트 수집 상세](../level-3-internals/context-compression.md) |
+| 단계 4 | QueryEngine 및 LLM 통신 | [QueryEngine 상세](../level-2-systems/query-engine.md) |
+| 단계 5 | 도구 권한 및 실행 | [Tool 실행 상세](../level-2-systems/tool-system.md) |
+| 단계 6 | 에이전트 루프 제어 | [에이전트 루프 상세](../level-2-systems/agent-coordinator.md) |
+| 단계 7 | Ink 렌더링 파이프라인 | [렌더링 상세](../level-2-systems/ui-ink-components.md) |
 
 ---
 

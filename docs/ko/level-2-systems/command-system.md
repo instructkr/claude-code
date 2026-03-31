@@ -456,4 +456,4 @@ function findCommand(commandName: string, commands: Command[]): Command | undefi
 
 - 이전: [Tool 시스템: 도구 레지스트리 & 실행 파이프라인](./tool-system.md)
 - 다음: [권한 시스템: 도구 실행 승인 흐름](./permission-system.md)
-- 상위: [Level 2 시스템 분석 목록](../index.md)
+- 상위: [Level 2 시스템 분석 목록](../README.md)
