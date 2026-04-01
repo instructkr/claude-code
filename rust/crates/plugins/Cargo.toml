@@ -1,19 +1,13 @@
 [package]
-name = "runtime"
+name = "plugins"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
 publish.workspace = true
 
 [dependencies]
-sha2 = "0.10"
-glob = "0.3"
-plugins = { path = "../plugins" }
-regex = "1"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
-tokio = { version = "1", features = ["io-util", "macros", "process", "rt", "rt-multi-thread", "time"] }
-walkdir = "2"
 
 [lints]
 workspace = true

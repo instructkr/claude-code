@@ -1,11 +1,13 @@
 use std::collections::BTreeMap;
 use std::fmt::{Display, Formatter};
 
+use plugins::{HookRunner as PluginHookRunner, PluginRegistry};
+
 use crate::compact::{
     compact_session, estimate_session_tokens, CompactionConfig, CompactionResult,
 };
 use crate::config::RuntimeFeatureConfig;
-use crate::hooks::{HookRunResult, HookRunner};
+use crate::hooks::HookRunner;
 use crate::permissions::{PermissionOutcome, PermissionPolicy, PermissionPrompter};
 use crate::session::{ContentBlock, ConversationMessage, Session};
 use crate::usage::{TokenUsage, UsageTracker};
@@ -107,6 +109,24 @@ pub struct ConversationRuntime<C, T> {
     usage_tracker: UsageTracker,
     hook_runner: HookRunner,
     auto_compaction_input_tokens_threshold: u32,
+    plugin_hook_runner: Option<PluginHookRunner>,
+    plugin_registry: Option<PluginRegistry>,
+    plugins_shutdown: bool,
+}
+
+impl<C, T> ConversationRuntime<C, T> {
+    fn shutdown_registered_plugins(&mut self) -> Result<(), RuntimeError> {
+        if self.plugins_shutdown {
+            return Ok(());
+        }
+        if let Some(registry) = &self.plugin_registry {
+            registry
+                .shutdown()
+                .map_err(|error| RuntimeError::new(format!("plugin shutdown failed: {error}")))?;
+        }
+        self.plugins_shutdown = true;
+        Ok(())
+    }
 }
 
 impl<C, T> ConversationRuntime<C, T>
@@ -133,6 +153,7 @@ where
     }
 
     #[must_use]
+    #[allow(clippy::needless_pass_by_value)]
     pub fn new_with_features(
         session: Session,
         api_client: C,
@@ -152,7 +173,40 @@ where
             usage_tracker,
             hook_runner: HookRunner::from_feature_config(&feature_config),
             auto_compaction_input_tokens_threshold: auto_compaction_threshold_from_env(),
+            plugin_hook_runner: None,
+            plugin_registry: None,
+            plugins_shutdown: false,
         }
+    }
+
+    #[allow(clippy::needless_pass_by_value)]
+    pub fn new_with_plugins(
+        session: Session,
+        api_client: C,
+        tool_executor: T,
+        permission_policy: PermissionPolicy,
+        system_prompt: Vec<String>,
+        feature_config: RuntimeFeatureConfig,
+        plugin_registry: PluginRegistry,
+    ) -> Result<Self, RuntimeError> {
+        let plugin_hook_runner =
+            PluginHookRunner::from_registry(&plugin_registry).map_err(|error| {
+                RuntimeError::new(format!("plugin hook registration failed: {error}"))
+            })?;
+        plugin_registry
+            .initialize()
+            .map_err(|error| RuntimeError::new(format!("plugin initialization failed: {error}")))?;
+        let mut runtime = Self::new_with_features(
+            session,
+            api_client,
+            tool_executor,
+            permission_policy,
+            system_prompt,
+            feature_config,
+        );
+        runtime.plugin_hook_runner = Some(plugin_hook_runner);
+        runtime.plugin_registry = Some(plugin_registry);
+        Ok(runtime)
     }
 
     #[must_use]
@@ -167,6 +221,7 @@ where
         self
     }
 
+    #[allow(clippy::too_many_lines)]
     pub fn run_turn(
         &mut self,
         user_input: impl Into<String>,
@@ -179,6 +234,7 @@ where
         let mut assistant_messages = Vec::new();
         let mut tool_results = Vec::new();
         let mut iterations = 0;
+        let mut max_turn_input_tokens = 0;
 
         loop {
             iterations += 1;
@@ -195,6 +251,7 @@ where
             let events = self.api_client.stream(request)?;
             let (assistant_message, usage) = build_assistant_message(events)?;
             if let Some(usage) = usage {
+                max_turn_input_tokens = max_turn_input_tokens.max(usage.input_tokens);
                 self.usage_tracker.record(usage);
             }
             let pending_tool_uses = assistant_message
@@ -231,35 +288,74 @@ where
                             ConversationMessage::tool_result(
                                 tool_use_id,
                                 tool_name,
-                                format_hook_message(&pre_hook_result, &deny_message),
+                                format_hook_message(pre_hook_result.messages(), &deny_message),
                                 true,
                             )
                         } else {
-                            let (mut output, mut is_error) =
-                                match self.tool_executor.execute(&tool_name, &input) {
-                                    Ok(output) => (output, false),
-                                    Err(error) => (error.to_string(), true),
-                                };
-                            output = merge_hook_feedback(pre_hook_result.messages(), output, false);
+                            let plugin_pre_hook_result =
+                                self.run_plugin_pre_tool_use(&tool_name, &input);
+                            if plugin_pre_hook_result.is_denied() {
+                                let deny_message =
+                                    format!("PreToolUse hook denied tool `{tool_name}`");
+                                let mut messages = pre_hook_result.messages().to_vec();
+                                messages.extend(plugin_pre_hook_result.messages().iter().cloned());
+                                ConversationMessage::tool_result(
+                                    tool_use_id,
+                                    tool_name,
+                                    format_hook_message(&messages, &deny_message),
+                                    true,
+                                )
+                            } else {
+                                let (mut output, mut is_error) =
+                                    match self.tool_executor.execute(&tool_name, &input) {
+                                        Ok(output) => (output, false),
+                                        Err(error) => (error.to_string(), true),
+                                    };
+                                output =
+                                    merge_hook_feedback(pre_hook_result.messages(), output, false);
+                                output = merge_hook_feedback(
+                                    plugin_pre_hook_result.messages(),
+                                    output,
+                                    false,
+                                );
 
-                            let post_hook_result = self
-                                .hook_runner
-                                .run_post_tool_use(&tool_name, &input, &output, is_error);
-                            if post_hook_result.is_denied() {
-                                is_error = true;
+                                let hook_output = output.clone();
+                                let post_hook_result = self.hook_runner.run_post_tool_use(
+                                    &tool_name,
+                                    &input,
+                                    &hook_output,
+                                    is_error,
+                                );
+                                let plugin_post_hook_result = self.run_plugin_post_tool_use(
+                                    &tool_name,
+                                    &input,
+                                    &hook_output,
+                                    is_error,
+                                );
+                                if post_hook_result.is_denied() {
+                                    is_error = true;
+                                }
+                                if plugin_post_hook_result.is_denied() {
+                                    is_error = true;
+                                }
+                                output = merge_hook_feedback(
+                                    post_hook_result.messages(),
+                                    output,
+                                    post_hook_result.is_denied(),
+                                );
+                                output = merge_hook_feedback(
+                                    plugin_post_hook_result.messages(),
+                                    output,
+                                    plugin_post_hook_result.is_denied(),
+                                );
+
+                                ConversationMessage::tool_result(
+                                    tool_use_id,
+                                    tool_name,
+                                    output,
+                                    is_error,
+                                )
                             }
-                            output = merge_hook_feedback(
-                                post_hook_result.messages(),
-                                output,
-                                post_hook_result.is_denied(),
-                            );
-
-                            ConversationMessage::tool_result(
-                                tool_use_id,
-                                tool_name,
-                                output,
-                                is_error,
-                            )
                         }
                     }
                     PermissionOutcome::Deny { reason } => {
@@ -271,7 +367,7 @@ where
             }
         }
 
-        let auto_compaction = self.maybe_auto_compact();
+        let auto_compaction = self.maybe_auto_compact(max_turn_input_tokens);
 
         Ok(TurnSummary {
             assistant_messages,
@@ -303,21 +399,45 @@ where
     }
 
     #[must_use]
-    pub fn into_session(self) -> Session {
-        self.session
+    pub fn into_session(mut self) -> Session {
+        let _ = self.shutdown_registered_plugins();
+        std::mem::take(&mut self.session)
     }
 
-    fn maybe_auto_compact(&mut self) -> Option<AutoCompactionEvent> {
-        if self.usage_tracker.cumulative_usage().input_tokens
-            < self.auto_compaction_input_tokens_threshold
-        {
+    pub fn shutdown_plugins(&mut self) -> Result<(), RuntimeError> {
+        self.shutdown_registered_plugins()
+    }
+
+    fn run_plugin_pre_tool_use(&self, tool_name: &str, input: &str) -> plugins::HookRunResult {
+        self.plugin_hook_runner.as_ref().map_or_else(
+            || plugins::HookRunResult::allow(Vec::new()),
+            |runner| runner.run_pre_tool_use(tool_name, input),
+        )
+    }
+
+    fn run_plugin_post_tool_use(
+        &self,
+        tool_name: &str,
+        input: &str,
+        output: &str,
+        is_error: bool,
+    ) -> plugins::HookRunResult {
+        self.plugin_hook_runner.as_ref().map_or_else(
+            || plugins::HookRunResult::allow(Vec::new()),
+            |runner| runner.run_post_tool_use(tool_name, input, output, is_error),
+        )
+    }
+
+    fn maybe_auto_compact(&mut self, turn_input_tokens: u32) -> Option<AutoCompactionEvent> {
+        if turn_input_tokens < self.auto_compaction_input_tokens_threshold {
             return None;
         }
 
         let result = compact_session(
             &self.session,
             CompactionConfig {
-                max_estimated_tokens: 0,
+                max_estimated_tokens: usize::try_from(self.auto_compaction_input_tokens_threshold)
+                    .unwrap_or(usize::MAX),
                 ..CompactionConfig::default()
             },
         );
@@ -330,6 +450,12 @@ where
         Some(AutoCompactionEvent {
             removed_message_count: result.removed_message_count,
         })
+    }
+}
+
+impl<C, T> Drop for ConversationRuntime<C, T> {
+    fn drop(&mut self) {
+        let _ = self.shutdown_registered_plugins();
     }
 }
 
@@ -397,11 +523,11 @@ fn flush_text_block(text: &mut String, blocks: &mut Vec<ContentBlock>) {
     }
 }
 
-fn format_hook_message(result: &HookRunResult, fallback: &str) -> String {
-    if result.messages().is_empty() {
+fn format_hook_message(messages: &[String], fallback: &str) -> String {
+    if messages.is_empty() {
         fallback.to_string()
     } else {
-        result.messages().join("\n")
+        messages.join("\n")
     }
 }
 
@@ -471,7 +597,13 @@ mod tests {
     use crate::prompt::{ProjectContext, SystemPromptBuilder};
     use crate::session::{ContentBlock, MessageRole, Session};
     use crate::usage::TokenUsage;
+    use plugins::{PluginManager, PluginManagerConfig};
+    use std::fs;
+    #[cfg(unix)]
+    use std::os::unix::fs::PermissionsExt;
+    use std::path::Path;
     use std::path::PathBuf;
+    use std::time::{SystemTime, UNIX_EPOCH};
 
     struct ScriptedApiClient {
         call_count: usize,
@@ -531,6 +663,68 @@ mod tests {
             assert_eq!(request.tool_name, "add");
             PermissionPromptDecision::Allow
         }
+    }
+
+    fn temp_dir(label: &str) -> PathBuf {
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("time should be after epoch")
+            .as_nanos();
+        std::env::temp_dir().join(format!("runtime-plugin-{label}-{nanos}"))
+    }
+
+    fn write_lifecycle_plugin(root: &Path, name: &str) -> PathBuf {
+        fs::create_dir_all(root.join(".claude-plugin")).expect("manifest dir");
+        fs::create_dir_all(root.join("lifecycle")).expect("lifecycle dir");
+        let log_path = root.join("lifecycle.log");
+        fs::write(
+            root.join("lifecycle").join("init.sh"),
+            "#!/bin/sh\nprintf 'init\\n' >> lifecycle.log\n",
+        )
+        .expect("write init script");
+        fs::write(
+            root.join("lifecycle").join("shutdown.sh"),
+            "#!/bin/sh\nprintf 'shutdown\\n' >> lifecycle.log\n",
+        )
+        .expect("write shutdown script");
+        fs::write(
+            root.join(".claude-plugin").join("plugin.json"),
+            format!(
+                "{{\n  \"name\": \"{name}\",\n  \"version\": \"1.0.0\",\n  \"description\": \"runtime lifecycle plugin\",\n  \"lifecycle\": {{\n    \"Init\": [\"./lifecycle/init.sh\"],\n    \"Shutdown\": [\"./lifecycle/shutdown.sh\"]\n  }}\n}}"
+            ),
+        )
+        .expect("write plugin manifest");
+        log_path
+    }
+
+    fn write_hook_plugin(root: &Path, name: &str, pre_message: &str, post_message: &str) {
+        fs::create_dir_all(root.join(".claude-plugin")).expect("manifest dir");
+        fs::create_dir_all(root.join("hooks")).expect("hooks dir");
+        fs::write(
+            root.join("hooks").join("pre.sh"),
+            format!("#!/bin/sh\nprintf '%s\\n' '{pre_message}'\n"),
+        )
+        .expect("write pre hook");
+        fs::write(
+            root.join("hooks").join("post.sh"),
+            format!("#!/bin/sh\nprintf '%s\\n' '{post_message}'\n"),
+        )
+        .expect("write post hook");
+        #[cfg(unix)]
+        {
+            let exec_mode = fs::Permissions::from_mode(0o755);
+            fs::set_permissions(root.join("hooks").join("pre.sh"), exec_mode.clone())
+                .expect("chmod pre hook");
+            fs::set_permissions(root.join("hooks").join("post.sh"), exec_mode)
+                .expect("chmod post hook");
+        }
+        fs::write(
+            root.join(".claude-plugin").join("plugin.json"),
+            format!(
+                "{{\n  \"name\": \"{name}\",\n  \"version\": \"1.0.0\",\n  \"description\": \"runtime hook plugin\",\n  \"hooks\": {{\n    \"PreToolUse\": [\"./hooks/pre.sh\"],\n    \"PostToolUse\": [\"./hooks/post.sh\"]\n  }}\n}}"
+            ),
+        )
+        .expect("write plugin manifest");
     }
 
     #[test]
@@ -761,7 +955,7 @@ mod tests {
             "post hook should preserve non-error result: {output:?}"
         );
         assert!(
-            output.contains("4"),
+            output.contains('4'),
             "tool output missing value: {output:?}"
         );
         assert!(
@@ -772,6 +966,153 @@ mod tests {
             output.contains("post hook ran"),
             "tool output missing post hook feedback: {output:?}"
         );
+    }
+
+    #[test]
+    fn initializes_and_shuts_down_plugins_with_runtime_lifecycle() {
+        let config_home = temp_dir("config");
+        let source_root = temp_dir("source");
+        let _ = write_lifecycle_plugin(&source_root, "runtime-lifecycle");
+
+        let mut manager = PluginManager::new(PluginManagerConfig::new(&config_home));
+        let install = manager
+            .install(source_root.to_str().expect("utf8 path"))
+            .expect("install should succeed");
+        let log_path = install.install_path.join("lifecycle.log");
+        let registry = manager.plugin_registry().expect("registry should load");
+
+        {
+            let runtime = ConversationRuntime::new_with_plugins(
+                Session::new(),
+                ScriptedApiClient { call_count: 0 },
+                StaticToolExecutor::new().register("add", |_input| Ok("4".to_string())),
+                PermissionPolicy::new(PermissionMode::WorkspaceWrite),
+                vec!["system".to_string()],
+                RuntimeFeatureConfig::default(),
+                registry,
+            )
+            .expect("runtime should initialize plugins");
+
+            let log = fs::read_to_string(&log_path).expect("init log should exist");
+            assert_eq!(log, "init\n");
+            drop(runtime);
+        }
+
+        let log = fs::read_to_string(&log_path).expect("shutdown log should exist");
+        assert_eq!(log, "init\nshutdown\n");
+
+        let _ = fs::remove_dir_all(config_home);
+        let _ = fs::remove_dir_all(source_root);
+    }
+
+    #[test]
+    fn executes_hooks_from_installed_plugins_during_tool_use() {
+        struct TwoCallApiClient {
+            calls: usize,
+        }
+
+        impl ApiClient for TwoCallApiClient {
+            fn stream(&mut self, request: ApiRequest) -> Result<Vec<AssistantEvent>, RuntimeError> {
+                self.calls += 1;
+                match self.calls {
+                    1 => Ok(vec![
+                        AssistantEvent::ToolUse {
+                            id: "tool-1".to_string(),
+                            name: "add".to_string(),
+                            input: r#"{"lhs":2,"rhs":2}"#.to_string(),
+                        },
+                        AssistantEvent::MessageStop,
+                    ]),
+                    2 => {
+                        assert!(request
+                            .messages
+                            .iter()
+                            .any(|message| message.role == MessageRole::Tool));
+                        Ok(vec![
+                            AssistantEvent::TextDelta("done".to_string()),
+                            AssistantEvent::MessageStop,
+                        ])
+                    }
+                    _ => Err(RuntimeError::new("unexpected extra API call")),
+                }
+            }
+        }
+
+        let config_home = temp_dir("hook-config");
+        let first_source_root = temp_dir("hook-source-a");
+        let second_source_root = temp_dir("hook-source-b");
+        write_hook_plugin(
+            &first_source_root,
+            "first",
+            "plugin pre one",
+            "plugin post one",
+        );
+        write_hook_plugin(
+            &second_source_root,
+            "second",
+            "plugin pre two",
+            "plugin post two",
+        );
+
+        let mut manager = PluginManager::new(PluginManagerConfig::new(&config_home));
+        manager
+            .install(first_source_root.to_str().expect("utf8 path"))
+            .expect("first plugin install should succeed");
+        manager
+            .install(second_source_root.to_str().expect("utf8 path"))
+            .expect("second plugin install should succeed");
+        let registry = manager.plugin_registry().expect("registry should load");
+
+        let mut runtime = ConversationRuntime::new_with_plugins(
+            Session::new(),
+            TwoCallApiClient { calls: 0 },
+            StaticToolExecutor::new().register("add", |_input| Ok("4".to_string())),
+            PermissionPolicy::new(PermissionMode::DangerFullAccess),
+            vec!["system".to_string()],
+            RuntimeFeatureConfig::default(),
+            registry,
+        )
+        .expect("runtime should load plugin hooks");
+
+        let summary = runtime
+            .run_turn("use add", None)
+            .expect("tool loop succeeds");
+
+        assert_eq!(summary.tool_results.len(), 1);
+        let ContentBlock::ToolResult {
+            is_error, output, ..
+        } = &summary.tool_results[0].blocks[0]
+        else {
+            panic!("expected tool result block");
+        };
+        assert!(
+            !*is_error,
+            "plugin hooks should not force an error: {output:?}"
+        );
+        assert!(
+            output.contains('4'),
+            "tool output missing value: {output:?}"
+        );
+        assert!(
+            output.contains("plugin pre one"),
+            "tool output missing first pre hook feedback: {output:?}"
+        );
+        assert!(
+            output.contains("plugin pre two"),
+            "tool output missing second pre hook feedback: {output:?}"
+        );
+        assert!(
+            output.contains("plugin post one"),
+            "tool output missing first post hook feedback: {output:?}"
+        );
+        assert!(
+            output.contains("plugin post two"),
+            "tool output missing second post hook feedback: {output:?}"
+        );
+
+        let _ = fs::remove_dir_all(config_home);
+        let _ = fs::remove_dir_all(first_source_root);
+        let _ = fs::remove_dir_all(second_source_root);
     }
 
     #[test]
@@ -864,7 +1205,7 @@ mod tests {
     }
 
     #[test]
-    fn auto_compacts_when_cumulative_input_threshold_is_crossed() {
+    fn auto_compacts_when_turn_input_threshold_is_crossed() {
         struct SimpleApi;
         impl ApiClient for SimpleApi {
             fn stream(
@@ -887,13 +1228,13 @@ mod tests {
         let session = Session {
             version: 1,
             messages: vec![
-                crate::session::ConversationMessage::user_text("one"),
+                crate::session::ConversationMessage::user_text("one ".repeat(30_000)),
                 crate::session::ConversationMessage::assistant(vec![ContentBlock::Text {
-                    text: "two".to_string(),
+                    text: "two ".repeat(30_000),
                 }]),
-                crate::session::ConversationMessage::user_text("three"),
+                crate::session::ConversationMessage::user_text("three ".repeat(30_000)),
                 crate::session::ConversationMessage::assistant(vec![ContentBlock::Text {
-                    text: "four".to_string(),
+                    text: "four ".repeat(30_000),
                 }]),
             ],
         };
@@ -917,6 +1258,72 @@ mod tests {
                 removed_message_count: 2,
             })
         );
+        assert_eq!(runtime.session().messages[0].role, MessageRole::System);
+    }
+
+    #[test]
+    fn auto_compaction_does_not_repeat_after_context_is_already_compacted() {
+        struct SequentialUsageApi {
+            call_count: usize,
+        }
+
+        impl ApiClient for SequentialUsageApi {
+            fn stream(
+                &mut self,
+                _request: ApiRequest,
+            ) -> Result<Vec<AssistantEvent>, RuntimeError> {
+                self.call_count += 1;
+                let input_tokens = if self.call_count == 1 { 120_000 } else { 64 };
+                Ok(vec![
+                    AssistantEvent::TextDelta("done".to_string()),
+                    AssistantEvent::Usage(TokenUsage {
+                        input_tokens,
+                        output_tokens: 4,
+                        cache_creation_input_tokens: 0,
+                        cache_read_input_tokens: 0,
+                    }),
+                    AssistantEvent::MessageStop,
+                ])
+            }
+        }
+
+        let session = Session {
+            version: 1,
+            messages: vec![
+                crate::session::ConversationMessage::user_text("one ".repeat(30_000)),
+                crate::session::ConversationMessage::assistant(vec![ContentBlock::Text {
+                    text: "two ".repeat(30_000),
+                }]),
+                crate::session::ConversationMessage::user_text("three ".repeat(30_000)),
+                crate::session::ConversationMessage::assistant(vec![ContentBlock::Text {
+                    text: "four ".repeat(30_000),
+                }]),
+            ],
+        };
+
+        let mut runtime = ConversationRuntime::new(
+            session,
+            SequentialUsageApi { call_count: 0 },
+            StaticToolExecutor::new(),
+            PermissionPolicy::new(PermissionMode::DangerFullAccess),
+            vec!["system".to_string()],
+        )
+        .with_auto_compaction_input_tokens_threshold(100_000);
+
+        let first = runtime
+            .run_turn("trigger", None)
+            .expect("first turn should succeed");
+        assert_eq!(
+            first.auto_compaction,
+            Some(AutoCompactionEvent {
+                removed_message_count: 2,
+            })
+        );
+
+        let second = runtime
+            .run_turn("continue", None)
+            .expect("second turn should succeed");
+        assert_eq!(second.auto_compaction, None);
         assert_eq!(runtime.session().messages[0].role, MessageRole::System);
     }
 

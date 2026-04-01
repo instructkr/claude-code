@@ -4,7 +4,7 @@ use std::process::Command;
 
 use serde_json::json;
 
-use crate::config::{RuntimeFeatureConfig, RuntimeHookConfig};
+use crate::{PluginError, PluginHooks, PluginRegistry};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum HookEvent {
@@ -49,25 +49,24 @@ impl HookRunResult {
 
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct HookRunner {
-    config: RuntimeHookConfig,
+    hooks: PluginHooks,
 }
 
 impl HookRunner {
     #[must_use]
-    pub fn new(config: RuntimeHookConfig) -> Self {
-        Self { config }
+    pub fn new(hooks: PluginHooks) -> Self {
+        Self { hooks }
     }
 
-    #[must_use]
-    pub fn from_feature_config(feature_config: &RuntimeFeatureConfig) -> Self {
-        Self::new(feature_config.hooks().clone())
+    pub fn from_registry(plugin_registry: &PluginRegistry) -> Result<Self, PluginError> {
+        Ok(Self::new(plugin_registry.aggregated_hooks()?))
     }
 
     #[must_use]
     pub fn run_pre_tool_use(&self, tool_name: &str, tool_input: &str) -> HookRunResult {
         self.run_commands(
             HookEvent::PreToolUse,
-            self.config.pre_tool_use(),
+            &self.hooks.pre_tool_use,
             tool_name,
             tool_input,
             None,
@@ -85,7 +84,7 @@ impl HookRunner {
     ) -> HookRunResult {
         self.run_commands(
             HookEvent::PostToolUse,
-            self.config.post_tool_use(),
+            &self.hooks.post_tool_use,
             tool_name,
             tool_input,
             Some(tool_output),
@@ -134,10 +133,9 @@ impl HookRunner {
                     }
                 }
                 HookCommandOutcome::Deny { message } => {
-                    let message = message.unwrap_or_else(|| {
+                    messages.push(message.unwrap_or_else(|| {
                         format!("{} hook denied tool `{tool_name}`", event.as_str())
-                    });
-                    messages.push(message);
+                    }));
                     return HookRunResult {
                         denied: true,
                         messages,
@@ -232,7 +230,7 @@ fn format_hook_warning(command: &str, code: i32, stdout: Option<&str>, stderr: &
 
 fn shell_command(command: &str) -> CommandWithStdin {
     #[cfg(windows)]
-    let mut command_builder = {
+    let command_builder = {
         let mut command_builder = Command::new("cmd");
         command_builder.arg("/C").arg(command);
         CommandWithStdin::new(command_builder)
@@ -288,7 +286,7 @@ impl CommandWithStdin {
     fn output_with_stdin(&mut self, stdin: &[u8]) -> std::io::Result<std::process::Output> {
         let mut child = self.command.spawn()?;
         if let Some(mut child_stdin) = child.stdin.take() {
-            use std::io::Write;
+            use std::io::Write as _;
             child_stdin.write_all(stdin)?;
         }
         child.wait_with_output()
@@ -298,58 +296,100 @@ impl CommandWithStdin {
 #[cfg(test)]
 mod tests {
     use super::{HookRunResult, HookRunner};
-    use crate::config::{RuntimeFeatureConfig, RuntimeHookConfig};
+    use crate::{PluginManager, PluginManagerConfig};
+    use std::fs;
+    use std::path::{Path, PathBuf};
+    use std::time::{SystemTime, UNIX_EPOCH};
 
-    #[test]
-    fn allows_exit_code_zero_and_captures_stdout() {
-        let runner = HookRunner::new(RuntimeHookConfig::new(
-            vec![shell_snippet("printf 'pre ok'")],
-            Vec::new(),
-        ));
+    fn temp_dir(label: &str) -> PathBuf {
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("time should be after epoch")
+            .as_nanos();
+        std::env::temp_dir().join(format!("plugins-hook-runner-{label}-{nanos}"))
+    }
 
-        let result = runner.run_pre_tool_use("Read", r#"{"path":"README.md"}"#);
-
-        assert_eq!(result, HookRunResult::allow(vec!["pre ok".to_string()]));
+    fn write_hook_plugin(root: &Path, name: &str, pre_message: &str, post_message: &str) {
+        fs::create_dir_all(root.join(".claude-plugin")).expect("manifest dir");
+        fs::create_dir_all(root.join("hooks")).expect("hooks dir");
+        fs::write(
+            root.join("hooks").join("pre.sh"),
+            format!("#!/bin/sh\nprintf '%s\\n' '{pre_message}'\n"),
+        )
+        .expect("write pre hook");
+        fs::write(
+            root.join("hooks").join("post.sh"),
+            format!("#!/bin/sh\nprintf '%s\\n' '{post_message}'\n"),
+        )
+        .expect("write post hook");
+        fs::write(
+            root.join(".claude-plugin").join("plugin.json"),
+            format!(
+                "{{\n  \"name\": \"{name}\",\n  \"version\": \"1.0.0\",\n  \"description\": \"hook plugin\",\n  \"hooks\": {{\n    \"PreToolUse\": [\"./hooks/pre.sh\"],\n    \"PostToolUse\": [\"./hooks/post.sh\"]\n  }}\n}}"
+            ),
+        )
+        .expect("write plugin manifest");
     }
 
     #[test]
-    fn denies_exit_code_two() {
-        let runner = HookRunner::new(RuntimeHookConfig::new(
-            vec![shell_snippet("printf 'blocked by hook'; exit 2")],
-            Vec::new(),
-        ));
+    fn collects_and_runs_hooks_from_enabled_plugins() {
+        let config_home = temp_dir("config");
+        let first_source_root = temp_dir("source-a");
+        let second_source_root = temp_dir("source-b");
+        write_hook_plugin(
+            &first_source_root,
+            "first",
+            "plugin pre one",
+            "plugin post one",
+        );
+        write_hook_plugin(
+            &second_source_root,
+            "second",
+            "plugin pre two",
+            "plugin post two",
+        );
+
+        let mut manager = PluginManager::new(PluginManagerConfig::new(&config_home));
+        manager
+            .install(first_source_root.to_str().expect("utf8 path"))
+            .expect("first plugin install should succeed");
+        manager
+            .install(second_source_root.to_str().expect("utf8 path"))
+            .expect("second plugin install should succeed");
+        let registry = manager.plugin_registry().expect("registry should build");
+
+        let runner = HookRunner::from_registry(&registry).expect("plugin hooks should load");
+
+        assert_eq!(
+            runner.run_pre_tool_use("Read", r#"{"path":"README.md"}"#),
+            HookRunResult::allow(vec![
+                "plugin pre one".to_string(),
+                "plugin pre two".to_string(),
+            ])
+        );
+        assert_eq!(
+            runner.run_post_tool_use("Read", r#"{"path":"README.md"}"#, "ok", false),
+            HookRunResult::allow(vec![
+                "plugin post one".to_string(),
+                "plugin post two".to_string(),
+            ])
+        );
+
+        let _ = fs::remove_dir_all(config_home);
+        let _ = fs::remove_dir_all(first_source_root);
+        let _ = fs::remove_dir_all(second_source_root);
+    }
+
+    #[test]
+    fn pre_tool_use_denies_when_plugin_hook_exits_two() {
+        let runner = HookRunner::new(crate::PluginHooks {
+            pre_tool_use: vec!["printf 'blocked by plugin'; exit 2".to_string()],
+            post_tool_use: Vec::new(),
+        });
 
         let result = runner.run_pre_tool_use("Bash", r#"{"command":"pwd"}"#);
 
         assert!(result.is_denied());
-        assert_eq!(result.messages(), &["blocked by hook".to_string()]);
-    }
-
-    #[test]
-    fn warns_for_other_non_zero_statuses() {
-        let runner = HookRunner::from_feature_config(&RuntimeFeatureConfig::default().with_hooks(
-            RuntimeHookConfig::new(
-                vec![shell_snippet("printf 'warning hook'; exit 1")],
-                Vec::new(),
-            ),
-        ));
-
-        let result = runner.run_pre_tool_use("Edit", r#"{"file":"src/lib.rs"}"#);
-
-        assert!(!result.is_denied());
-        assert!(result
-            .messages()
-            .iter()
-            .any(|message| message.contains("allowing tool execution to continue")));
-    }
-
-    #[cfg(windows)]
-    fn shell_snippet(script: &str) -> String {
-        script.replace('\'', "\"")
-    }
-
-    #[cfg(not(windows))]
-    fn shell_snippet(script: &str) -> String {
-        script.to_string()
+        assert_eq!(result.messages(), &["blocked by plugin".to_string()]);
     }
 }

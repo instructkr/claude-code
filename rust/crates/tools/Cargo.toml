@@ -7,6 +7,7 @@ publish.workspace = true
 
 [dependencies]
 api = { path = "../api" }
+plugins = { path = "../plugins" }
 runtime = { path = "../runtime" }
 reqwest = { version = "0.12", default-features = false, features = ["blocking", "rustls-tls"] }
 serde = { version = "1", features = ["derive"] }

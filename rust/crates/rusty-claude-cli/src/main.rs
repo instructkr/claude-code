@@ -2,14 +2,18 @@ mod init;
 mod input;
 mod render;
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::BTreeSet;
 use std::env;
+use std::fmt::Write as _;
 use std::fs;
 use std::io::{self, Read, Write};
 use std::net::TcpListener;
 use std::path::{Path, PathBuf};
 use std::process::Command;
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::sync::mpsc::{self, RecvTimeoutError};
+use std::sync::{Arc, Mutex};
+use std::thread;
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use api::{
     resolve_startup_auth_source, AnthropicClient, AuthSource, ContentBlockDelta, InputContentBlock,
@@ -18,10 +22,12 @@ use api::{
 };
 
 use commands::{
-    render_slash_command_help, resume_supported_slash_commands, slash_command_specs, SlashCommand,
+    handle_plugins_slash_command, render_slash_command_help, resume_supported_slash_commands,
+    slash_command_specs, SlashCommand,
 };
 use compat_harness::{extract_manifest, UpstreamPaths};
 use init::initialize_repo;
+use plugins::{PluginManager, PluginManagerConfig, PluginRegistry};
 use render::{MarkdownStreamState, Spinner, TerminalRenderer};
 use runtime::{
     clear_oauth_credentials, generate_pkce_pair, generate_state, load_system_prompt,
@@ -32,7 +38,7 @@ use runtime::{
     Session, TokenUsage, ToolError, ToolExecutor, UsageTracker,
 };
 use serde_json::json;
-use tools::{execute_tool, mvp_tool_specs, ToolSpec};
+use tools::GlobalToolRegistry;
 
 const DEFAULT_MODEL: &str = "claude-opus-4-6";
 fn max_tokens_for_model(model: &str) -> u32 {
@@ -47,6 +53,7 @@ const DEFAULT_OAUTH_CALLBACK_PORT: u16 = 4545;
 const VERSION: &str = env!("CARGO_PKG_VERSION");
 const BUILD_TARGET: Option<&str> = option_env!("TARGET");
 const GIT_SHA: Option<&str> = option_env!("GIT_SHA");
+const INTERNAL_PROGRESS_HEARTBEAT_INTERVAL: Duration = Duration::from_secs(3);
 
 type AllowedToolSet = BTreeSet<String>;
 
@@ -298,51 +305,18 @@ fn resolve_model_alias(model: &str) -> &str {
 }
 
 fn normalize_allowed_tools(values: &[String]) -> Result<Option<AllowedToolSet>, String> {
-    if values.is_empty() {
-        return Ok(None);
-    }
-
-    let canonical_names = mvp_tool_specs()
-        .into_iter()
-        .map(|spec| spec.name.to_string())
-        .collect::<Vec<_>>();
-    let mut name_map = canonical_names
-        .iter()
-        .map(|name| (normalize_tool_name(name), name.clone()))
-        .collect::<BTreeMap<_, _>>();
-
-    for (alias, canonical) in [
-        ("read", "read_file"),
-        ("write", "write_file"),
-        ("edit", "edit_file"),
-        ("glob", "glob_search"),
-        ("grep", "grep_search"),
-    ] {
-        name_map.insert(alias.to_string(), canonical.to_string());
-    }
-
-    let mut allowed = AllowedToolSet::new();
-    for value in values {
-        for token in value
-            .split(|ch: char| ch == ',' || ch.is_whitespace())
-            .filter(|token| !token.is_empty())
-        {
-            let normalized = normalize_tool_name(token);
-            let canonical = name_map.get(&normalized).ok_or_else(|| {
-                format!(
-                    "unsupported tool in --allowedTools: {token} (expected one of: {})",
-                    canonical_names.join(", ")
-                )
-            })?;
-            allowed.insert(canonical.clone());
-        }
-    }
-
-    Ok(Some(allowed))
+    current_tool_registry()?.normalize_allowed_tools(values)
 }
 
-fn normalize_tool_name(value: &str) -> String {
-    value.trim().replace('-', "_").to_ascii_lowercase()
+fn current_tool_registry() -> Result<GlobalToolRegistry, String> {
+    let cwd = env::current_dir().map_err(|error| error.to_string())?;
+    let loader = ConfigLoader::default_for(&cwd);
+    let runtime_config = loader.load().map_err(|error| error.to_string())?;
+    let plugin_manager = build_plugin_manager(&cwd, &loader, &runtime_config);
+    let plugin_tools = plugin_manager
+        .aggregated_tools()
+        .map_err(|error| error.to_string())?;
+    GlobalToolRegistry::with_plugin_tools(plugin_tools)
 }
 
 fn parse_permission_mode_arg(value: &str) -> Result<PermissionMode, String> {
@@ -372,11 +346,11 @@ fn default_permission_mode() -> PermissionMode {
         .map_or(PermissionMode::DangerFullAccess, permission_mode_from_label)
 }
 
-fn filter_tool_specs(allowed_tools: Option<&AllowedToolSet>) -> Vec<tools::ToolSpec> {
-    mvp_tool_specs()
-        .into_iter()
-        .filter(|spec| allowed_tools.is_none_or(|allowed| allowed.contains(spec.name)))
-        .collect()
+fn filter_tool_specs(
+    tool_registry: &GlobalToolRegistry,
+    allowed_tools: Option<&AllowedToolSet>,
+) -> Vec<ToolDefinition> {
+    tool_registry.definitions(allowed_tools)
 }
 
 fn parse_system_prompt_args(args: &[String]) -> Result<CliAction, String> {
@@ -928,6 +902,7 @@ fn run_resume_command(
         | SlashCommand::Model { .. }
         | SlashCommand::Permissions { .. }
         | SlashCommand::Session { .. }
+        | SlashCommand::Plugins { .. }
         | SlashCommand::Unknown(_) => Err("unsupported resumed slash command".into()),
     }
 }
@@ -1012,6 +987,7 @@ impl LiveCli {
             true,
             allowed_tools.clone(),
             permission_mode,
+            None,
         )?;
         let cli = Self {
             model,
@@ -1109,6 +1085,7 @@ impl LiveCli {
             false,
             self.allowed_tools.clone(),
             self.permission_mode,
+            None,
         )?;
         let mut permission_prompter = CliPermissionPrompter::new(self.permission_mode);
         let summary = runtime.run_turn(input, Some(&mut permission_prompter))?;
@@ -1217,6 +1194,9 @@ impl LiveCli {
             SlashCommand::Session { action, target } => {
                 self.handle_session_command(action.as_deref(), target.as_deref())?
             }
+            SlashCommand::Plugins { action, target } => {
+                self.handle_plugins_command(action.as_deref(), target.as_deref())?
+            }
             SlashCommand::Unknown(name) => {
                 eprintln!("unknown slash command: /{name}");
                 false
@@ -1287,6 +1267,7 @@ impl LiveCli {
             true,
             self.allowed_tools.clone(),
             self.permission_mode,
+            None,
         )?;
         self.model.clone_from(&model);
         println!(
@@ -1330,6 +1311,7 @@ impl LiveCli {
             true,
             self.allowed_tools.clone(),
             self.permission_mode,
+            None,
         )?;
         println!(
             "{}",
@@ -1355,6 +1337,7 @@ impl LiveCli {
             true,
             self.allowed_tools.clone(),
             self.permission_mode,
+            None,
         )?;
         println!(
             "Session cleared\n  Mode             fresh session\n  Preserved model  {}\n  Permission mode  {}\n  Session          {}",
@@ -1390,6 +1373,7 @@ impl LiveCli {
             true,
             self.allowed_tools.clone(),
             self.permission_mode,
+            None,
         )?;
         self.session = handle;
         println!(
@@ -1462,6 +1446,7 @@ impl LiveCli {
                     true,
                     self.allowed_tools.clone(),
                     self.permission_mode,
+                    None,
                 )?;
                 self.session = handle;
                 println!(
@@ -1479,6 +1464,37 @@ impl LiveCli {
         }
     }
 
+    fn handle_plugins_command(
+        &mut self,
+        action: Option<&str>,
+        target: Option<&str>,
+    ) -> Result<bool, Box<dyn std::error::Error>> {
+        let cwd = env::current_dir()?;
+        let loader = ConfigLoader::default_for(&cwd);
+        let runtime_config = loader.load()?;
+        let mut manager = build_plugin_manager(&cwd, &loader, &runtime_config);
+        let result = handle_plugins_slash_command(action, target, &mut manager)?;
+        println!("{}", result.message);
+        if result.reload_runtime {
+            self.reload_runtime_features()?;
+        }
+        Ok(false)
+    }
+
+    fn reload_runtime_features(&mut self) -> Result<(), Box<dyn std::error::Error>> {
+        self.runtime = build_runtime(
+            self.runtime.session().clone(),
+            self.model.clone(),
+            self.system_prompt.clone(),
+            true,
+            true,
+            self.allowed_tools.clone(),
+            self.permission_mode,
+            None,
+        )?;
+        self.persist_session()
+    }
+
     fn compact(&mut self) -> Result<(), Box<dyn std::error::Error>> {
         let result = self.runtime.compact(CompactionConfig::default());
         let removed = result.removed_message_count;
@@ -1492,16 +1508,18 @@ impl LiveCli {
             true,
             self.allowed_tools.clone(),
             self.permission_mode,
+            None,
         )?;
         self.persist_session()?;
         println!("{}", format_compact_report(removed, kept, skipped));
         Ok(())
     }
 
-    fn run_internal_prompt_text(
+    fn run_internal_prompt_text_with_progress(
         &self,
         prompt: &str,
         enable_tools: bool,
+        progress: Option<InternalPromptProgressReporter>,
     ) -> Result<String, Box<dyn std::error::Error>> {
         let session = self.runtime.session().clone();
         let mut runtime = build_runtime(
@@ -1512,10 +1530,19 @@ impl LiveCli {
             false,
             self.allowed_tools.clone(),
             self.permission_mode,
+            progress,
         )?;
         let mut permission_prompter = CliPermissionPrompter::new(self.permission_mode);
         let summary = runtime.run_turn(prompt, Some(&mut permission_prompter))?;
         Ok(final_assistant_text(&summary).trim().to_string())
+    }
+
+    fn run_internal_prompt_text(
+        &self,
+        prompt: &str,
+        enable_tools: bool,
+    ) -> Result<String, Box<dyn std::error::Error>> {
+        self.run_internal_prompt_text_with_progress(prompt, enable_tools, None)
     }
 
     fn run_bughunter(&self, scope: Option<&str>) -> Result<(), Box<dyn std::error::Error>> {
@@ -1532,10 +1559,22 @@ impl LiveCli {
         let prompt = format!(
             "You are /ultraplan. Produce a deep multi-step execution plan for {task}. Include goals, risks, implementation sequence, verification steps, and rollback considerations. Use tools if needed."
         );
-        println!("{}", self.run_internal_prompt_text(&prompt, true)?);
-        Ok(())
+        let mut progress = InternalPromptProgressRun::start_ultraplan(task);
+        match self.run_internal_prompt_text_with_progress(&prompt, true, Some(progress.reporter()))
+        {
+            Ok(plan) => {
+                progress.finish_success();
+                println!("{plan}");
+                Ok(())
+            }
+            Err(error) => {
+                progress.finish_failure(&error.to_string());
+                Err(error)
+            }
+        }
     }
 
+    #[allow(clippy::unused_self)]
     fn run_teleport(&self, target: Option<&str>) -> Result<(), Box<dyn std::error::Error>> {
         let Some(target) = target.map(str::trim).filter(|value| !value.is_empty()) else {
             println!("Usage: /teleport <symbol-or-path>");
@@ -1894,9 +1933,12 @@ fn render_config_report(section: Option<&str>) -> Result<String, Box<dyn std::er
             "env" => runtime_config.get("env"),
             "hooks" => runtime_config.get("hooks"),
             "model" => runtime_config.get("model"),
+            "plugins" => runtime_config
+                .get("plugins")
+                .or_else(|| runtime_config.get("enabledPlugins")),
             other => {
                 lines.push(format!(
-                    "  Unsupported config section '{other}'. Use env, hooks, or model."
+                    "  Unsupported config section '{other}'. Use env, hooks, model, or plugins."
                 ));
                 return Ok(lines.join(
                     "
@@ -2306,15 +2348,392 @@ fn build_system_prompt() -> Result<Vec<String>, Box<dyn std::error::Error>> {
     )?)
 }
 
-fn build_runtime_feature_config(
-) -> Result<runtime::RuntimeFeatureConfig, Box<dyn std::error::Error>> {
+fn build_runtime_plugin_state() -> Result<
+    (
+        runtime::RuntimeFeatureConfig,
+        PluginRegistry,
+        GlobalToolRegistry,
+    ),
+    Box<dyn std::error::Error>,
+> {
     let cwd = env::current_dir()?;
-    Ok(ConfigLoader::default_for(cwd)
-        .load()?
-        .feature_config()
-        .clone())
+    let loader = ConfigLoader::default_for(&cwd);
+    let runtime_config = loader.load()?;
+    let plugin_manager = build_plugin_manager(&cwd, &loader, &runtime_config);
+    let plugin_registry = plugin_manager.plugin_registry()?;
+    let tool_registry = GlobalToolRegistry::with_plugin_tools(plugin_registry.aggregated_tools()?)?;
+    Ok((
+        runtime_config.feature_config().clone(),
+        plugin_registry,
+        tool_registry,
+    ))
 }
 
+fn build_plugin_manager(
+    cwd: &Path,
+    loader: &ConfigLoader,
+    runtime_config: &runtime::RuntimeConfig,
+) -> PluginManager {
+    let plugin_settings = runtime_config.plugins();
+    let mut plugin_config = PluginManagerConfig::new(loader.config_home().to_path_buf());
+    plugin_config.enabled_plugins = plugin_settings.enabled_plugins().clone();
+    plugin_config.external_dirs = plugin_settings
+        .external_directories()
+        .iter()
+        .map(|path| resolve_plugin_path(cwd, loader.config_home(), path))
+        .collect();
+    plugin_config.install_root = plugin_settings
+        .install_root()
+        .map(|path| resolve_plugin_path(cwd, loader.config_home(), path));
+    plugin_config.registry_path = plugin_settings
+        .registry_path()
+        .map(|path| resolve_plugin_path(cwd, loader.config_home(), path));
+    plugin_config.bundled_root = plugin_settings
+        .bundled_root()
+        .map(|path| resolve_plugin_path(cwd, loader.config_home(), path));
+    PluginManager::new(plugin_config)
+}
+
+fn resolve_plugin_path(cwd: &Path, config_home: &Path, value: &str) -> PathBuf {
+    let path = PathBuf::from(value);
+    if path.is_absolute() {
+        path
+    } else if value.starts_with('.') {
+        cwd.join(path)
+    } else {
+        config_home.join(path)
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct InternalPromptProgressState {
+    command_label: &'static str,
+    task_label: String,
+    step: usize,
+    phase: String,
+    detail: Option<String>,
+    saw_final_text: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum InternalPromptProgressEvent {
+    Started,
+    Update,
+    Heartbeat,
+    Complete,
+    Failed,
+}
+
+#[derive(Debug)]
+struct InternalPromptProgressShared {
+    state: Mutex<InternalPromptProgressState>,
+    output_lock: Mutex<()>,
+    started_at: Instant,
+}
+
+#[derive(Debug, Clone)]
+struct InternalPromptProgressReporter {
+    shared: Arc<InternalPromptProgressShared>,
+}
+
+#[derive(Debug)]
+struct InternalPromptProgressRun {
+    reporter: InternalPromptProgressReporter,
+    heartbeat_stop: Option<mpsc::Sender<()>>,
+    heartbeat_handle: Option<thread::JoinHandle<()>>,
+}
+
+impl InternalPromptProgressReporter {
+    fn ultraplan(task: &str) -> Self {
+        Self {
+            shared: Arc::new(InternalPromptProgressShared {
+                state: Mutex::new(InternalPromptProgressState {
+                    command_label: "Ultraplan",
+                    task_label: task.to_string(),
+                    step: 0,
+                    phase: "planning started".to_string(),
+                    detail: Some(format!("task: {task}")),
+                    saw_final_text: false,
+                }),
+                output_lock: Mutex::new(()),
+                started_at: Instant::now(),
+            }),
+        }
+    }
+
+    fn emit(&self, event: InternalPromptProgressEvent, error: Option<&str>) {
+        let snapshot = self.snapshot();
+        let line = format_internal_prompt_progress_line(event, &snapshot, self.elapsed(), error);
+        self.write_line(&line);
+    }
+
+    fn mark_model_phase(&self) {
+        let snapshot = {
+            let mut state = self
+                .shared
+                .state
+                .lock()
+                .expect("internal prompt progress state poisoned");
+            state.step += 1;
+            state.phase = if state.step == 1 {
+                "analyzing request".to_string()
+            } else {
+                "reviewing findings".to_string()
+            };
+            state.detail = Some(format!("task: {}", state.task_label));
+            state.clone()
+        };
+        self.write_line(&format_internal_prompt_progress_line(
+            InternalPromptProgressEvent::Update,
+            &snapshot,
+            self.elapsed(),
+            None,
+        ));
+    }
+
+    fn mark_tool_phase(&self, name: &str, input: &str) {
+        let detail = describe_tool_progress(name, input);
+        let snapshot = {
+            let mut state = self
+                .shared
+                .state
+                .lock()
+                .expect("internal prompt progress state poisoned");
+            state.step += 1;
+            state.phase = format!("running {name}");
+            state.detail = Some(detail);
+            state.clone()
+        };
+        self.write_line(&format_internal_prompt_progress_line(
+            InternalPromptProgressEvent::Update,
+            &snapshot,
+            self.elapsed(),
+            None,
+        ));
+    }
+
+    fn mark_text_phase(&self, text: &str) {
+        let trimmed = text.trim();
+        if trimmed.is_empty() {
+            return;
+        }
+        let detail = truncate_for_summary(first_visible_line(trimmed), 120);
+        let snapshot = {
+            let mut state = self
+                .shared
+                .state
+                .lock()
+                .expect("internal prompt progress state poisoned");
+            if state.saw_final_text {
+                return;
+            }
+            state.saw_final_text = true;
+            state.step += 1;
+            state.phase = "drafting final plan".to_string();
+            state.detail = (!detail.is_empty()).then_some(detail);
+            state.clone()
+        };
+        self.write_line(&format_internal_prompt_progress_line(
+            InternalPromptProgressEvent::Update,
+            &snapshot,
+            self.elapsed(),
+            None,
+        ));
+    }
+
+    fn emit_heartbeat(&self) {
+        let snapshot = self.snapshot();
+        self.write_line(&format_internal_prompt_progress_line(
+            InternalPromptProgressEvent::Heartbeat,
+            &snapshot,
+            self.elapsed(),
+            None,
+        ));
+    }
+
+    fn snapshot(&self) -> InternalPromptProgressState {
+        self.shared
+            .state
+            .lock()
+            .expect("internal prompt progress state poisoned")
+            .clone()
+    }
+
+    fn elapsed(&self) -> Duration {
+        self.shared.started_at.elapsed()
+    }
+
+    fn write_line(&self, line: &str) {
+        let _guard = self
+            .shared
+            .output_lock
+            .lock()
+            .expect("internal prompt progress output lock poisoned");
+        let mut stdout = io::stdout();
+        let _ = writeln!(stdout, "{line}");
+        let _ = stdout.flush();
+    }
+}
+
+impl InternalPromptProgressRun {
+    fn start_ultraplan(task: &str) -> Self {
+        let reporter = InternalPromptProgressReporter::ultraplan(task);
+        reporter.emit(InternalPromptProgressEvent::Started, None);
+
+        let (heartbeat_stop, heartbeat_rx) = mpsc::channel();
+        let heartbeat_reporter = reporter.clone();
+        let heartbeat_handle = thread::spawn(move || loop {
+            match heartbeat_rx.recv_timeout(INTERNAL_PROGRESS_HEARTBEAT_INTERVAL) {
+                Ok(()) | Err(RecvTimeoutError::Disconnected) => break,
+                Err(RecvTimeoutError::Timeout) => heartbeat_reporter.emit_heartbeat(),
+            }
+        });
+
+        Self {
+            reporter,
+            heartbeat_stop: Some(heartbeat_stop),
+            heartbeat_handle: Some(heartbeat_handle),
+        }
+    }
+
+    fn reporter(&self) -> InternalPromptProgressReporter {
+        self.reporter.clone()
+    }
+
+    fn finish_success(&mut self) {
+        self.stop_heartbeat();
+        self.reporter
+            .emit(InternalPromptProgressEvent::Complete, None);
+    }
+
+    fn finish_failure(&mut self, error: &str) {
+        self.stop_heartbeat();
+        self.reporter
+            .emit(InternalPromptProgressEvent::Failed, Some(error));
+    }
+
+    fn stop_heartbeat(&mut self) {
+        if let Some(sender) = self.heartbeat_stop.take() {
+            let _ = sender.send(());
+        }
+        if let Some(handle) = self.heartbeat_handle.take() {
+            let _ = handle.join();
+        }
+    }
+}
+
+impl Drop for InternalPromptProgressRun {
+    fn drop(&mut self) {
+        self.stop_heartbeat();
+    }
+}
+
+fn format_internal_prompt_progress_line(
+    event: InternalPromptProgressEvent,
+    snapshot: &InternalPromptProgressState,
+    elapsed: Duration,
+    error: Option<&str>,
+) -> String {
+    let elapsed_seconds = elapsed.as_secs();
+    let step_label = if snapshot.step == 0 {
+        "current step pending".to_string()
+    } else {
+        format!("current step {}", snapshot.step)
+    };
+    let mut status_bits = vec![step_label, format!("phase {}", snapshot.phase)];
+    if let Some(detail) = snapshot
+        .detail
+        .as_deref()
+        .filter(|detail| !detail.is_empty())
+    {
+        status_bits.push(detail.to_string());
+    }
+    let status = status_bits.join(" · ");
+    match event {
+        InternalPromptProgressEvent::Started => {
+            format!(
+                "🧭 {} status · planning started · {status}",
+                snapshot.command_label
+            )
+        }
+        InternalPromptProgressEvent::Update => {
+            format!("… {} status · {status}", snapshot.command_label)
+        }
+        InternalPromptProgressEvent::Heartbeat => format!(
+            "… {} heartbeat · {elapsed_seconds}s elapsed · {status}",
+            snapshot.command_label
+        ),
+        InternalPromptProgressEvent::Complete => format!(
+            "✔ {} status · completed · {elapsed_seconds}s elapsed · {} steps total",
+            snapshot.command_label, snapshot.step
+        ),
+        InternalPromptProgressEvent::Failed => format!(
+            "✘ {} status · failed · {elapsed_seconds}s elapsed · {}",
+            snapshot.command_label,
+            error.unwrap_or("unknown error")
+        ),
+    }
+}
+
+fn describe_tool_progress(name: &str, input: &str) -> String {
+    let parsed: serde_json::Value =
+        serde_json::from_str(input).unwrap_or(serde_json::Value::String(input.to_string()));
+    match name {
+        "bash" | "Bash" => {
+            let command = parsed
+                .get("command")
+                .and_then(|value| value.as_str())
+                .unwrap_or_default();
+            if command.is_empty() {
+                "running shell command".to_string()
+            } else {
+                format!("command {}", truncate_for_summary(command.trim(), 100))
+            }
+        }
+        "read_file" | "Read" => format!("reading {}", extract_tool_path(&parsed)),
+        "write_file" | "Write" => format!("writing {}", extract_tool_path(&parsed)),
+        "edit_file" | "Edit" => format!("editing {}", extract_tool_path(&parsed)),
+        "glob_search" | "Glob" => {
+            let pattern = parsed
+                .get("pattern")
+                .and_then(|value| value.as_str())
+                .unwrap_or("?");
+            let scope = parsed
+                .get("path")
+                .and_then(|value| value.as_str())
+                .unwrap_or(".");
+            format!("glob `{pattern}` in {scope}")
+        }
+        "grep_search" | "Grep" => {
+            let pattern = parsed
+                .get("pattern")
+                .and_then(|value| value.as_str())
+                .unwrap_or("?");
+            let scope = parsed
+                .get("path")
+                .and_then(|value| value.as_str())
+                .unwrap_or(".");
+            format!("grep `{pattern}` in {scope}")
+        }
+        "web_search" | "WebSearch" => parsed
+            .get("query")
+            .and_then(|value| value.as_str())
+            .map_or_else(
+                || "running web search".to_string(),
+                |query| format!("query {}", truncate_for_summary(query, 100)),
+            ),
+        _ => {
+            let summary = summarize_tool_payload(input);
+            if summary.is_empty() {
+                format!("running {name}")
+            } else {
+                format!("{name}: {summary}")
+            }
+        }
+    }
+}
+
+#[allow(clippy::needless_pass_by_value)]
 fn build_runtime(
     session: Session,
     model: String,
@@ -2323,16 +2742,26 @@ fn build_runtime(
     emit_output: bool,
     allowed_tools: Option<AllowedToolSet>,
     permission_mode: PermissionMode,
+    progress_reporter: Option<InternalPromptProgressReporter>,
 ) -> Result<ConversationRuntime<AnthropicRuntimeClient, CliToolExecutor>, Box<dyn std::error::Error>>
 {
-    Ok(ConversationRuntime::new_with_features(
+    let (feature_config, plugin_registry, tool_registry) = build_runtime_plugin_state()?;
+    Ok(ConversationRuntime::new_with_plugins(
         session,
-        AnthropicRuntimeClient::new(model, enable_tools, emit_output, allowed_tools.clone())?,
-        CliToolExecutor::new(allowed_tools, emit_output),
-        permission_policy(permission_mode),
+        AnthropicRuntimeClient::new(
+            model,
+            enable_tools,
+            emit_output,
+            allowed_tools.clone(),
+            tool_registry.clone(),
+            progress_reporter,
+        )?,
+        CliToolExecutor::new(allowed_tools.clone(), emit_output, tool_registry.clone()),
+        permission_policy(permission_mode, &tool_registry),
         system_prompt,
-        build_runtime_feature_config()?,
-    ))
+        feature_config,
+        plugin_registry,
+    )?)
 }
 
 struct CliPermissionPrompter {
@@ -2388,6 +2817,8 @@ struct AnthropicRuntimeClient {
     enable_tools: bool,
     emit_output: bool,
     allowed_tools: Option<AllowedToolSet>,
+    tool_registry: GlobalToolRegistry,
+    progress_reporter: Option<InternalPromptProgressReporter>,
 }
 
 impl AnthropicRuntimeClient {
@@ -2396,6 +2827,8 @@ impl AnthropicRuntimeClient {
         enable_tools: bool,
         emit_output: bool,
         allowed_tools: Option<AllowedToolSet>,
+        tool_registry: GlobalToolRegistry,
+        progress_reporter: Option<InternalPromptProgressReporter>,
     ) -> Result<Self, Box<dyn std::error::Error>> {
         Ok(Self {
             runtime: tokio::runtime::Runtime::new()?,
@@ -2405,6 +2838,8 @@ impl AnthropicRuntimeClient {
             enable_tools,
             emit_output,
             allowed_tools,
+            tool_registry,
+            progress_reporter,
         })
     }
 }
@@ -2422,21 +2857,17 @@ fn resolve_cli_auth_source() -> Result<AuthSource, Box<dyn std::error::Error>> {
 impl ApiClient for AnthropicRuntimeClient {
     #[allow(clippy::too_many_lines)]
     fn stream(&mut self, request: ApiRequest) -> Result<Vec<AssistantEvent>, RuntimeError> {
+        if let Some(progress_reporter) = &self.progress_reporter {
+            progress_reporter.mark_model_phase();
+        }
         let message_request = MessageRequest {
             model: self.model.clone(),
             max_tokens: max_tokens_for_model(&self.model),
             messages: convert_messages(&request.messages),
             system: (!request.system_prompt.is_empty()).then(|| request.system_prompt.join("\n\n")),
-            tools: self.enable_tools.then(|| {
-                filter_tool_specs(self.allowed_tools.as_ref())
-                    .into_iter()
-                    .map(|spec| ToolDefinition {
-                        name: spec.name.to_string(),
-                        description: Some(spec.description.to_string()),
-                        input_schema: spec.input_schema,
-                    })
-                    .collect()
-            }),
+            tools: self
+                .enable_tools
+                .then(|| filter_tool_specs(&self.tool_registry, self.allowed_tools.as_ref())),
             tool_choice: self.enable_tools.then_some(ToolChoice::Auto),
             stream: true,
         };
@@ -2483,6 +2914,9 @@ impl ApiClient for AnthropicRuntimeClient {
                     ApiStreamEvent::ContentBlockDelta(delta) => match delta.delta {
                         ContentBlockDelta::TextDelta { text } => {
                             if !text.is_empty() {
+                                if let Some(progress_reporter) = &self.progress_reporter {
+                                    progress_reporter.mark_text_phase(&text);
+                                }
                                 if let Some(rendered) = markdown_stream.push(&renderer, &text) {
                                     write!(out, "{rendered}")
                                         .and_then(|()| out.flush())
@@ -2496,6 +2930,8 @@ impl ApiClient for AnthropicRuntimeClient {
                                 input.push_str(&partial_json);
                             }
                         }
+                        ContentBlockDelta::ThinkingDelta { .. }
+                        | ContentBlockDelta::SignatureDelta { .. } => {}
                     },
                     ApiStreamEvent::ContentBlockStop(_) => {
                         if let Some(rendered) = markdown_stream.flush(&renderer) {
@@ -2504,6 +2940,9 @@ impl ApiClient for AnthropicRuntimeClient {
                                 .map_err(|error| RuntimeError::new(error.to_string()))?;
                         }
                         if let Some((id, name, input)) = pending_tool.take() {
+                            if let Some(progress_reporter) = &self.progress_reporter {
+                                progress_reporter.mark_tool_phase(&name, &input);
+                            }
                             // Display tool call now that input is fully accumulated
                             writeln!(out, "\n{}", format_tool_call_start(&name, &input))
                                 .and_then(|()| out.flush())
@@ -2700,12 +3139,16 @@ fn format_tool_result(name: &str, output: &str, is_error: bool) -> String {
         "edit_file" | "Edit" => format_edit_result(icon, &parsed),
         "glob_search" | "Glob" => format_glob_result(icon, &parsed),
         "grep_search" | "Grep" => format_grep_result(icon, &parsed),
-        _ => {
-            let summary = truncate_for_summary(output.trim(), 200);
-            format!("{icon} \x1b[38;5;245m{name}:\x1b[0m {summary}")
-        }
+        _ => format_generic_tool_result(icon, name, &parsed),
     }
 }
+
+const DISPLAY_TRUNCATION_NOTICE: &str =
+    "\x1b[2m… output truncated for display; full result preserved in session.\x1b[0m";
+const READ_DISPLAY_MAX_LINES: usize = 80;
+const READ_DISPLAY_MAX_CHARS: usize = 6_000;
+const TOOL_OUTPUT_DISPLAY_MAX_LINES: usize = 60;
+const TOOL_OUTPUT_DISPLAY_MAX_CHARS: usize = 4_000;
 
 fn extract_tool_path(parsed: &serde_json::Value) -> String {
     parsed
@@ -2767,23 +3210,34 @@ fn format_bash_result(icon: &str, parsed: &serde_json::Value) -> String {
         .get("backgroundTaskId")
         .and_then(|value| value.as_str())
     {
-        lines[0].push_str(&format!(" backgrounded ({task_id})"));
+        write!(&mut lines[0], " backgrounded ({task_id})").expect("write to string");
     } else if let Some(status) = parsed
         .get("returnCodeInterpretation")
         .and_then(|value| value.as_str())
         .filter(|status| !status.is_empty())
     {
-        lines[0].push_str(&format!(" {status}"));
+        write!(&mut lines[0], " {status}").expect("write to string");
     }
 
     if let Some(stdout) = parsed.get("stdout").and_then(|value| value.as_str()) {
         if !stdout.trim().is_empty() {
-            lines.push(stdout.trim_end().to_string());
+            lines.push(truncate_output_for_display(
+                stdout,
+                TOOL_OUTPUT_DISPLAY_MAX_LINES,
+                TOOL_OUTPUT_DISPLAY_MAX_CHARS,
+            ));
         }
     }
     if let Some(stderr) = parsed.get("stderr").and_then(|value| value.as_str()) {
         if !stderr.trim().is_empty() {
-            lines.push(format!("\x1b[38;5;203m{}\x1b[0m", stderr.trim_end()));
+            lines.push(format!(
+                "\x1b[38;5;203m{}\x1b[0m",
+                truncate_output_for_display(
+                    stderr,
+                    TOOL_OUTPUT_DISPLAY_MAX_LINES,
+                    TOOL_OUTPUT_DISPLAY_MAX_CHARS,
+                )
+            ));
         }
     }
 
@@ -2795,15 +3249,15 @@ fn format_read_result(icon: &str, parsed: &serde_json::Value) -> String {
     let path = extract_tool_path(file);
     let start_line = file
         .get("startLine")
-        .and_then(|value| value.as_u64())
+        .and_then(serde_json::Value::as_u64)
         .unwrap_or(1);
     let num_lines = file
         .get("numLines")
-        .and_then(|value| value.as_u64())
+        .and_then(serde_json::Value::as_u64)
         .unwrap_or(0);
     let total_lines = file
         .get("totalLines")
-        .and_then(|value| value.as_u64())
+        .and_then(serde_json::Value::as_u64)
         .unwrap_or(num_lines);
     let content = file
         .get("content")
@@ -2816,7 +3270,7 @@ fn format_read_result(icon: &str, parsed: &serde_json::Value) -> String {
         start_line,
         end_line.max(start_line),
         total_lines,
-        content
+        truncate_output_for_display(content, READ_DISPLAY_MAX_LINES, READ_DISPLAY_MAX_CHARS)
     )
 }
 
@@ -2829,8 +3283,7 @@ fn format_write_result(icon: &str, parsed: &serde_json::Value) -> String {
     let line_count = parsed
         .get("content")
         .and_then(|value| value.as_str())
-        .map(|content| content.lines().count())
-        .unwrap_or(0);
+        .map_or(0, |content| content.lines().count());
     format!(
         "{icon} \x1b[1;32m✏️ {} {path}\x1b[0m \x1b[2m({line_count} lines)\x1b[0m",
         if kind == "create" { "Wrote" } else { "Updated" },
@@ -2861,7 +3314,7 @@ fn format_edit_result(icon: &str, parsed: &serde_json::Value) -> String {
     let path = extract_tool_path(parsed);
     let suffix = if parsed
         .get("replaceAll")
-        .and_then(|value| value.as_bool())
+        .and_then(serde_json::Value::as_bool)
         .unwrap_or(false)
     {
         " (replace all)"
@@ -2889,7 +3342,7 @@ fn format_edit_result(icon: &str, parsed: &serde_json::Value) -> String {
 fn format_glob_result(icon: &str, parsed: &serde_json::Value) -> String {
     let num_files = parsed
         .get("numFiles")
-        .and_then(|value| value.as_u64())
+        .and_then(serde_json::Value::as_u64)
         .unwrap_or(0);
     let filenames = parsed
         .get("filenames")
@@ -2913,11 +3366,11 @@ fn format_glob_result(icon: &str, parsed: &serde_json::Value) -> String {
 fn format_grep_result(icon: &str, parsed: &serde_json::Value) -> String {
     let num_matches = parsed
         .get("numMatches")
-        .and_then(|value| value.as_u64())
+        .and_then(serde_json::Value::as_u64)
         .unwrap_or(0);
     let num_files = parsed
         .get("numFiles")
-        .and_then(|value| value.as_u64())
+        .and_then(serde_json::Value::as_u64)
         .unwrap_or(0);
     let content = parsed
         .get("content")
@@ -2939,11 +3392,42 @@ fn format_grep_result(icon: &str, parsed: &serde_json::Value) -> String {
         "{icon} \x1b[38;5;245mgrep_search\x1b[0m {num_matches} matches across {num_files} files"
     );
     if !content.trim().is_empty() {
-        format!("{summary}\n{}", content.trim_end())
+        format!(
+            "{summary}\n{}",
+            truncate_output_for_display(
+                content,
+                TOOL_OUTPUT_DISPLAY_MAX_LINES,
+                TOOL_OUTPUT_DISPLAY_MAX_CHARS,
+            )
+        )
     } else if !filenames.is_empty() {
         format!("{summary}\n{filenames}")
     } else {
         summary
+    }
+}
+
+fn format_generic_tool_result(icon: &str, name: &str, parsed: &serde_json::Value) -> String {
+    let rendered_output = match parsed {
+        serde_json::Value::String(text) => text.clone(),
+        serde_json::Value::Null => String::new(),
+        serde_json::Value::Object(_) | serde_json::Value::Array(_) => {
+            serde_json::to_string_pretty(parsed).unwrap_or_else(|_| parsed.to_string())
+        }
+        _ => parsed.to_string(),
+    };
+    let preview = truncate_output_for_display(
+        &rendered_output,
+        TOOL_OUTPUT_DISPLAY_MAX_LINES,
+        TOOL_OUTPUT_DISPLAY_MAX_CHARS,
+    );
+
+    if preview.is_empty() {
+        format!("{icon} \x1b[38;5;245m{name}\x1b[0m")
+    } else if preview.contains('\n') {
+        format!("{icon} \x1b[38;5;245m{name}\x1b[0m\n{preview}")
+    } else {
+        format!("{icon} \x1b[38;5;245m{name}:\x1b[0m {preview}")
     }
 }
 
@@ -2963,6 +3447,50 @@ fn truncate_for_summary(value: &str, limit: usize) -> String {
     } else {
         truncated
     }
+}
+
+fn truncate_output_for_display(content: &str, max_lines: usize, max_chars: usize) -> String {
+    let original = content.trim_end_matches('\n');
+    if original.is_empty() {
+        return String::new();
+    }
+
+    let mut preview_lines = Vec::new();
+    let mut used_chars = 0usize;
+    let mut truncated = false;
+
+    for (index, line) in original.lines().enumerate() {
+        if index >= max_lines {
+            truncated = true;
+            break;
+        }
+
+        let newline_cost = usize::from(!preview_lines.is_empty());
+        let available = max_chars.saturating_sub(used_chars + newline_cost);
+        if available == 0 {
+            truncated = true;
+            break;
+        }
+
+        let line_chars = line.chars().count();
+        if line_chars > available {
+            preview_lines.push(line.chars().take(available).collect::<String>());
+            truncated = true;
+            break;
+        }
+
+        preview_lines.push(line.to_string());
+        used_chars += newline_cost + line_chars;
+    }
+
+    let mut preview = preview_lines.join("\n");
+    if truncated {
+        if !preview.is_empty() {
+            preview.push('\n');
+        }
+        preview.push_str(DISPLAY_TRUNCATION_NOTICE);
+    }
+    preview
 }
 
 fn push_output_block(
@@ -2996,6 +3524,7 @@ fn push_output_block(
             };
             *pending_tool = Some((id, name, initial_input));
         }
+        OutputContentBlock::Thinking { .. } | OutputContentBlock::RedactedThinking { .. } => {}
     }
     Ok(())
 }
@@ -3028,14 +3557,20 @@ struct CliToolExecutor {
     renderer: TerminalRenderer,
     emit_output: bool,
     allowed_tools: Option<AllowedToolSet>,
+    tool_registry: GlobalToolRegistry,
 }
 
 impl CliToolExecutor {
-    fn new(allowed_tools: Option<AllowedToolSet>, emit_output: bool) -> Self {
+    fn new(
+        allowed_tools: Option<AllowedToolSet>,
+        emit_output: bool,
+        tool_registry: GlobalToolRegistry,
+    ) -> Self {
         Self {
             renderer: TerminalRenderer::new(),
             emit_output,
             allowed_tools,
+            tool_registry,
         }
     }
 }
@@ -3053,7 +3588,7 @@ impl ToolExecutor for CliToolExecutor {
         }
         let value = serde_json::from_str(input)
             .map_err(|error| ToolError::new(format!("invalid tool input JSON: {error}")))?;
-        match execute_tool(tool_name, &value) {
+        match self.tool_registry.execute(tool_name, &value) {
             Ok(output) => {
                 if self.emit_output {
                     let markdown = format_tool_result(tool_name, &output, false);
@@ -3076,16 +3611,13 @@ impl ToolExecutor for CliToolExecutor {
     }
 }
 
-fn permission_policy(mode: PermissionMode) -> PermissionPolicy {
-    tool_permission_specs()
-        .into_iter()
-        .fold(PermissionPolicy::new(mode), |policy, spec| {
-            policy.with_tool_requirement(spec.name, spec.required_permission)
-        })
-}
-
-fn tool_permission_specs() -> Vec<ToolSpec> {
-    mvp_tool_specs()
+fn permission_policy(mode: PermissionMode, tool_registry: &GlobalToolRegistry) -> PermissionPolicy {
+    tool_registry.permission_specs(None).into_iter().fold(
+        PermissionPolicy::new(mode),
+        |policy, (name, required_permission)| {
+            policy.with_tool_requirement(name, required_permission)
+        },
+    )
 }
 
 fn convert_messages(messages: &[ConversationMessage]) -> Vec<InputMessage> {
@@ -3224,18 +3756,47 @@ fn print_help() {
 #[cfg(test)]
 mod tests {
     use super::{
-        filter_tool_specs, format_compact_report, format_cost_report, format_model_report,
-        format_model_switch_report, format_permissions_report, format_permissions_switch_report,
-        format_resume_report, format_status_report, format_tool_call_start, format_tool_result,
-        normalize_permission_mode, parse_args, parse_git_status_metadata, print_help_to,
-        push_output_block, render_config_report, render_memory_report, render_repl_help,
-        resolve_model_alias, response_to_events, resume_supported_slash_commands, status_context,
-        CliAction, CliOutputFormat, SlashCommand, StatusUsage, DEFAULT_MODEL,
+        describe_tool_progress, filter_tool_specs, format_compact_report, format_cost_report,
+        format_internal_prompt_progress_line, format_model_report, format_model_switch_report,
+        format_permissions_report, format_permissions_switch_report, format_resume_report,
+        format_status_report, format_tool_call_start, format_tool_result,
+        normalize_permission_mode, parse_args, parse_git_status_metadata, permission_policy,
+        print_help_to, push_output_block, render_config_report, render_memory_report,
+        render_repl_help, resolve_model_alias, response_to_events, resume_supported_slash_commands,
+        status_context, CliAction, CliOutputFormat, InternalPromptProgressEvent,
+        InternalPromptProgressState, SlashCommand, StatusUsage, DEFAULT_MODEL,
     };
     use api::{MessageResponse, OutputContentBlock, Usage};
+    use plugins::{PluginTool, PluginToolDefinition, PluginToolPermission};
     use runtime::{AssistantEvent, ContentBlock, ConversationMessage, MessageRole, PermissionMode};
     use serde_json::json;
     use std::path::PathBuf;
+    use std::time::Duration;
+    use tools::GlobalToolRegistry;
+
+    fn registry_with_plugin_tool() -> GlobalToolRegistry {
+        GlobalToolRegistry::with_plugin_tools(vec![PluginTool::new(
+            "plugin-demo@external",
+            "plugin-demo",
+            PluginToolDefinition {
+                name: "plugin_echo".to_string(),
+                description: Some("Echo plugin payload".to_string()),
+                input_schema: json!({
+                    "type": "object",
+                    "properties": {
+                        "message": { "type": "string" }
+                    },
+                    "required": ["message"],
+                    "additionalProperties": false
+                }),
+            },
+            "echo".to_string(),
+            Vec::new(),
+            PluginToolPermission::WorkspaceWrite,
+            None,
+        )])
+        .expect("plugin tool registry should build")
+    }
 
     #[test]
     fn defaults_to_repl_when_no_args() {
@@ -3449,12 +4010,30 @@ mod tests {
             .into_iter()
             .map(str::to_string)
             .collect();
-        let filtered = filter_tool_specs(Some(&allowed));
+        let filtered = filter_tool_specs(&GlobalToolRegistry::builtin(), Some(&allowed));
         let names = filtered
             .into_iter()
             .map(|spec| spec.name)
             .collect::<Vec<_>>();
         assert_eq!(names, vec!["read_file", "grep_search"]);
+    }
+
+    #[test]
+    fn filtered_tool_specs_include_plugin_tools() {
+        let filtered = filter_tool_specs(&registry_with_plugin_tool(), None);
+        let names = filtered
+            .into_iter()
+            .map(|definition| definition.name)
+            .collect::<Vec<_>>();
+        assert!(names.contains(&"bash".to_string()));
+        assert!(names.contains(&"plugin_echo".to_string()));
+    }
+
+    #[test]
+    fn permission_policy_uses_plugin_tool_permissions() {
+        let policy = permission_policy(PermissionMode::ReadOnly, &registry_with_plugin_tool());
+        let required = policy.required_mode_for("plugin_echo");
+        assert_eq!(required, PermissionMode::WorkspaceWrite);
     }
 
     #[test]
@@ -3475,13 +4054,16 @@ mod tests {
         assert!(help.contains("/clear [--confirm]"));
         assert!(help.contains("/cost"));
         assert!(help.contains("/resume <session-path>"));
-        assert!(help.contains("/config [env|hooks|model]"));
+        assert!(help.contains("/config [env|hooks|model|plugins]"));
         assert!(help.contains("/memory"));
         assert!(help.contains("/init"));
         assert!(help.contains("/diff"));
         assert!(help.contains("/version"));
         assert!(help.contains("/export [file]"));
         assert!(help.contains("/session [list|switch <session-id>]"));
+        assert!(help.contains(
+            "/plugins [list|install <path>|enable <name>|disable <name>|uninstall <id>|update <id>]"
+        ));
         assert!(help.contains("/exit"));
     }
 
@@ -3632,6 +4214,9 @@ mod tests {
     fn config_report_supports_section_views() {
         let report = render_config_report(Some("env")).expect("config report should render");
         assert!(report.contains("Merged section: env"));
+        let plugins_report =
+            render_config_report(Some("plugins")).expect("plugins config report should render");
+        assert!(plugins_report.contains("Merged section: plugins"));
     }
 
     #[test]
@@ -3778,6 +4363,156 @@ mod tests {
     }
 
     #[test]
+    fn tool_rendering_truncates_large_read_output_for_display_only() {
+        let content = (0..200)
+            .map(|index| format!("line {index:03}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let output = json!({
+            "file": {
+                "filePath": "src/main.rs",
+                "content": content,
+                "numLines": 200,
+                "startLine": 1,
+                "totalLines": 200
+            }
+        })
+        .to_string();
+
+        let rendered = format_tool_result("read_file", &output, false);
+
+        assert!(rendered.contains("line 000"));
+        assert!(rendered.contains("line 079"));
+        assert!(!rendered.contains("line 199"));
+        assert!(rendered.contains("full result preserved in session"));
+        assert!(output.contains("line 199"));
+    }
+
+    #[test]
+    fn tool_rendering_truncates_large_bash_output_for_display_only() {
+        let stdout = (0..120)
+            .map(|index| format!("stdout {index:03}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let output = json!({
+            "stdout": stdout,
+            "stderr": "",
+            "returnCodeInterpretation": "completed successfully"
+        })
+        .to_string();
+
+        let rendered = format_tool_result("bash", &output, false);
+
+        assert!(rendered.contains("stdout 000"));
+        assert!(rendered.contains("stdout 059"));
+        assert!(!rendered.contains("stdout 119"));
+        assert!(rendered.contains("full result preserved in session"));
+        assert!(output.contains("stdout 119"));
+    }
+
+    #[test]
+    fn tool_rendering_truncates_generic_long_output_for_display_only() {
+        let items = (0..120)
+            .map(|index| format!("payload {index:03}"))
+            .collect::<Vec<_>>();
+        let output = json!({
+            "summary": "plugin payload",
+            "items": items,
+        })
+        .to_string();
+
+        let rendered = format_tool_result("plugin_echo", &output, false);
+
+        assert!(rendered.contains("plugin_echo"));
+        assert!(rendered.contains("payload 000"));
+        assert!(rendered.contains("payload 040"));
+        assert!(!rendered.contains("payload 080"));
+        assert!(!rendered.contains("payload 119"));
+        assert!(rendered.contains("full result preserved in session"));
+        assert!(output.contains("payload 119"));
+    }
+
+    #[test]
+    fn tool_rendering_truncates_raw_generic_output_for_display_only() {
+        let output = (0..120)
+            .map(|index| format!("raw {index:03}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+
+        let rendered = format_tool_result("plugin_echo", &output, false);
+
+        assert!(rendered.contains("plugin_echo"));
+        assert!(rendered.contains("raw 000"));
+        assert!(rendered.contains("raw 059"));
+        assert!(!rendered.contains("raw 119"));
+        assert!(rendered.contains("full result preserved in session"));
+        assert!(output.contains("raw 119"));
+    }
+
+    #[test]
+    fn ultraplan_progress_lines_include_phase_step_and_elapsed_status() {
+        let snapshot = InternalPromptProgressState {
+            command_label: "Ultraplan",
+            task_label: "ship plugin progress".to_string(),
+            step: 3,
+            phase: "running read_file".to_string(),
+            detail: Some("reading rust/crates/rusty-claude-cli/src/main.rs".to_string()),
+            saw_final_text: false,
+        };
+
+        let started = format_internal_prompt_progress_line(
+            InternalPromptProgressEvent::Started,
+            &snapshot,
+            Duration::from_secs(0),
+            None,
+        );
+        let heartbeat = format_internal_prompt_progress_line(
+            InternalPromptProgressEvent::Heartbeat,
+            &snapshot,
+            Duration::from_secs(9),
+            None,
+        );
+        let completed = format_internal_prompt_progress_line(
+            InternalPromptProgressEvent::Complete,
+            &snapshot,
+            Duration::from_secs(12),
+            None,
+        );
+        let failed = format_internal_prompt_progress_line(
+            InternalPromptProgressEvent::Failed,
+            &snapshot,
+            Duration::from_secs(12),
+            Some("network timeout"),
+        );
+
+        assert!(started.contains("planning started"));
+        assert!(started.contains("current step 3"));
+        assert!(heartbeat.contains("heartbeat"));
+        assert!(heartbeat.contains("9s elapsed"));
+        assert!(heartbeat.contains("phase running read_file"));
+        assert!(completed.contains("completed"));
+        assert!(completed.contains("3 steps total"));
+        assert!(failed.contains("failed"));
+        assert!(failed.contains("network timeout"));
+    }
+
+    #[test]
+    fn describe_tool_progress_summarizes_known_tools() {
+        assert_eq!(
+            describe_tool_progress("read_file", r#"{"path":"src/main.rs"}"#),
+            "reading src/main.rs"
+        );
+        assert!(
+            describe_tool_progress("bash", r#"{"command":"cargo test -p rusty-claude-cli"}"#)
+                .contains("cargo test -p rusty-claude-cli")
+        );
+        assert_eq!(
+            describe_tool_progress("grep_search", r#"{"pattern":"ultraplan","path":"rust"}"#),
+            "grep `ultraplan` in rust"
+        );
+    }
+
+    #[test]
     fn push_output_block_renders_markdown_text() {
         let mut out = Vec::new();
         let mut events = Vec::new();
@@ -3893,5 +4628,44 @@ mod tests {
             AssistantEvent::ToolUse { name, input, .. }
                 if name == "read_file" && input == "{\"path\":\"rust/Cargo.toml\"}"
         ));
+    }
+
+    #[test]
+    fn response_to_events_ignores_thinking_blocks() {
+        let mut out = Vec::new();
+        let events = response_to_events(
+            MessageResponse {
+                id: "msg-3".to_string(),
+                kind: "message".to_string(),
+                model: "claude-opus-4-6".to_string(),
+                role: "assistant".to_string(),
+                content: vec![
+                    OutputContentBlock::Thinking {
+                        thinking: "step 1".to_string(),
+                        signature: Some("sig_123".to_string()),
+                    },
+                    OutputContentBlock::Text {
+                        text: "Final answer".to_string(),
+                    },
+                ],
+                stop_reason: Some("end_turn".to_string()),
+                stop_sequence: None,
+                usage: Usage {
+                    input_tokens: 1,
+                    output_tokens: 1,
+                    cache_creation_input_tokens: 0,
+                    cache_read_input_tokens: 0,
+                },
+                request_id: None,
+            },
+            &mut out,
+        )
+        .expect("response conversion should succeed");
+
+        assert!(matches!(
+            &events[0],
+            AssistantEvent::TextDelta(text) if text == "Final answer"
+        ));
+        assert!(!String::from_utf8(out).expect("utf8").contains("step 1"));
     }
 }

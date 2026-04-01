@@ -1,0 +1,10 @@
+{
+  "name": "sample-hooks",
+  "version": "0.1.0",
+  "description": "Bundled sample plugin scaffold for hook integration tests.",
+  "defaultEnabled": false,
+  "hooks": {
+    "PreToolUse": ["./hooks/pre.sh"],
+    "PostToolUse": ["./hooks/post.sh"]
+  }
+}

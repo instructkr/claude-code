@@ -76,6 +76,48 @@ async fn send_message_posts_json_and_parses_response() {
 }
 
 #[tokio::test]
+async fn send_message_parses_response_with_thinking_blocks() {
+    let state = Arc::new(Mutex::new(Vec::<CapturedRequest>::new()));
+    let body = concat!(
+        "{",
+        "\"id\":\"msg_thinking\",",
+        "\"type\":\"message\",",
+        "\"role\":\"assistant\",",
+        "\"content\":[",
+        "{\"type\":\"thinking\",\"thinking\":\"step 1\",\"signature\":\"sig_123\"},",
+        "{\"type\":\"text\",\"text\":\"Final answer\"}",
+        "],",
+        "\"model\":\"claude-3-7-sonnet-latest\",",
+        "\"stop_reason\":\"end_turn\",",
+        "\"stop_sequence\":null,",
+        "\"usage\":{\"input_tokens\":12,\"output_tokens\":4}",
+        "}"
+    );
+    let server = spawn_server(
+        state,
+        vec![http_response("200 OK", "application/json", body)],
+    )
+    .await;
+
+    let client = AnthropicClient::new("test-key").with_base_url(server.base_url());
+    let response = client
+        .send_message(&sample_request(false))
+        .await
+        .expect("request should succeed");
+
+    assert_eq!(response.content.len(), 2);
+    assert!(matches!(
+        &response.content[0],
+        OutputContentBlock::Thinking { thinking, signature }
+            if thinking == "step 1" && signature.as_deref() == Some("sig_123")
+    ));
+    assert!(matches!(
+        &response.content[1],
+        OutputContentBlock::Text { text } if text == "Final answer"
+    ));
+}
+
+#[tokio::test]
 async fn stream_message_parses_sse_events_with_tool_use() {
     let state = Arc::new(Mutex::new(Vec::<CapturedRequest>::new()));
     let sse = concat!(
@@ -160,6 +202,85 @@ async fn stream_message_parses_sse_events_with_tool_use() {
     let captured = state.lock().await;
     let request = captured.first().expect("server should capture request");
     assert!(request.body.contains("\"stream\":true"));
+}
+
+#[tokio::test]
+async fn stream_message_parses_sse_events_with_thinking_blocks() {
+    let state = Arc::new(Mutex::new(Vec::<CapturedRequest>::new()));
+    let sse = concat!(
+        "event: message_start\n",
+        "data: {\"type\":\"message_start\",\"message\":{\"id\":\"msg_stream_thinking\",\"type\":\"message\",\"role\":\"assistant\",\"content\":[],\"model\":\"claude-3-7-sonnet-latest\",\"stop_reason\":null,\"stop_sequence\":null,\"usage\":{\"input_tokens\":8,\"output_tokens\":0}}}\n\n",
+        "event: content_block_start\n",
+        "data: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"thinking\",\"thinking\":\"\"}}\n\n",
+        "event: content_block_delta\n",
+        "data: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"thinking_delta\",\"thinking\":\"step 1\"}}\n\n",
+        "event: content_block_delta\n",
+        "data: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"signature_delta\",\"signature\":\"sig_123\"}}\n\n",
+        "event: content_block_stop\n",
+        "data: {\"type\":\"content_block_stop\",\"index\":0}\n\n",
+        "event: content_block_start\n",
+        "data: {\"type\":\"content_block_start\",\"index\":1,\"content_block\":{\"type\":\"text\",\"text\":\"Final answer\"}}\n\n",
+        "event: content_block_stop\n",
+        "data: {\"type\":\"content_block_stop\",\"index\":1}\n\n",
+        "event: message_delta\n",
+        "data: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"end_turn\",\"stop_sequence\":null},\"usage\":{\"input_tokens\":8,\"output_tokens\":1}}\n\n",
+        "event: message_stop\n",
+        "data: {\"type\":\"message_stop\"}\n\n",
+        "data: [DONE]\n\n"
+    );
+    let server = spawn_server(
+        state,
+        vec![http_response("200 OK", "text/event-stream", sse)],
+    )
+    .await;
+
+    let client = AnthropicClient::new("test-key").with_base_url(server.base_url());
+    let mut stream = client
+        .stream_message(&sample_request(false))
+        .await
+        .expect("stream should start");
+
+    let mut events = Vec::new();
+    while let Some(event) = stream
+        .next_event()
+        .await
+        .expect("stream event should parse")
+    {
+        events.push(event);
+    }
+
+    assert_eq!(events.len(), 9);
+    assert!(matches!(
+        &events[1],
+        StreamEvent::ContentBlockStart(ContentBlockStartEvent {
+            content_block: OutputContentBlock::Thinking { thinking, signature },
+            ..
+        }) if thinking.is_empty() && signature.is_none()
+    ));
+    assert!(matches!(
+        &events[2],
+        StreamEvent::ContentBlockDelta(ContentBlockDeltaEvent {
+            delta: ContentBlockDelta::ThinkingDelta { thinking },
+            ..
+        }) if thinking == "step 1"
+    ));
+    assert!(matches!(
+        &events[3],
+        StreamEvent::ContentBlockDelta(ContentBlockDeltaEvent {
+            delta: ContentBlockDelta::SignatureDelta { signature },
+            ..
+        }) if signature == "sig_123"
+    ));
+    assert!(matches!(
+        &events[5],
+        StreamEvent::ContentBlockStart(ContentBlockStartEvent {
+            content_block: OutputContentBlock::Text { text },
+            ..
+        }) if text == "Final answer"
+    ));
+    assert!(matches!(events[6], StreamEvent::ContentBlockStop(_)));
+    assert!(matches!(events[7], StreamEvent::MessageDelta(_)));
+    assert!(matches!(events[8], StreamEvent::MessageStop(_)));
 }
 
 #[tokio::test]

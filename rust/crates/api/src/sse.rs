@@ -216,4 +216,64 @@ mod tests {
             ))
         );
     }
+
+    #[test]
+    fn parses_thinking_content_block_start() {
+        let frame = concat!(
+            "event: content_block_start\n",
+            "data: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"thinking\",\"thinking\":\"\",\"signature\":null}}\n\n"
+        );
+
+        let event = parse_frame(frame).expect("frame should parse");
+        assert_eq!(
+            event,
+            Some(StreamEvent::ContentBlockStart(
+                crate::types::ContentBlockStartEvent {
+                    index: 0,
+                    content_block: OutputContentBlock::Thinking {
+                        thinking: String::new(),
+                        signature: None,
+                    },
+                },
+            ))
+        );
+    }
+
+    #[test]
+    fn parses_thinking_related_deltas() {
+        let thinking = concat!(
+            "event: content_block_delta\n",
+            "data: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"thinking_delta\",\"thinking\":\"step 1\"}}\n\n"
+        );
+        let signature = concat!(
+            "event: content_block_delta\n",
+            "data: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"signature_delta\",\"signature\":\"sig_123\"}}\n\n"
+        );
+
+        let thinking_event = parse_frame(thinking).expect("thinking delta should parse");
+        let signature_event = parse_frame(signature).expect("signature delta should parse");
+
+        assert_eq!(
+            thinking_event,
+            Some(StreamEvent::ContentBlockDelta(
+                crate::types::ContentBlockDeltaEvent {
+                    index: 0,
+                    delta: ContentBlockDelta::ThinkingDelta {
+                        thinking: "step 1".to_string(),
+                    },
+                }
+            ))
+        );
+        assert_eq!(
+            signature_event,
+            Some(StreamEvent::ContentBlockDelta(
+                crate::types::ContentBlockDeltaEvent {
+                    index: 0,
+                    delta: ContentBlockDelta::SignatureDelta {
+                        signature: "sig_123".to_string(),
+                    },
+                }
+            ))
+        );
+    }
 }

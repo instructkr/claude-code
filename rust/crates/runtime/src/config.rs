@@ -36,8 +36,18 @@ pub struct RuntimeConfig {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct RuntimePluginConfig {
+    enabled_plugins: BTreeMap<String, bool>,
+    external_directories: Vec<String>,
+    install_root: Option<String>,
+    registry_path: Option<String>,
+    bundled_root: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct RuntimeFeatureConfig {
     hooks: RuntimeHookConfig,
+    plugins: RuntimePluginConfig,
     mcp: McpConfigCollection,
     oauth: Option<OAuthConfig>,
     model: Option<String>,
@@ -174,11 +184,13 @@ impl ConfigLoader {
     #[must_use]
     pub fn default_for(cwd: impl Into<PathBuf>) -> Self {
         let cwd = cwd.into();
-        let config_home = std::env::var_os("CLAUDE_CONFIG_HOME")
-            .map(PathBuf::from)
-            .or_else(|| std::env::var_os("HOME").map(|home| PathBuf::from(home).join(".claude")))
-            .unwrap_or_else(|| PathBuf::from(".claude"));
+        let config_home = default_config_home();
         Self { cwd, config_home }
+    }
+
+    #[must_use]
+    pub fn config_home(&self) -> &Path {
+        &self.config_home
     }
 
     #[must_use]
@@ -229,6 +241,7 @@ impl ConfigLoader {
 
         let feature_config = RuntimeFeatureConfig {
             hooks: parse_optional_hooks_config(&merged_value)?,
+            plugins: parse_optional_plugin_config(&merged_value)?,
             mcp: McpConfigCollection {
                 servers: mcp_servers,
             },
@@ -292,6 +305,11 @@ impl RuntimeConfig {
     }
 
     #[must_use]
+    pub fn plugins(&self) -> &RuntimePluginConfig {
+        &self.feature_config.plugins
+    }
+
+    #[must_use]
     pub fn oauth(&self) -> Option<&OAuthConfig> {
         self.feature_config.oauth.as_ref()
     }
@@ -320,8 +338,19 @@ impl RuntimeFeatureConfig {
     }
 
     #[must_use]
+    pub fn with_plugins(mut self, plugins: RuntimePluginConfig) -> Self {
+        self.plugins = plugins;
+        self
+    }
+
+    #[must_use]
     pub fn hooks(&self) -> &RuntimeHookConfig {
         &self.hooks
+    }
+
+    #[must_use]
+    pub fn plugins(&self) -> &RuntimePluginConfig {
+        &self.plugins
     }
 
     #[must_use]
@@ -350,6 +379,53 @@ impl RuntimeFeatureConfig {
     }
 }
 
+impl RuntimePluginConfig {
+    #[must_use]
+    pub fn enabled_plugins(&self) -> &BTreeMap<String, bool> {
+        &self.enabled_plugins
+    }
+
+    #[must_use]
+    pub fn external_directories(&self) -> &[String] {
+        &self.external_directories
+    }
+
+    #[must_use]
+    pub fn install_root(&self) -> Option<&str> {
+        self.install_root.as_deref()
+    }
+
+    #[must_use]
+    pub fn registry_path(&self) -> Option<&str> {
+        self.registry_path.as_deref()
+    }
+
+    #[must_use]
+    pub fn bundled_root(&self) -> Option<&str> {
+        self.bundled_root.as_deref()
+    }
+
+    pub fn set_plugin_state(&mut self, plugin_id: String, enabled: bool) {
+        self.enabled_plugins.insert(plugin_id, enabled);
+    }
+
+    #[must_use]
+    pub fn state_for(&self, plugin_id: &str, default_enabled: bool) -> bool {
+        self.enabled_plugins
+            .get(plugin_id)
+            .copied()
+            .unwrap_or(default_enabled)
+    }
+}
+
+#[must_use]
+pub fn default_config_home() -> PathBuf {
+    std::env::var_os("CLAUDE_CONFIG_HOME")
+        .map(PathBuf::from)
+        .or_else(|| std::env::var_os("HOME").map(|home| PathBuf::from(home).join(".claude")))
+        .unwrap_or_else(|| PathBuf::from(".claude"))
+}
+
 impl RuntimeHookConfig {
     #[must_use]
     pub fn new(pre_tool_use: Vec<String>, post_tool_use: Vec<String>) -> Self {
@@ -367,6 +443,18 @@ impl RuntimeHookConfig {
     #[must_use]
     pub fn post_tool_use(&self) -> &[String] {
         &self.post_tool_use
+    }
+
+    #[must_use]
+    pub fn merged(&self, other: &Self) -> Self {
+        let mut merged = self.clone();
+        merged.extend(other);
+        merged
+    }
+
+    pub fn extend(&mut self, other: &Self) {
+        extend_unique(&mut self.pre_tool_use, other.pre_tool_use());
+        extend_unique(&mut self.post_tool_use, other.post_tool_use());
     }
 }
 
@@ -482,6 +570,36 @@ fn parse_optional_hooks_config(root: &JsonValue) -> Result<RuntimeHookConfig, Co
         post_tool_use: optional_string_array(hooks, "PostToolUse", "merged settings.hooks")?
             .unwrap_or_default(),
     })
+}
+
+fn parse_optional_plugin_config(root: &JsonValue) -> Result<RuntimePluginConfig, ConfigError> {
+    let Some(object) = root.as_object() else {
+        return Ok(RuntimePluginConfig::default());
+    };
+
+    let mut config = RuntimePluginConfig::default();
+    if let Some(enabled_plugins) = object.get("enabledPlugins") {
+        config.enabled_plugins = parse_bool_map(enabled_plugins, "merged settings.enabledPlugins")?;
+    }
+
+    let Some(plugins_value) = object.get("plugins") else {
+        return Ok(config);
+    };
+    let plugins = expect_object(plugins_value, "merged settings.plugins")?;
+
+    if let Some(enabled_value) = plugins.get("enabled") {
+        config.enabled_plugins = parse_bool_map(enabled_value, "merged settings.plugins.enabled")?;
+    }
+    config.external_directories =
+        optional_string_array(plugins, "externalDirectories", "merged settings.plugins")?
+            .unwrap_or_default();
+    config.install_root =
+        optional_string(plugins, "installRoot", "merged settings.plugins")?.map(str::to_string);
+    config.registry_path =
+        optional_string(plugins, "registryPath", "merged settings.plugins")?.map(str::to_string);
+    config.bundled_root =
+        optional_string(plugins, "bundledRoot", "merged settings.plugins")?.map(str::to_string);
+    Ok(config)
 }
 
 fn parse_optional_permission_mode(
@@ -716,6 +834,24 @@ fn optional_u16(
     }
 }
 
+fn parse_bool_map(value: &JsonValue, context: &str) -> Result<BTreeMap<String, bool>, ConfigError> {
+    let Some(map) = value.as_object() else {
+        return Err(ConfigError::Parse(format!(
+            "{context}: expected JSON object"
+        )));
+    };
+    map.iter()
+        .map(|(key, value)| {
+            value
+                .as_bool()
+                .map(|enabled| (key.clone(), enabled))
+                .ok_or_else(|| {
+                    ConfigError::Parse(format!("{context}: field {key} must be a boolean"))
+                })
+        })
+        .collect()
+}
+
 fn optional_string_array(
     object: &BTreeMap<String, JsonValue>,
     key: &str,
@@ -787,6 +923,18 @@ fn deep_merge_objects(
                 target.insert(key.clone(), value.clone());
             }
         }
+    }
+}
+
+fn extend_unique(target: &mut Vec<String>, values: &[String]) {
+    for value in values {
+        push_unique(target, value.clone());
+    }
+}
+
+fn push_unique(target: &mut Vec<String>, value: String) {
+    if !target.iter().any(|existing| existing == &value) {
+        target.push(value);
     }
 }
 
@@ -1029,6 +1177,96 @@ mod tests {
         assert_eq!(oauth.client_id, "runtime-client");
         assert_eq!(oauth.callback_port, Some(54_545));
         assert_eq!(oauth.scopes, vec!["org:read", "user:write"]);
+
+        fs::remove_dir_all(root).expect("cleanup temp dir");
+    }
+
+    #[test]
+    fn parses_plugin_config_from_enabled_plugins() {
+        let root = temp_dir();
+        let cwd = root.join("project");
+        let home = root.join("home").join(".claude");
+        fs::create_dir_all(cwd.join(".claude")).expect("project config dir");
+        fs::create_dir_all(&home).expect("home config dir");
+
+        fs::write(
+            home.join("settings.json"),
+            r#"{
+              "enabledPlugins": {
+                "tool-guard@builtin": true,
+                "sample-plugin@external": false
+              }
+            }"#,
+        )
+        .expect("write user settings");
+
+        let loaded = ConfigLoader::new(&cwd, &home)
+            .load()
+            .expect("config should load");
+
+        assert_eq!(
+            loaded.plugins().enabled_plugins().get("tool-guard@builtin"),
+            Some(&true)
+        );
+        assert_eq!(
+            loaded
+                .plugins()
+                .enabled_plugins()
+                .get("sample-plugin@external"),
+            Some(&false)
+        );
+
+        fs::remove_dir_all(root).expect("cleanup temp dir");
+    }
+
+    #[test]
+    fn parses_plugin_config() {
+        let root = temp_dir();
+        let cwd = root.join("project");
+        let home = root.join("home").join(".claude");
+        fs::create_dir_all(cwd.join(".claude")).expect("project config dir");
+        fs::create_dir_all(&home).expect("home config dir");
+
+        fs::write(
+            home.join("settings.json"),
+            r#"{
+              "enabledPlugins": {
+                "core-helpers@builtin": true
+              },
+              "plugins": {
+                "externalDirectories": ["./external-plugins"],
+                "installRoot": "plugin-cache/installed",
+                "registryPath": "plugin-cache/installed.json",
+                "bundledRoot": "./bundled-plugins"
+              }
+            }"#,
+        )
+        .expect("write plugin settings");
+
+        let loaded = ConfigLoader::new(&cwd, &home)
+            .load()
+            .expect("config should load");
+
+        assert_eq!(
+            loaded
+                .plugins()
+                .enabled_plugins()
+                .get("core-helpers@builtin"),
+            Some(&true)
+        );
+        assert_eq!(
+            loaded.plugins().external_directories(),
+            &["./external-plugins".to_string()]
+        );
+        assert_eq!(
+            loaded.plugins().install_root(),
+            Some("plugin-cache/installed")
+        );
+        assert_eq!(
+            loaded.plugins().registry_path(),
+            Some("plugin-cache/installed.json")
+        );
+        assert_eq!(loaded.plugins().bundled_root(), Some("./bundled-plugins"));
 
         fs::remove_dir_all(root).expect("cleanup temp dir");
     }

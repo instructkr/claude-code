@@ -1,0 +1,10 @@
+{
+  "name": "example-bundled",
+  "version": "0.1.0",
+  "description": "Example bundled plugin scaffold for the Rust plugin system",
+  "defaultEnabled": false,
+  "hooks": {
+    "PreToolUse": ["./hooks/pre.sh"],
+    "PostToolUse": ["./hooks/post.sh"]
+  }
+}

@@ -1,5 +1,10 @@
 use crate::session::{ContentBlock, ConversationMessage, MessageRole, Session};
 
+const COMPACT_CONTINUATION_PREAMBLE: &str =
+    "This session is being continued from a previous conversation that ran out of context. The summary below covers the earlier portion of the conversation.\n\n";
+const COMPACT_RECENT_MESSAGES_NOTE: &str = "Recent messages are preserved verbatim.";
+const COMPACT_DIRECT_RESUME_INSTRUCTION: &str = "Continue the conversation from where it left off without asking the user any further questions. Resume directly — do not acknowledge the summary, do not recap what was happening, and do not preface with continuation text.";
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct CompactionConfig {
     pub preserve_recent_messages: usize,
@@ -30,8 +35,15 @@ pub fn estimate_session_tokens(session: &Session) -> usize {
 
 #[must_use]
 pub fn should_compact(session: &Session, config: CompactionConfig) -> bool {
-    session.messages.len() > config.preserve_recent_messages
-        && estimate_session_tokens(session) >= config.max_estimated_tokens
+    let start = compacted_summary_prefix_len(session);
+    let compactable = &session.messages[start..];
+
+    compactable.len() > config.preserve_recent_messages
+        && compactable
+            .iter()
+            .map(estimate_message_tokens)
+            .sum::<usize>()
+            >= config.max_estimated_tokens
 }
 
 #[must_use]
@@ -56,16 +68,18 @@ pub fn get_compact_continuation_message(
     recent_messages_preserved: bool,
 ) -> String {
     let mut base = format!(
-        "This session is being continued from a previous conversation that ran out of context. The summary below covers the earlier portion of the conversation.\n\n{}",
+        "{COMPACT_CONTINUATION_PREAMBLE}{}",
         format_compact_summary(summary)
     );
 
     if recent_messages_preserved {
-        base.push_str("\n\nRecent messages are preserved verbatim.");
+        base.push_str("\n\n");
+        base.push_str(COMPACT_RECENT_MESSAGES_NOTE);
     }
 
     if suppress_follow_up_questions {
-        base.push_str("\nContinue the conversation from where it left off without asking the user any further questions. Resume directly — do not acknowledge the summary, do not recap what was happening, and do not preface with continuation text.");
+        base.push('\n');
+        base.push_str(COMPACT_DIRECT_RESUME_INSTRUCTION);
     }
 
     base
@@ -82,13 +96,19 @@ pub fn compact_session(session: &Session, config: CompactionConfig) -> Compactio
         };
     }
 
+    let existing_summary = session
+        .messages
+        .first()
+        .and_then(extract_existing_compacted_summary);
+    let compacted_prefix_len = usize::from(existing_summary.is_some());
     let keep_from = session
         .messages
         .len()
         .saturating_sub(config.preserve_recent_messages);
-    let removed = &session.messages[..keep_from];
+    let removed = &session.messages[compacted_prefix_len..keep_from];
     let preserved = session.messages[keep_from..].to_vec();
-    let summary = summarize_messages(removed);
+    let summary =
+        merge_compact_summaries(existing_summary.as_deref(), &summarize_messages(removed));
     let formatted_summary = format_compact_summary(&summary);
     let continuation = get_compact_continuation_message(&summary, true, !preserved.is_empty());
 
@@ -108,6 +128,16 @@ pub fn compact_session(session: &Session, config: CompactionConfig) -> Compactio
         },
         removed_message_count: removed.len(),
     }
+}
+
+fn compacted_summary_prefix_len(session: &Session) -> usize {
+    usize::from(
+        session
+            .messages
+            .first()
+            .and_then(extract_existing_compacted_summary)
+            .is_some(),
+    )
 }
 
 fn summarize_messages(messages: &[ConversationMessage]) -> String {
@@ -193,6 +223,41 @@ fn summarize_messages(messages: &[ConversationMessage]) -> String {
             .join(" | ");
         lines.push(format!("  - {role}: {content}"));
     }
+    lines.push("</summary>".to_string());
+    lines.join("\n")
+}
+
+fn merge_compact_summaries(existing_summary: Option<&str>, new_summary: &str) -> String {
+    let Some(existing_summary) = existing_summary else {
+        return new_summary.to_string();
+    };
+
+    let previous_highlights = extract_summary_highlights(existing_summary);
+    let new_formatted_summary = format_compact_summary(new_summary);
+    let new_highlights = extract_summary_highlights(&new_formatted_summary);
+    let new_timeline = extract_summary_timeline(&new_formatted_summary);
+
+    let mut lines = vec!["<summary>".to_string(), "Conversation summary:".to_string()];
+
+    if !previous_highlights.is_empty() {
+        lines.push("- Previously compacted context:".to_string());
+        lines.extend(
+            previous_highlights
+                .into_iter()
+                .map(|line| format!("  {line}")),
+        );
+    }
+
+    if !new_highlights.is_empty() {
+        lines.push("- Newly compacted context:".to_string());
+        lines.extend(new_highlights.into_iter().map(|line| format!("  {line}")));
+    }
+
+    if !new_timeline.is_empty() {
+        lines.push("- Key timeline:".to_string());
+        lines.extend(new_timeline.into_iter().map(|line| format!("  {line}")));
+    }
+
     lines.push("</summary>".to_string());
     lines.join("\n")
 }
@@ -374,11 +439,71 @@ fn collapse_blank_lines(content: &str) -> String {
     result
 }
 
+fn extract_existing_compacted_summary(message: &ConversationMessage) -> Option<String> {
+    if message.role != MessageRole::System {
+        return None;
+    }
+
+    let text = first_text_block(message)?;
+    let summary = text.strip_prefix(COMPACT_CONTINUATION_PREAMBLE)?;
+    let summary = summary
+        .split_once(&format!("\n\n{COMPACT_RECENT_MESSAGES_NOTE}"))
+        .map_or(summary, |(value, _)| value);
+    let summary = summary
+        .split_once(&format!("\n{COMPACT_DIRECT_RESUME_INSTRUCTION}"))
+        .map_or(summary, |(value, _)| value);
+    Some(summary.trim().to_string())
+}
+
+fn extract_summary_highlights(summary: &str) -> Vec<String> {
+    let mut lines = Vec::new();
+    let mut in_timeline = false;
+
+    for line in format_compact_summary(summary).lines() {
+        let trimmed = line.trim_end();
+        if trimmed.is_empty() || trimmed == "Summary:" || trimmed == "Conversation summary:" {
+            continue;
+        }
+        if trimmed == "- Key timeline:" {
+            in_timeline = true;
+            continue;
+        }
+        if in_timeline {
+            continue;
+        }
+        lines.push(trimmed.to_string());
+    }
+
+    lines
+}
+
+fn extract_summary_timeline(summary: &str) -> Vec<String> {
+    let mut lines = Vec::new();
+    let mut in_timeline = false;
+
+    for line in format_compact_summary(summary).lines() {
+        let trimmed = line.trim_end();
+        if trimmed == "- Key timeline:" {
+            in_timeline = true;
+            continue;
+        }
+        if !in_timeline {
+            continue;
+        }
+        if trimmed.is_empty() {
+            break;
+        }
+        lines.push(trimmed.to_string());
+    }
+
+    lines
+}
+
 #[cfg(test)]
 mod tests {
     use super::{
         collect_key_files, compact_session, estimate_session_tokens, format_compact_summary,
-        infer_pending_work, should_compact, CompactionConfig,
+        get_compact_continuation_message, infer_pending_work, should_compact, CompactionConfig,
     };
     use crate::session::{ContentBlock, ConversationMessage, MessageRole, Session};
 
@@ -451,6 +576,98 @@ mod tests {
         assert!(
             estimate_session_tokens(&result.compacted_session) < estimate_session_tokens(&session)
         );
+    }
+
+    #[test]
+    fn keeps_previous_compacted_context_when_compacting_again() {
+        let initial_session = Session {
+            version: 1,
+            messages: vec![
+                ConversationMessage::user_text("Investigate rust/crates/runtime/src/compact.rs"),
+                ConversationMessage::assistant(vec![ContentBlock::Text {
+                    text: "I will inspect the compact flow.".to_string(),
+                }]),
+                ConversationMessage::user_text(
+                    "Also update rust/crates/runtime/src/conversation.rs",
+                ),
+                ConversationMessage::assistant(vec![ContentBlock::Text {
+                    text: "Next: preserve prior summary context during auto compact.".to_string(),
+                }]),
+            ],
+        };
+        let config = CompactionConfig {
+            preserve_recent_messages: 2,
+            max_estimated_tokens: 1,
+        };
+
+        let first = compact_session(&initial_session, config);
+        let mut follow_up_messages = first.compacted_session.messages.clone();
+        follow_up_messages.extend([
+            ConversationMessage::user_text("Please add regression tests for compaction."),
+            ConversationMessage::assistant(vec![ContentBlock::Text {
+                text: "Working on regression coverage now.".to_string(),
+            }]),
+        ]);
+
+        let second = compact_session(
+            &Session {
+                version: 1,
+                messages: follow_up_messages,
+            },
+            config,
+        );
+
+        assert!(second
+            .formatted_summary
+            .contains("Previously compacted context:"));
+        assert!(second
+            .formatted_summary
+            .contains("Scope: 2 earlier messages compacted"));
+        assert!(second
+            .formatted_summary
+            .contains("Newly compacted context:"));
+        assert!(second
+            .formatted_summary
+            .contains("Also update rust/crates/runtime/src/conversation.rs"));
+        assert!(matches!(
+            &second.compacted_session.messages[0].blocks[0],
+            ContentBlock::Text { text }
+                if text.contains("Previously compacted context:")
+                    && text.contains("Newly compacted context:")
+        ));
+        assert!(matches!(
+            &second.compacted_session.messages[1].blocks[0],
+            ContentBlock::Text { text } if text.contains("Please add regression tests for compaction.")
+        ));
+    }
+
+    #[test]
+    fn ignores_existing_compacted_summary_when_deciding_to_recompact() {
+        let summary = "<summary>Conversation summary:\n- Scope: earlier work preserved.\n- Key timeline:\n  - user: large preserved context\n</summary>";
+        let session = Session {
+            version: 1,
+            messages: vec![
+                ConversationMessage {
+                    role: MessageRole::System,
+                    blocks: vec![ContentBlock::Text {
+                        text: get_compact_continuation_message(summary, true, true),
+                    }],
+                    usage: None,
+                },
+                ConversationMessage::user_text("tiny"),
+                ConversationMessage::assistant(vec![ContentBlock::Text {
+                    text: "recent".to_string(),
+                }]),
+            ],
+        };
+
+        assert!(!should_compact(
+            &session,
+            CompactionConfig {
+                preserve_recent_messages: 2,
+                max_estimated_tokens: 1,
+            }
+        ));
     }
 
     #[test]

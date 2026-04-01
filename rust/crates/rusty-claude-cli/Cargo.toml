@@ -17,6 +17,7 @@ crossterm = "0.28"
 pulldown-cmark = "0.13"
 rustyline = "15"
 runtime = { path = "../runtime" }
+plugins = { path = "../plugins" }
 serde_json = "1"
 syntect = "5"
 tokio = { version = "1", features = ["rt-multi-thread", "time"] }

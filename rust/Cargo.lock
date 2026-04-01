@@ -111,6 +111,7 @@ dependencies = [
 name = "commands"
 version = "0.1.0"
 dependencies = [
+ "plugins",
  "runtime",
 ]
 
@@ -826,6 +827,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "plugins"
+version = "0.1.0"
+dependencies = [
+ "serde",
+ "serde_json",
+]
+
+[[package]]
 name = "potential_utf"
 version = "0.1.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1092,6 +1101,7 @@ name = "runtime"
 version = "0.1.0"
 dependencies = [
  "glob",
+ "plugins",
  "regex",
  "serde",
  "serde_json",
@@ -1181,6 +1191,7 @@ dependencies = [
  "commands",
  "compat-harness",
  "crossterm",
+ "plugins",
  "pulldown-cmark",
  "runtime",
  "rustyline",
@@ -1546,6 +1557,7 @@ name = "tools"
 version = "0.1.0"
 dependencies = [
  "api",
+ "plugins",
  "reqwest",
  "runtime",
  "serde",
