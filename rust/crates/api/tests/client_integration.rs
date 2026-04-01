@@ -3,7 +3,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use api::{
-    AnthropicClient, ApiError, ContentBlockDelta, ContentBlockDeltaEvent, ContentBlockStartEvent,
+    ApiClient, ApiError, ContentBlockDelta, ContentBlockDeltaEvent, ContentBlockStartEvent,
     InputContentBlock, InputMessage, MessageDeltaEvent, MessageRequest, OutputContentBlock,
     StreamEvent, ToolChoice, ToolDefinition,
 };
@@ -34,7 +34,7 @@ async fn send_message_posts_json_and_parses_response() {
     )
     .await;
 
-    let client = AnthropicClient::new("test-key")
+    let client = ApiClient::new("test-key")
         .with_auth_token(Some("proxy-token".to_string()))
         .with_base_url(server.base_url());
     let response = client
@@ -104,7 +104,7 @@ async fn stream_message_parses_sse_events_with_tool_use() {
     )
     .await;
 
-    let client = AnthropicClient::new("test-key")
+    let client = ApiClient::new("test-key")
         .with_auth_token(Some("proxy-token".to_string()))
         .with_base_url(server.base_url());
     let mut stream = client
@@ -182,7 +182,7 @@ async fn retries_retryable_failures_before_succeeding() {
     )
     .await;
 
-    let client = AnthropicClient::new("test-key")
+    let client = ApiClient::new("test-key")
         .with_base_url(server.base_url())
         .with_retry_policy(2, Duration::from_millis(1), Duration::from_millis(2));
 
@@ -215,7 +215,7 @@ async fn surfaces_retry_exhaustion_for_persistent_retryable_errors() {
     )
     .await;
 
-    let client = AnthropicClient::new("test-key")
+    let client = ApiClient::new("test-key")
         .with_base_url(server.base_url())
         .with_retry_policy(1, Duration::from_millis(1), Duration::from_millis(2));
 
@@ -246,7 +246,7 @@ async fn surfaces_retry_exhaustion_for_persistent_retryable_errors() {
 #[tokio::test]
 #[ignore = "requires ANTHROPIC_API_KEY and network access"]
 async fn live_stream_smoke_test() {
-    let client = AnthropicClient::from_env().expect("ANTHROPIC_API_KEY must be set");
+    let client = ApiClient::from_env().expect("ANTHROPIC_API_KEY must be set");
     let mut stream = client
         .stream_message(&MessageRequest {
             model: std::env::var("ANTHROPIC_MODEL")

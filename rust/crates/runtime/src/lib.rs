@@ -24,11 +24,11 @@ pub use compact::{
     get_compact_continuation_message, should_compact, CompactionConfig, CompactionResult,
 };
 pub use config::{
-    ConfigEntry, ConfigError, ConfigLoader, ConfigSource, McpClaudeAiProxyServerConfig,
+    ConfigEntry, ConfigError, ConfigLoader, ConfigSource, McpManagedProxyServerConfig,
     McpConfigCollection, McpOAuthConfig, McpRemoteServerConfig, McpSdkServerConfig,
     McpServerConfig, McpStdioServerConfig, McpTransport, McpWebSocketServerConfig, OAuthConfig,
     ResolvedPermissionMode, RuntimeConfig, RuntimeFeatureConfig, RuntimeHookConfig,
-    RuntimePermissionRuleConfig, ScopedMcpServerConfig, CLAUDE_CODE_SETTINGS_SCHEMA_NAME,
+    RuntimePermissionRuleConfig, ScopedMcpServerConfig, CLAW_SETTINGS_SCHEMA_NAME,
 };
 pub use conversation::{
     ApiClient, ApiRequest, AssistantEvent, ConversationRuntime, RuntimeError, StaticToolExecutor,
@@ -47,7 +47,7 @@ pub use mcp::{
     scoped_mcp_config_hash, unwrap_ccr_proxy_url,
 };
 pub use mcp_client::{
-    McpClaudeAiProxyTransport, McpClientAuth, McpClientBootstrap, McpClientTransport,
+    McpManagedProxyTransport, McpClientAuth, McpClientBootstrap, McpClientTransport,
     McpRemoteTransport, McpSdkTransport, McpStdioTransport,
 };
 pub use mcp_stdio::{

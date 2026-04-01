@@ -10,7 +10,7 @@ pub enum McpClientTransport {
     Http(McpRemoteTransport),
     WebSocket(McpRemoteTransport),
     Sdk(McpSdkTransport),
-    ClaudeAiProxy(McpClaudeAiProxyTransport),
+    ManagedProxy(McpManagedProxyTransport),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -34,7 +34,7 @@ pub struct McpSdkTransport {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct McpClaudeAiProxyTransport {
+pub struct McpManagedProxyTransport {
     pub url: String,
     pub id: String,
 }
@@ -97,8 +97,8 @@ impl McpClientTransport {
             McpServerConfig::Sdk(config) => Self::Sdk(McpSdkTransport {
                 name: config.name.clone(),
             }),
-            McpServerConfig::ClaudeAiProxy(config) => {
-                Self::ClaudeAiProxy(McpClaudeAiProxyTransport {
+            McpServerConfig::ManagedProxy(config) => {
+                Self::ManagedProxy(McpManagedProxyTransport {
                     url: config.url.clone(),
                     id: config.id.clone(),
                 })

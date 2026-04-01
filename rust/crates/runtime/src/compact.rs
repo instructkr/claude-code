@@ -465,10 +465,10 @@ mod tests {
     #[test]
     fn extracts_key_files_from_message_content() {
         let files = collect_key_files(&[ConversationMessage::user_text(
-            "Update rust/crates/runtime/src/compact.rs and rust/crates/rusty-claude-cli/src/main.rs next.",
+            "Update rust/crates/runtime/src/compact.rs and rust/crates/claw-cli/src/main.rs next.",
         )]);
         assert!(files.contains(&"rust/crates/runtime/src/compact.rs".to_string()));
-        assert!(files.contains(&"rust/crates/rusty-claude-cli/src/main.rs".to_string()));
+        assert!(files.contains(&"rust/crates/claw-cli/src/main.rs".to_string()));
     }
 
     #[test]

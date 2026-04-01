@@ -70,16 +70,16 @@ fn upstream_repo_candidates(primary_repo_root: &Path) -> Vec<PathBuf> {
     }
 
     for ancestor in primary_repo_root.ancestors().take(4) {
-        candidates.push(ancestor.join("claude-code"));
+        candidates.push(ancestor.join("claw-code"));
         candidates.push(ancestor.join("clawd-code"));
     }
 
     candidates.push(
         primary_repo_root
             .join("reference-source")
-            .join("claude-code"),
+            .join("claw-code"),
     );
-    candidates.push(primary_repo_root.join("vendor").join("claude-code"));
+    candidates.push(primary_repo_root.join("vendor").join("claw-code"));
 
     let mut deduped = Vec::new();
     for candidate in candidates {
@@ -196,7 +196,7 @@ pub fn extract_bootstrap_plan(source: &str) -> BootstrapPlan {
     if source.contains("--dump-system-prompt") {
         phases.push(BootstrapPhase::SystemPromptFastPath);
     }
-    if source.contains("--claude-in-chrome-mcp") {
+    if source.contains("--claw-in-chrome-mcp") {
         phases.push(BootstrapPhase::ChromeMcpFastPath);
     }
     if source.contains("--daemon-worker") {

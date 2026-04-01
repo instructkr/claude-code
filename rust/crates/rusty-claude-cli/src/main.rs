@@ -14,7 +14,7 @@ use std::thread::{self, JoinHandle};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use api::{
-    resolve_startup_auth_source, AnthropicClient, AuthSource, ContentBlockDelta, InputContentBlock,
+    resolve_startup_auth_source, ApiClient as ApiHttpClient, AuthSource, ContentBlockDelta, InputContentBlock,
     InputMessage, MessageRequest, MessageResponse, OutputContentBlock,
     StreamEvent as ApiStreamEvent, ToolChoice, ToolDefinition, ToolResultContentBlock,
 };
@@ -444,7 +444,7 @@ fn dump_manifests() {
 }
 
 fn print_bootstrap_plan() {
-    for phase in runtime::BootstrapPlan::claude_code_default().phases() {
+    for phase in runtime::BootstrapPlan::default_bootstrap().phases() {
         println!("- {phase:?}");
     }
 }
@@ -501,7 +501,7 @@ fn run_login() -> Result<(), Box<dyn std::error::Error>> {
         return Err(io::Error::new(io::ErrorKind::InvalidData, "oauth state mismatch").into());
     }
 
-    let client = AnthropicClient::from_auth(AuthSource::None).with_base_url(api::read_base_url());
+    let client = ApiHttpClient::from_auth(AuthSource::None).with_base_url(api::read_base_url());
     let exchange_request =
         OAuthTokenExchangeRequest::from_config(oauth, code, state, pkce.verifier, redirect_uri);
     let runtime = tokio::runtime::Runtime::new()?;
@@ -982,7 +982,7 @@ struct LiveCli {
     allowed_tools: Option<AllowedToolSet>,
     permission_mode: PermissionMode,
     system_prompt: Vec<String>,
-    runtime: ConversationRuntime<AnthropicRuntimeClient, CliToolExecutor>,
+    runtime: ConversationRuntime<ClawRuntimeClient, CliToolExecutor>,
     session: SessionHandle,
 }
 
@@ -1101,7 +1101,7 @@ impl LiveCli {
         emit_output: bool,
     ) -> Result<
         (
-            ConversationRuntime<AnthropicRuntimeClient, CliToolExecutor>,
+            ConversationRuntime<ClawRuntimeClient, CliToolExecutor>,
             HookAbortMonitor,
         ),
         Box<dyn std::error::Error>,
@@ -1531,7 +1531,7 @@ impl LiveCli {
 
 fn sessions_dir() -> Result<PathBuf, Box<dyn std::error::Error>> {
     let cwd = env::current_dir()?;
-    let path = cwd.join(".claude").join("sessions");
+    let path = cwd.join(".claw").join("sessions");
     fs::create_dir_all(&path)?;
     Ok(path)
 }
@@ -1999,12 +1999,12 @@ fn build_runtime(
     emit_output: bool,
     allowed_tools: Option<AllowedToolSet>,
     permission_mode: PermissionMode,
-) -> Result<ConversationRuntime<AnthropicRuntimeClient, CliToolExecutor>, Box<dyn std::error::Error>>
+) -> Result<ConversationRuntime<ClawRuntimeClient, CliToolExecutor>, Box<dyn std::error::Error>>
 {
     let feature_config = build_runtime_feature_config()?;
     let mut runtime = ConversationRuntime::new_with_features(
         session,
-        AnthropicRuntimeClient::new(model, enable_tools, emit_output, allowed_tools.clone())?,
+        ClawRuntimeClient::new(model, enable_tools, emit_output, allowed_tools.clone())?,
         CliToolExecutor::new(allowed_tools, emit_output),
         permission_policy(permission_mode, &feature_config),
         system_prompt,
@@ -2098,16 +2098,16 @@ impl runtime::PermissionPrompter for CliPermissionPrompter {
     }
 }
 
-struct AnthropicRuntimeClient {
+struct ClawRuntimeClient {
     runtime: tokio::runtime::Runtime,
-    client: AnthropicClient,
+    client: ApiHttpClient,
     model: String,
     enable_tools: bool,
     emit_output: bool,
     allowed_tools: Option<AllowedToolSet>,
 }
 
-impl AnthropicRuntimeClient {
+impl ClawRuntimeClient {
     fn new(
         model: String,
         enable_tools: bool,
@@ -2116,7 +2116,7 @@ impl AnthropicRuntimeClient {
     ) -> Result<Self, Box<dyn std::error::Error>> {
         Ok(Self {
             runtime: tokio::runtime::Runtime::new()?,
-            client: AnthropicClient::from_auth(resolve_cli_auth_source()?)
+            client: ApiHttpClient::from_auth(resolve_cli_auth_source()?)
                 .with_base_url(api::read_base_url()),
             model,
             enable_tools,
@@ -2136,7 +2136,7 @@ fn resolve_cli_auth_source() -> Result<AuthSource, Box<dyn std::error::Error>> {
     })?)
 }
 
-impl ApiClient for AnthropicRuntimeClient {
+impl ApiClient for ClawRuntimeClient {
     #[allow(clippy::too_many_lines)]
     fn stream(&mut self, request: ApiRequest) -> Result<Vec<AssistantEvent>, RuntimeError> {
         let message_request = MessageRequest {
@@ -3448,8 +3448,8 @@ mod tests {
 
     #[test]
     fn init_template_mentions_detected_rust_workspace() {
-        let rendered = crate::init::render_init_claude_md(std::path::Path::new("."));
-        assert!(rendered.contains("# CLAUDE.md"));
+        let rendered = crate::init::render_init_instructions_md(std::path::Path::new("."));
+        assert!(rendered.contains("# INSTRUCTIONS.md"));
         assert!(rendered.contains("cargo clippy --workspace --all-targets -- -D warnings"));
     }
 
