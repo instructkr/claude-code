@@ -8949,3 +8949,107 @@ Given the complexity, **better path forward:**
 
 ---
 
+
+---
+
+## Pinpoint #164. JSON envelope schema-vs-binary divergence: SCHEMAS.md specifies a different envelope shape than the binary actually emits
+
+**Status: 📋 FILED (cycle #76, 2026-04-23 04:38 Seoul).**
+
+**Surface.** The JSON envelope documented in SCHEMAS.md does NOT match what the binary actually emits.
+
+**Example — SCHEMAS.md says:**
+```json
+{
+  "timestamp": "2026-04-22T10:10:00Z",
+  "command": "doctor",
+  "exit_code": 1,
+  "output_format": "json",
+  "schema_version": "1.0",
+  "error": {
+    "kind": "filesystem",
+    "operation": "write",
+    "target": "/tmp/nonexistent/out.md",
+    "retryable": true,
+    "message": "No such file or directory",
+    "hint": "intermediate directory does not exist; try mkdir -p /tmp/nonexistent"
+  }
+}
+```
+
+**Binary actually emits:**
+```json
+{
+  "error": "unrecognized argument `foo` for subcommand `doctor`",
+  "hint": "Run `claw --help` for usage.",
+  "kind": "cli_parse",
+  "type": "error"
+}
+```
+
+**Divergences:**
+
+1. **Missing required fields from schema:** `timestamp`, `command`, `exit_code`, `output_format`, `schema_version`
+2. **Wrong field placement:** Schema says `error.kind` (nested object), binary emits `kind` at top level
+3. **Extra undocumented field:** `type: "error"` is not in the schema
+4. **Wrong field type:** Schema says `error` should be an **object** with `operation/target/retryable/message/hint` nested. Binary emits `error` as a **string** (just the message)
+
+**Additional issue (identified in cycle #76):**
+
+The top-level `kind` field is **semantically overloaded** across success/error:
+- **Success envelopes:** `kind` = verb identity (`"kind": "doctor"`, `"kind": "status"`, etc.)
+- **Error envelopes:** `kind` = error classification (`"kind": "cli_parse"`, `"kind": "no_managed_sessions"`, etc.)
+
+A consumer cannot dispatch on `kind` alone; they must first check if `type == "error"` exists.
+
+**Impact.** High for downstream claws:
+- Python/Node/Rust consumers writing typed deserializers will FAIL against the binary
+- Orchestrators can't reliably dispatch on envelope shape (schema lies about nested vs. flat)
+- Documentation is actively misleading — users implement against schema, get runtime errors
+- Breaks the "typed-error contract" family (§4.44 in ROADMAP) that's supposed to unlock programmatic error handling
+
+**Root cause hypotheses:**
+
+1. SCHEMAS.md was written aspirationally (as target design), not documented from actual binary behavior
+2. Binary was implemented before schema was locked, and they drifted
+3. Schema was updated post-hoc without binary changes
+
+**Fix shape — Two options:**
+
+**Option A: Update binary to match schema (breaking change for existing consumers)**
+- Add `timestamp`, `command`, `exit_code`, `output_format`, `schema_version` to all envelopes
+- Nest `error` fields under an `error` object
+- Remove the `type: "error"` field
+- Migrate `kind` semantics: top-level `kind` becomes verb identity; errors go under `error.kind`
+- Requires schema_version bump to "2.0"
+
+**Option B: Update schema to match binary (documentation-only change)**
+- Document actual flat envelope: `error`, `hint`, `kind`, `type` at top level
+- Document semantic overloading of `kind` (verb-id vs. error-kind)
+- Remove references to `error.operation`, `error.target`, `error.retryable` from SCHEMAS.md
+
+**Recommendation:** **Option A** (binary to match schema), because:
+- Schema design is more principled (nested error object is cleaner)
+- `kind` overloading is bad typed-contract design
+- `timestamp/command/exit_code` are genuinely useful for orchestrators
+- Current state is fragile — changes are high-cost now but higher-cost later
+
+**Acceptance criteria:**
+
+1. Every command with `--output-format json` emits the envelope shape documented in SCHEMAS.md
+2. `kind` has one meaning (verb-id in success, or removed in favor of nested error.kind)
+3. All envelope fields present and correctly typed
+4. `cargo test` passes with new envelope contract
+5. Document `schema_version` bump in SCHEMAS.md changelog
+
+**Dogfood session.** Cycle #76 probe on `/tmp/jobdori-161/rust/target/debug/claw` (latest main). Discovered via systematic JSON output testing across doctor, status, version, sandbox, export, resume verbs.
+
+**Related:**
+- §4.44 Typed-error contract (this is an implementation gap in that contract)
+- Joins #102 + #121 + #127 + #129 + #130 + #245 cluster as 7th member of typed-error family
+- Violates documented schema at `SCHEMAS.md` lines 24-32 (common fields) and lines 45-65 (error envelope)
+
+**Classification:** Typed-error family member (joins #102 + #121 + #127 + #129 + #130 + #245). Highest impact of the family because it affects EVERY command, not just a subset.
+
+---
+
