@@ -85,9 +85,25 @@ class QueryEnginePort:
         ]
         output = self._format_output(summary_lines)
         projected_usage = self.total_usage.add_turn(prompt, output)
-        stop_reason = 'completed'
+
+        # #162: budget check must precede mutation. Previously this block set
+        # stop_reason='max_budget_reached' but still appended the overflow turn
+        # to mutable_messages / transcript_store / permission_denials, corrupting
+        # the session for any caller that persisted it afterwards. The overflow
+        # prompt was effectively committed even though the TurnResult signalled
+        # rejection. Now we early-return with pre-mutation state intact so
+        # callers can safely retry with a smaller prompt or a fresh budget.
         if projected_usage.input_tokens + projected_usage.output_tokens > self.config.max_budget_tokens:
-            stop_reason = 'max_budget_reached'
+            return TurnResult(
+                prompt=prompt,
+                output=output,
+                matched_commands=matched_commands,
+                matched_tools=matched_tools,
+                permission_denials=denied_tools,
+                usage=self.total_usage,  # unchanged — overflow turn was rejected
+                stop_reason='max_budget_reached',
+            )
+
         self.mutable_messages.append(prompt)
         self.transcript_store.append(prompt)
         self.permission_denials.extend(denied_tools)
@@ -100,7 +116,7 @@ class QueryEnginePort:
             matched_tools=matched_tools,
             permission_denials=denied_tools,
             usage=self.total_usage,
-            stop_reason=stop_reason,
+            stop_reason='completed',
         )
 
     def stream_submit_message(
