@@ -571,7 +571,27 @@ cd rust
 ./target/debug/claw --resume latest /status /diff
 ```
 
-Useful interactive commands include `/help`, `/status`, `/cost`, `/config`, `/session`, `/model`, `/permissions`, and `/export`.
+### Interactive slash commands (inside the REPL)
+
+Useful interactive commands include:
+
+- `/help` — Show help for all available commands
+- `/status` — Display current session and workspace status
+- `/cost` — Show token usage and cost estimates for the session
+- `/config` — Display current configuration and environment state
+- `/session` — Show session ID, creation time, and persisted metadata
+- `/model` — Display or switch the active model
+- `/permissions` — Check sandbox permissions and capability grants
+- `/export [file]` — Export the current conversation to a file (or resume from backup)
+- `/ultraplan [task]` — Run a deep planning prompt with multi-step reasoning (good for complex refactoring tasks)
+- `/teleport <symbol-or-path>` — Jump to a file or symbol by searching the workspace (IDE-like navigation)
+- `/bughunter [scope]` — Inspect the codebase for likely bugs in an optional scope (e.g., `src/runtime`)
+- `/commit` — Generate a commit message and create a git commit from the conversation
+- `/pr [context]` — Draft or create a pull request from the conversation
+- `/issue [context]` — Draft or create a GitHub issue from the conversation
+- `/diff` — Show unified diff of changes made in the current session
+- `/plugin [list|install|enable|disable|uninstall|update]` — Manage Claw Code plugins
+- `/agents [list|help]` — List configured agents or get help on agent commands
 
 ## Config file resolution order
 
