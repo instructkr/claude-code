@@ -186,3 +186,57 @@ class TestCrossChannelConsistency:
             'Boolean fields must correlate with error block:\n' +
             '\n'.join(failures)
         )
+
+
+class TestTextVsJsonModeDivergence:
+    """Cycle #29: Document known text-mode vs JSON-mode exit code divergence.
+    
+    ERROR_HANDLING.md specifies the exit code contract applies ONLY when
+    --output-format json is set. Text mode follows argparse defaults (e.g.,
+    exit 2 for parse errors) while JSON mode normalizes to the contract
+    (exit 1 for parse errors).
+    
+    This test class LOCKS the expected divergence so:
+    1. Documentation stays aligned with implementation
+    2. Future changes to text mode behavior are caught as intentional
+    3. Claws consuming subprocess output can trust the docs
+    """
+
+    def test_unknown_command_text_mode_exits_2(self) -> None:
+        """Text mode: argparse default exit 2 for unknown subcommand."""
+        result = _run(['nonexistent-cmd'])
+        assert result.returncode == 2, (
+            f'text mode should exit 2 (argparse default), got {result.returncode}'
+        )
+
+    def test_unknown_command_json_mode_exits_1(self) -> None:
+        """JSON mode: normalized exit 1 for parse error (#178)."""
+        result = _run(['nonexistent-cmd', '--output-format', 'json'])
+        assert result.returncode == 1, (
+            f'JSON mode should exit 1 (protocol contract), got {result.returncode}'
+        )
+        envelope = json.loads(result.stdout)
+        assert envelope['error']['kind'] == 'parse'
+
+    def test_missing_required_arg_text_mode_exits_2(self) -> None:
+        """Text mode: argparse default exit 2 for missing required arg."""
+        result = _run(['exec-command'])  # missing name + prompt
+        assert result.returncode == 2, (
+            f'text mode should exit 2, got {result.returncode}'
+        )
+
+    def test_missing_required_arg_json_mode_exits_1(self) -> None:
+        """JSON mode: normalized exit 1 for parse error."""
+        result = _run(['exec-command', '--output-format', 'json'])
+        assert result.returncode == 1, (
+            f'JSON mode should exit 1, got {result.returncode}'
+        )
+
+    def test_success_path_identical_in_both_modes(self) -> None:
+        """Success exit codes are identical in both modes."""
+        text_result = _run(['list-sessions'])
+        json_result = _run(['list-sessions', '--output-format', 'json'])
+        assert text_result.returncode == json_result.returncode == 0, (
+            f'success exit should be 0 in both modes: '
+            f'text={text_result.returncode}, json={json_result.returncode}'
+        )

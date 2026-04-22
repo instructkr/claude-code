@@ -10,11 +10,25 @@ After cycles #178–#179 (parser-front-door hole closure), claw-code's error int
 
 Every clawable command returns JSON on stdout when `--output-format json` is requested.
 
+**IMPORTANT:** The exit code contract below applies **only when `--output-format json` is explicitly set**. Text mode follows argparse conventions and may return different exit codes (e.g., `2` for argparse parse errors). Claws consuming claw-code as a subprocess MUST always pass `--output-format json` to get the documented contract.
+
 | Exit Code | Meaning | Response Format | Example |
 |---|---|---|---|
 | **0** | Success | `{success fields}` | `{"session_id": "...", "loaded": true}` |
 | **1** | Error / Not Found | `{error: {kind, message, ...}}` | `{"error": {"kind": "session_not_found", ...}}` |
 | **2** | Timeout | `{final_stop_reason: "timeout", final_cancel_observed: ...}` | `{"final_stop_reason": "timeout", ...}` |
+
+### Text mode vs JSON mode exit codes
+
+| Scenario | Text mode exit | JSON mode exit | Why |
+|---|---|---|---|
+| Unknown subcommand | 2 (argparse default) | 1 (parse error envelope) | argparse defaults to 2; JSON mode normalizes to contract |
+| Missing required arg | 2 (argparse default) | 1 (parse error envelope) | Same reason |
+| Session not found | 1 | 1 | Application-level error, same in both |
+| Command executed OK | 0 | 0 | Success path, identical |
+| Turn-loop timeout | 2 | 2 | Identical (#161 implementation) |
+
+**Practical rule for claws:** always pass `--output-format json`. This eliminates text-mode surprises and gives you the documented exit-code contract for every error path.
 
 ---
 
