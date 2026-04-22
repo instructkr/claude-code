@@ -9178,3 +9178,66 @@ All three are variants of 'doc claims X, binary does Y' but differ in consumer h
 
 **Dogfood session.** Cycle #80 systematic sweep of README.md, CLAUDE.md for P0 copy-paste traps.
 
+
+---
+
+## Pinpoint #166. SCHEMAS.md presents target v2.0 as current v1.0 contract — P0 SOURCE MISDOCUMENTATION
+
+**Status: ✅ DONE (cycle #82, 2026-04-23 05:22 Seoul, commit `4c9a0a9`). Root cause fixed.**
+
+**Finding:** SCHEMAS.md, the **source document** for the JSON envelope contract, was presenting the target v2.0 schema as if it were the current binary behavior.
+
+**Header claim (line 1):** "This document locks the field-level contract for all clawable-surface commands."
+
+**Reality:** The binary doesn't emit `timestamp`, `command`, `exit_code`, `output_format`, `schema_version` (all documented as common fields). It emits a flat v1.0 envelope.
+
+**Impact:** MASSIVE. This is the **authoritative source**. Every downstream doc inherited the false claim:
+- USAGE.md (cycle #78): copied the "common fields" myth
+- ERROR_HANDLING.md (cycle #79): documented v2.0 error shape as current
+- CLAUDE.md (cycle #81): inherited "common fields" from SCHEMAS.md section
+
+**Classification:** P0 SOURCE MISDOCUMENTATION. The upstream lie propagated to 3+ downstream docs.
+
+**Fix shape — commit `4c9a0a9`:**
+
+1. **CRITICAL header:** Added ⚠️ warning that entire doc is target v2.0, not v1.0
+2. **Section headers:** Marked "Common Fields (All Envelopes) — TARGET v2.0 SCHEMA"
+3. **Comprehensive appendix:** 
+   - v1.0 success envelope example (what binary actually emits)
+   - v1.0 error envelope example (flat, error is string)
+   - Migration timeline from FIX_LOCUS_164
+   - Python code example for v1.0 (correct pattern)
+   - FAQ explaining the mismatch
+4. **Cross-links:** Points to ERROR_HANDLING.md Appendix A, FIX_LOCUS_164.md
+
+**Pattern insight:** SCHEMAS.md was the **aspirational source**. Three downstream docs inherited the false claim. Fix source = fix all four in one commit.
+
+---
+
+## Doc-Truthfulness P0 Family: Complete Taxonomy (4/4 closed)
+
+| # | File | Subclass | Root | Cycle Found | Cycle Closed | Status |
+|---|---|---|---|---|---|---|
+| (cycle #78) | USAGE.md | Active misdocumentation | Inherited from SCHEMAS | #76 audit | #78 | ✅ |
+| (cycle #79) | ERROR_HANDLING.md | Copy-paste trap | Inherited from SCHEMAS | #79 sweep | #79 | ✅ |
+| #165 | CLAUDE.md | Boundary collapse | Inherited from SCHEMAS | #80 audit | #81 | ✅ |
+| #166 | SCHEMAS.md | **Source misdocumentation** | **Aspirational design, not updated for empirical reality** | #82 audit | #82 | ✅ |
+
+**Root cause confirmed:** SCHEMAS.md is the aspirational source; v1.0 binary never matched it. Every downstream doc inherited the false premise.
+
+**Remediation pattern:**
+- USAGE.md: correct the sentence, add empirical reality
+- ERROR_HANDLING.md: fix code examples to match v1.0
+- CLAUDE.md: explicit v1.0 vs v2.0 labels in normative text
+- **SCHEMAS.md: prepend CRITICAL header, add v1.0 appendix, explain mismatch**
+
+**Velocity:** All 4 instances identified and closed in 6 cycles (#76 audit → #82 execution). Evidence-backed.
+
+**Doctrine principle #11 now locked with:**
+- 3 subclass taxonomy (active misdoc / copy-paste trap / boundary collapse)
+- 4 evidence-backed closures
+- Root-cause pattern (aspirational source → downstream inheritance)
+- Fix patterns per subclass
+
+---
+
