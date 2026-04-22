@@ -294,6 +294,17 @@ fn classify_error_kind(message: &str) -> &'static str {
     } else if message.starts_with("empty prompt:") {
         // #247: `claw ""` or `claw "   "` — a parse error, not `unknown`.
         "cli_parse"
+    } else if message.contains("unsupported value for --") {
+        // #169: Invalid CLI flag values (e.g., `--output-format xml`,
+        // `--permission-mode bogus`) are parse errors, not `unknown`.
+        // This covers all `CliOutputFormat::parse` / `parse_permission_mode_arg`
+        // rejections and any future `unsupported value for --<flag>: <value>`
+        // messages emitted from the parse_args dispatcher.
+        "cli_parse"
+    } else if message.contains("missing value for --") {
+        // #169: Missing required flag values (e.g., `--output-format` with no
+        // trailing argument) are parse errors, same family as above.
+        "cli_parse"
     } else if message.contains("invalid model syntax") {
         "invalid_model_syntax"
     } else if message.contains("is not yet implemented") {
@@ -11449,6 +11460,45 @@ mod tests {
             classify_error_kind("some random prompt-adjacent failure we don't recognize"),
             "unknown",
             "generic prompt-containing text should still fall through to unknown"
+        );
+    }
+
+    #[test]
+    fn classify_error_kind_covers_flag_value_parse_errors_169() {
+        // #169: Invalid CLI flag values must classify as `cli_parse`,
+        // not fall through to `unknown`. Regression guard found during
+        // dogfood probe 2026-04-23: `claw --output-format xml doctor`
+        // emitted `{"kind":"unknown"}` envelope instead of `cli_parse`.
+        assert_eq!(
+            classify_error_kind(
+                "unsupported value for --output-format: xml (expected text or json)"
+            ),
+            "cli_parse",
+            "invalid --output-format value must classify as cli_parse"
+        );
+        assert_eq!(
+            classify_error_kind(
+                "unsupported value for --permission-mode: bogus (expected ...)"
+            ),
+            "cli_parse",
+            "invalid --permission-mode value must classify as cli_parse"
+        );
+        assert_eq!(
+            classify_error_kind("missing value for --output-format"),
+            "cli_parse",
+            "missing --output-format value must classify as cli_parse"
+        );
+        assert_eq!(
+            classify_error_kind("missing value for --permission-mode"),
+            "cli_parse",
+            "missing --permission-mode value must classify as cli_parse"
+        );
+        // Sanity: must not hijack genuinely unknown errors that happen to
+        // contain the word `unsupported` or `missing`.
+        assert_eq!(
+            classify_error_kind("some unsupported runtime condition we don't recognize"),
+            "unknown",
+            "generic `unsupported` text should still fall through to unknown"
         );
     }
 
