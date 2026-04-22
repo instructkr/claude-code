@@ -733,6 +733,8 @@ enum LocalHelpTopic {
     BootstrapPlan,
     // #130c: help parity for `claw diff --help`
     Diff,
+    // #130d: help parity for `claw config --help`
+    Config,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1046,6 +1048,10 @@ fn parse_args(args: &[String]) -> Result<CliAction, String> {
         // which is synthetic friction. Accepts an optional section name
         // (env|hooks|model|plugins) matching the slash command shape.
         "config" => {
+            // #130d: accept --help / -h and route to help topic instead of silently ignoring
+            if rest.len() >= 2 && is_help_flag(&rest[1]) {
+                return Ok(CliAction::HelpTopic(LocalHelpTopic::Config));
+            }
             let tail = &rest[1..];
             let section = tail.first().cloned();
             if tail.len() > 1 {
@@ -1270,6 +1276,8 @@ fn parse_local_help_action(rest: &[String]) -> Option<Result<CliAction, String>>
         "bootstrap-plan" => LocalHelpTopic::BootstrapPlan,
         // #130c: help parity for `claw diff --help`
         "diff" => LocalHelpTopic::Diff,
+        // #130d: help parity for `claw config --help`
+        "config" => LocalHelpTopic::Config,
         _ => return None,
     };
     Some(Ok(CliAction::HelpTopic(topic)))
@@ -6139,6 +6147,15 @@ fn render_help_topic(topic: LocalHelpTopic) -> String {
   Formats          text (default), json
   Related          claw status · claw config"
             .to_string(),
+        // #130d: help topic for `claw config --help`.
+        LocalHelpTopic::Config => "Config
+  Usage            claw config [--cwd <path>] [--output-format <format>]
+  Purpose          merge and display the resolved .claw.json / settings.json configuration
+  Options          --cwd overrides the workspace directory for config lookup
+  Output           loaded files and merged key-value pairs (text) or JSON object (json)
+  Formats          text (default), json
+  Related          claw status · claw doctor · claw init"
+            .to_string(),
     }
 }
 
@@ -10448,6 +10465,44 @@ mod tests {
         assert!(
             diff_bad_arg.contains("unexpected extra arguments"),
             "#130c: diff with unknown arg must still error, got: {diff_bad_arg}"
+        );
+        // #130d: `claw config --help` must route to help topic, not silently run config.
+        let config_help_action = parse_args(&[
+            "config".to_string(),
+            "--help".to_string(),
+        ])
+        .expect("config --help must parse as help action");
+        assert!(
+            matches!(config_help_action, CliAction::HelpTopic(LocalHelpTopic::Config)),
+            "#130d: config --help must route to LocalHelpTopic::Config, got: {config_help_action:?}"
+        );
+        let config_h_action = parse_args(&[
+            "config".to_string(),
+            "-h".to_string(),
+        ])
+        .expect("config -h must parse as help action");
+        assert!(
+            matches!(config_h_action, CliAction::HelpTopic(LocalHelpTopic::Config)),
+            "#130d: config -h (short form) must route to LocalHelpTopic::Config"
+        );
+        // #130d: bare `claw config` still routes to Config action with no section
+        let config_action = parse_args(&[
+            "config".to_string(),
+        ])
+        .expect("bare config must parse as config action");
+        assert!(
+            matches!(config_action, CliAction::Config { section: None, .. }),
+            "#130d: bare config must still route to Config action with section=None"
+        );
+        // #130d: config with section still works (non-regression)
+        let config_section = parse_args(&[
+            "config".to_string(),
+            "permissions".to_string(),
+        ])
+        .expect("config permissions must parse");
+        assert!(
+            matches!(config_section, CliAction::Config { section: Some(ref s), .. } if s == "permissions"),
+            "#130d: config with section must still work"
         );
         // #147: empty / whitespace-only positional args must be rejected
         // with a specific error instead of falling through to the prompt
