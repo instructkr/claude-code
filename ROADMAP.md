@@ -9295,3 +9295,90 @@ Text output is **ad hoc per-command**. No two commands are documented to have co
 
 **Dogfood discovery:** Cycle #83 systematic audit of doc surfaces for uncovered contracts. SCHEMAS.md was comprehensive for JSON, but text output was invisible.
 
+
+---
+
+## Pinpoint #168. JSON envelope shape is inconsistent across commands — some have `command` field, others don't; bootstrap --output-format json produces no output
+
+**Status: 📋 FILED (cycle #84, 2026-04-23 05:33 Seoul). Fresh-dogfood validation revealed inconsistent binary behavior.**
+
+**Finding (dogfood cycle #84, fresh binary test):**
+
+The binary v1.0 envelope shape is NOT consistent across the 14 clawable commands. Each command emits a different top-level structure:
+
+```
+list-sessions:        {command, sessions}           ← HAS 'command'
+bootstrap:            (no JSON output!)             ← BROKEN
+doctor:               {checks, kind, message, ...}  ← NO 'command'
+mcp:                  {action, kind, status, ...}   ← NO 'command'
+```
+
+**More concerning:** `claw bootstrap hello --output-format json` produces NO output at all (empty stdout), but exit code is 0. This is a silent JSON failure.
+
+**Root cause:** The JSON envelope contract was never uniformly enforced. Each command's renderer was written independently. Some added `command` field for clarity; others rely on verb identity; bootstrap's JSON path is completely broken.
+
+**Consumer impact:** SEVERE. Claws building automation against JSON output cannot write a single envelope parser. They must write per-command deserialization logic.
+
+This is the **structural root cause** of why SCHEMAS.md had to be marked as "aspirational target" — the binary never had a consistent v1.0 envelope in the first place. It's not "v1.0 vs v2.0" — it's "no consistent v1.0 ever existed."
+
+**Evidence:**
+
+```bash
+$ claw list-sessions --output-format json | jq keys
+["command", "sessions"]
+
+$ claw doctor --output-format json | jq keys
+["checks", "has_failures", "kind", "message", "report", "summary"]
+
+$ claw bootstrap hello --output-format json
+(no output)
+
+$ echo $?
+0
+```
+
+**Implications for cycles #76–#82:**
+
+The P0 doc-truthfulness family fixes (USAGE.md, ERROR_HANDLING.md, CLAUDE.md, SCHEMAS.md) all documented a "v2.0 target" envelope because the "v1.0 current" envelope **never existed as a consistent contract**. The binary was incoherent from the start.
+
+- Cycle #76 audit claimed "100% divergence from SCHEMAS.md" — correct, but incomplete. The real issue: **no two commands share the same JSON shape.**
+- Cycles #78–#82 documented v1.0 as "flat envelope with top-level kind" — partially correct (error path matches this), but success paths are wildly inconsistent.
+- Actual situation: **each verb is a custom JSON shape**.
+
+**This explains why #164 (envelope schema migration) is still blocked on design:** the "current v1.0" that #164 is supposed to migrate *from* was never coherent.
+
+**Related filings:**
+
+- #164 (JSON envelope migration) — the target design (#164) assumed a coherent v1.0 to migrate from. This filing reveals that v1.0 was never coherent.
+- #250 (session-management CLI parity) — related surface audit that found inconsistent routing
+- #167 (text output has no contract) — corollary: if JSON has no consistent shape, text certainly doesn't
+
+**Design implications:**
+
+**Option A: Accept per-command JSON shapes (status quo)**
+- Document each verb's JSON output separately in SCHEMAS.md
+- Claws write per-command parsers
+- Effort: Medium (audit 14 commands, document each)
+- Benefit: Describes current reality
+- Risk: Keeps the incoherence as permanent design
+
+**Option B: Enforce common envelope wrapper (FIX_LOCUS_164 approach)**
+- All commands wrap verb-specific data in common envelope: `{command, timestamp, exit_code, output_format, schema_version, data: {...}}`
+- Single parser for all commands + verb-specific unpacking
+- Effort: High (~6 dev-days per FIX_LOCUS_164 estimate, but now confirmed as root cause)
+- Benefit: Claws write one parser, not 14
+- Risk: Requires coordinated migration of 14 verb renderers
+
+**Option C: Hybrid (pragmatic)**
+- Immediate (P1): Document actual per-command shapes as "Envelope Catalog" in SCHEMAS.md
+- Medium-term: FIX_LOCUS_164 Phase 1 migration on 3 pilot verbs (doctor, list-sessions, bootstrap)
+- Phase 2: Rollout to remaining 11
+- Effort: Medium (doc) + High (migration)
+- Benefit: Truth now, coherence later
+
+**Recommendation:** **Option C (hybrid).** Document the current incoherence immediately (P1), then execute FIX_LOCUS_164 as the coherence migration.
+
+**Blocker for #164 decision:** This filing resolves the blocker. The design question was "v1.0 → v2.0 migration" but the real situation is "incoherent-per-command → coherent-common-envelope migration." That's a *stronger* argument for the common-envelope approach.
+
+---
+
