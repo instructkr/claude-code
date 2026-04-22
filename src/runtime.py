@@ -1,11 +1,13 @@
 from __future__ import annotations
 
+import time
+from concurrent.futures import ThreadPoolExecutor, TimeoutError as FuturesTimeoutError
 from dataclasses import dataclass
 
 from .commands import PORTED_COMMANDS
 from .context import PortContext, build_port_context, render_context
 from .history import HistoryLog
-from .models import PermissionDenial, PortingModule
+from .models import PermissionDenial, PortingModule, UsageSummary
 from .query_engine import QueryEngineConfig, QueryEnginePort, TurnResult
 from .setup import SetupReport, WorkspaceSetup, run_setup
 from .system_init import build_system_init_message
@@ -151,20 +153,99 @@ class PortRuntime:
             persisted_session_path=persisted_session_path,
         )
 
-    def run_turn_loop(self, prompt: str, limit: int = 5, max_turns: int = 3, structured_output: bool = False) -> list[TurnResult]:
+    def run_turn_loop(
+        self,
+        prompt: str,
+        limit: int = 5,
+        max_turns: int = 3,
+        structured_output: bool = False,
+        timeout_seconds: float | None = None,
+    ) -> list[TurnResult]:
+        """Run a multi-turn engine loop with optional wall-clock deadline.
+
+        Args:
+            prompt: The initial prompt to submit.
+            limit: Match routing limit.
+            max_turns: Maximum number of turns before stopping.
+            structured_output: Whether to request structured output.
+            timeout_seconds: Total wall-clock budget across all turns. When the
+                budget is exhausted mid-turn, a synthetic TurnResult with
+                ``stop_reason='timeout'`` is appended and the loop exits.
+                ``None`` (default) preserves legacy unbounded behaviour.
+
+        Returns:
+            A list of TurnResult objects. The final entry's ``stop_reason``
+            distinguishes ``'completed'``, ``'max_turns_reached'``,
+            ``'max_budget_reached'``, or ``'timeout'``.
+
+        #161: prior to this change a hung ``engine.submit_message`` call would
+        block the loop indefinitely with no cancellation path, forcing claws to
+        rely on external watchdogs or OS-level kills. Callers can now enforce a
+        deadline and receive a typed timeout signal instead.
+        """
         engine = QueryEnginePort.from_workspace()
         engine.config = QueryEngineConfig(max_turns=max_turns, structured_output=structured_output)
         matches = self.route_prompt(prompt, limit=limit)
         command_names = tuple(match.name for match in matches if match.kind == 'command')
         tool_names = tuple(match.name for match in matches if match.kind == 'tool')
         results: list[TurnResult] = []
-        for turn in range(max_turns):
-            turn_prompt = prompt if turn == 0 else f'{prompt} [turn {turn + 1}]'
-            result = engine.submit_message(turn_prompt, command_names, tool_names, ())
-            results.append(result)
-            if result.stop_reason != 'completed':
-                break
+        deadline = time.monotonic() + timeout_seconds if timeout_seconds is not None else None
+
+        # ThreadPoolExecutor is reused across turns so we cancel cleanly on exit.
+        executor = ThreadPoolExecutor(max_workers=1) if deadline is not None else None
+        try:
+            for turn in range(max_turns):
+                turn_prompt = prompt if turn == 0 else f'{prompt} [turn {turn + 1}]'
+
+                if deadline is None:
+                    # Legacy path: unbounded call, preserves existing behaviour exactly.
+                    result = engine.submit_message(turn_prompt, command_names, tool_names, ())
+                else:
+                    remaining = deadline - time.monotonic()
+                    if remaining <= 0:
+                        results.append(self._build_timeout_result(turn_prompt, command_names, tool_names))
+                        break
+                    assert executor is not None
+                    future = executor.submit(
+                        engine.submit_message, turn_prompt, command_names, tool_names, ()
+                    )
+                    try:
+                        result = future.result(timeout=remaining)
+                    except FuturesTimeoutError:
+                        # Best-effort cancel; submit_message may still finish in background
+                        # but we never read its output. The engine's own state mutation
+                        # is owned by the engine and not our concern here.
+                        future.cancel()
+                        results.append(self._build_timeout_result(turn_prompt, command_names, tool_names))
+                        break
+
+                results.append(result)
+                if result.stop_reason != 'completed':
+                    break
+        finally:
+            if executor is not None:
+                # wait=False: don't let a hung thread block loop exit indefinitely.
+                # The thread will be reaped when the interpreter shuts down or when
+                # the engine call eventually returns.
+                executor.shutdown(wait=False)
         return results
+
+    @staticmethod
+    def _build_timeout_result(
+        prompt: str,
+        command_names: tuple[str, ...],
+        tool_names: tuple[str, ...],
+    ) -> TurnResult:
+        """Synthesize a TurnResult representing a wall-clock timeout (#161)."""
+        return TurnResult(
+            prompt=prompt,
+            output='Wall-clock timeout exceeded before turn completed.',
+            matched_commands=command_names,
+            matched_tools=tool_names,
+            permission_denials=(),
+            usage=UsageSummary(),
+            stop_reason='timeout',
+        )
 
     def _infer_permission_denials(self, matches: list[RoutedMatch]) -> list[PermissionDenial]:
         denials: list[PermissionDenial] = []

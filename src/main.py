@@ -65,6 +65,12 @@ def build_parser() -> argparse.ArgumentParser:
     loop_parser.add_argument('--limit', type=int, default=5)
     loop_parser.add_argument('--max-turns', type=int, default=3)
     loop_parser.add_argument('--structured-output', action='store_true')
+    loop_parser.add_argument(
+        '--timeout-seconds',
+        type=float,
+        default=None,
+        help='total wall-clock budget across all turns (#161). Default: unbounded.',
+    )
 
     flush_parser = subparsers.add_parser('flush-transcript', help='persist and flush a temporary session transcript')
     flush_parser.add_argument('prompt')
@@ -187,11 +193,21 @@ def main(argv: list[str] | None = None) -> int:
         print(PortRuntime().bootstrap_session(args.prompt, limit=args.limit).as_markdown())
         return 0
     if args.command == 'turn-loop':
-        results = PortRuntime().run_turn_loop(args.prompt, limit=args.limit, max_turns=args.max_turns, structured_output=args.structured_output)
+        results = PortRuntime().run_turn_loop(
+            args.prompt,
+            limit=args.limit,
+            max_turns=args.max_turns,
+            structured_output=args.structured_output,
+            timeout_seconds=args.timeout_seconds,
+        )
         for idx, result in enumerate(results, start=1):
             print(f'## Turn {idx}')
             print(result.output)
             print(f'stop_reason={result.stop_reason}')
+        # Exit 2 when a timeout terminated the loop so claws can distinguish
+        # 'ran to completion' from 'hit wall-clock budget'.
+        if results and results[-1].stop_reason == 'timeout':
+            return 2
         return 0
     if args.command == 'flush-transcript':
         engine = QueryEnginePort.from_workspace()
