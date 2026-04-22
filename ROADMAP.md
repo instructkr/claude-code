@@ -7651,3 +7651,64 @@ Doctrinal fix: **Doctor is not a separate system; it's a truthful mirror of runt
 
 ---
 
+
+---
+
+## Principle: Cycle Cadence — Hygiene Cycles Are First-Class
+
+**Source:** gaebal-gajae framing on cycle #59 closure (2026-04-23 02:45 Seoul). Key quote: "Cycle #59 didn't produce a new fix; it converted a fresh doctrine into an auditable backlog and kept the pending-branch queue from turning into noise."
+
+### The Tension
+
+Dogfood nudge cycles implicitly pressure toward "ship code every cycle." But when review queue is saturated (12 branches awaiting review in cycle #59), forcing new code has compounding costs:
+
+1. **Fix loci overlap with pending review feedback** — reviewer feedback may change shape; pre-implementing wastes work
+2. **Rebase burden grows** — each new branch forks from a main that hasn't absorbed pending PRs
+3. **Cognitive load scales** — 12+ branches means context-switching penalty; reviewer has less capacity to absorb reviews
+
+### Three Cycle Types (All First-Class)
+
+| Type | When | Deliverable |
+|---|---|---|
+| **Velocity cycle** | Clear fix locus, no review backlog | New code, test, push |
+| **Hygiene cycle** | Review queue saturated or doctrine just landed | Audit checklist, backlog seeding, stale-worktree cleanup |
+| **Integration cycle** | Review feedback landed, merge possible | Rebase, resolve conflicts, ship |
+
+### Heuristic
+
+**If review queue has 5+ branches awaiting review,** prefer hygiene cycles until at least 2 merge. Signs a hygiene cycle is correct:
+
+- [ ] No bug claims higher priority than currently-in-review work
+- [ ] Recent doctrine (principle, framing) needs operationalization
+- [ ] Audit checklist is incomplete or has unexplored surfaces
+- [ ] Stale worktrees have drift (uncommitted changes, missed rebases)
+- [ ] ROADMAP.md has closed items not marked closed
+
+### Anti-Patterns
+
+❌ **Forced shipping.** "I must produce a commit every cycle." Leads to over-eager fixes in areas that aren't ready.
+
+❌ **Audit aversion.** "Hygiene isn't real work." Fails to preserve doctrine → principle → protocol ladder.
+
+❌ **Ignoring queue depth.** Shipping a 13th branch when reviewer has 12 pending. Compounds the problem.
+
+### Applied in Cycle #59
+
+Chose NOT to ship code. Instead:
+- Formalized diagnostic-strictness audit checklist
+- Pre-filed 3 follow-up pinpoints (#157/#158/#159) as low-confidence audit candidates
+- Cleaned up stray worktree drift
+- Verified all 12 branches still passing
+
+**Result:** Queue stayed at 12 branches (not 13), doctrine became protocol, backlog stayed indexed.
+
+### Cycle-Type Signal
+
+Future cycles should briefly declare type in the Discord update:
+
+> **Cycle #N (velocity / hygiene / integration) — <summary>**
+
+This makes the pacing legible to reviewers and self-auditable.
+
+---
+
