@@ -153,7 +153,19 @@ class QueryEnginePort:
     def flush_transcript(self) -> None:
         self.transcript_store.flush()
 
-    def persist_session(self) -> str:
+    def persist_session(self, directory: 'Path | None' = None) -> str:
+        """Flush the transcript and save the session to disk.
+
+        Args:
+            directory: Optional override for the storage directory. When None
+                (default, for backward compat), uses the default location
+                (``.port_sessions`` in CWD). When set, passes through to
+                ``save_session`` which already supports directory overrides.
+
+        #166: added directory parameter to match the session-lifecycle CLI
+        surface established by #160/#165. Claws running out-of-tree can now
+        redirect session creation to a workspace-specific dir without chdir.
+        """
         self.flush_transcript()
         path = save_session(
             StoredSession(
@@ -161,7 +173,8 @@ class QueryEnginePort:
                 messages=tuple(self.mutable_messages),
                 input_tokens=self.total_usage.input_tokens,
                 output_tokens=self.total_usage.output_tokens,
-            )
+            ),
+            directory,
         )
         return str(path)
 

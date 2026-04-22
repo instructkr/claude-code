@@ -81,8 +81,24 @@ def build_parser() -> argparse.ArgumentParser:
         ),
     )
 
-    flush_parser = subparsers.add_parser('flush-transcript', help='persist and flush a temporary session transcript')
+    flush_parser = subparsers.add_parser(
+        'flush-transcript',
+        help='persist and flush a temporary session transcript (#160/#166: claw-native session API)',
+    )
     flush_parser.add_argument('prompt')
+    flush_parser.add_argument(
+        '--directory', help='session storage directory (default: .port_sessions)'
+    )
+    flush_parser.add_argument(
+        '--output-format',
+        choices=['text', 'json'],
+        default='text',
+        help='output format',
+    )
+    flush_parser.add_argument(
+        '--session-id',
+        help='deterministic session ID (default: auto-generated UUID)',
+    )
 
     load_session_parser = subparsers.add_parser(
         'load-session',
@@ -232,11 +248,29 @@ def main(argv: list[str] | None = None) -> int:
             return 2
         return 0
     if args.command == 'flush-transcript':
+        from pathlib import Path as _Path
         engine = QueryEnginePort.from_workspace()
+        # #166: allow deterministic session IDs for claw checkpointing/replay.
+        # When unset, the engine's auto-generated UUID is used (backward compat).
+        if args.session_id:
+            engine.session_id = args.session_id
         engine.submit_message(args.prompt)
-        path = engine.persist_session()
-        print(path)
-        print(f'flushed={engine.transcript_store.flushed}')
+        directory = _Path(args.directory) if args.directory else None
+        path = engine.persist_session(directory)
+        if args.output_format == 'json':
+            import json as _json
+            print(_json.dumps({
+                'session_id': engine.session_id,
+                'path': path,
+                'flushed': engine.transcript_store.flushed,
+                'messages_count': len(engine.mutable_messages),
+                'input_tokens': engine.total_usage.input_tokens,
+                'output_tokens': engine.total_usage.output_tokens,
+            }))
+        else:
+            # #166: legacy text output preserved byte-for-byte for backward compat.
+            print(path)
+            print(f'flushed={engine.transcript_store.flushed}')
         return 0
     if args.command == 'load-session':
         from pathlib import Path as _Path
