@@ -822,6 +822,50 @@ fn unrecognized_argument_still_classifies_as_cli_parse_247_regression_guard() {
     );
 }
 
+#[test]
+fn v1_5_action_field_appears_only_in_3_inventory_verbs_172() {
+    // #172: SCHEMAS.md v1.5 Emission Baseline claims `action` field appears
+    // only in 3 inventory verbs: mcp, skills, agents. This test is a
+    // regression guard for that truthfulness claim. If a new verb adds
+    // `action`, or one of the 3 removes it, this test fails and forces
+    // the SCHEMAS.md documentation to stay in sync with reality.
+    //
+    // Discovered during cycle #98 probe: earlier SCHEMAS.md draft said
+    // "only in 4 inventory verbs" but reality was only 3 (list-sessions
+    // uses `command` instead of `action`). Doc was corrected; this test
+    // locks the 3-verb invariant.
+    let root = unique_temp_dir("172-action-inventory");
+    fs::create_dir_all(&root).expect("temp dir should exist");
+
+    let verbs_with_action: &[&str] = &["mcp", "skills", "agents"];
+    let verbs_without_action: &[&str] = &[
+        "help",
+        "version",
+        "doctor",
+        "status",
+        "sandbox",
+        "system-prompt",
+        "bootstrap-plan",
+        "list-sessions",
+    ];
+
+    for verb in verbs_with_action {
+        let envelope = assert_json_command(&root, &["--output-format", "json", verb]);
+        assert!(
+            envelope.get("action").is_some(),
+            "#172: `{verb}` should have `action` field per v1.5 baseline, but envelope: {envelope}"
+        );
+    }
+
+    for verb in verbs_without_action {
+        let envelope = assert_json_command(&root, &["--output-format", "json", verb]);
+        assert!(
+            envelope.get("action").is_none(),
+            "#172: `{verb}` should NOT have `action` field per v1.5 baseline (only 3 inventory verbs: mcp/skills/agents should have it), but envelope: {envelope}"
+        );
+    }
+}
+
 fn assert_json_command_with_env(current_dir: &Path, args: &[&str], envs: &[(&str, &str)]) -> Value {
     let output = run_claw(current_dir, args, envs);
     assert!(

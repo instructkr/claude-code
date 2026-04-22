@@ -689,7 +689,7 @@ Phase 1 (shape stabilization) will normalize these divergences:
 
 - `list-sessions`: `command` → `kind` (align with 12/13 convention)
 - Potentially: unify where `message` field appears (9/13 have it, inconsistently populated)
-- Potentially: unify where `action` field appears (only in 4 inventory verbs)
+- Potentially: unify where `action` field appears (only in 3 inventory verbs: `mcp`, `skills`, `agents`)
 
 Phase 1 does **not** add common metadata (`timestamp`, `exit_code`) — that's Phase 2 (v2.0 wrapper).
 
