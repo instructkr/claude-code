@@ -9723,3 +9723,59 @@ Before any shape-level work, answer: **"What does each verb emit, to which strea
 - Phase 0 active targets: #168c (primary), emission CI (general)
 - Phase 1 active targets: #168a (shape normalization)
 
+## Pinpoint #169. Invalid/missing CLI flag values classified as `unknown` instead of `cli_parse` — SHIPPED (cycle #94, 2026-04-23 07:02 Seoul)
+
+**Gap.** Typed-error classifier gap in `classify_error_kind`: error messages from
+`CliOutputFormat::parse` and `parse_permission_mode_arg` were falling through to
+the `unknown` bucket instead of being recognized as `cli_parse` errors.
+
+**Discovered:** Dogfood probe 2026-04-23 07:00 Seoul. Running `claw --output-format
+json --output-format xml doctor` produced:
+
+```json
+{
+  "error": "unsupported value for --output-format: xml (expected text or json)",
+  "hint": null,
+  "kind": "unknown",
+  "type": "error"
+}
+```
+
+**Two problems:**
+1. `kind: "unknown"` — should be `cli_parse` so typed-error consumers can dispatch
+2. `hint: null` — the #247 hint synthesizer (which adds "Run `claw --help` for
+   usage.") only triggers when `kind == "cli_parse"`, so the bad classification
+   also lost the hint
+
+**Fix shipped.** Commit `834b0a9` on `feat/jobdori-168c-emission-routing`.
+Added two new classifier branches:
+
+```rust
+} else if message.contains("unsupported value for --") {
+    // #169: Invalid CLI flag values (e.g., `--output-format xml`).
+    "cli_parse"
+} else if message.contains("missing value for --") {
+    // #169: Missing required flag values.
+    "cli_parse"
+}
+```
+
+**After fix:**
+
+```json
+{
+  "error": "unsupported value for --output-format: xml (expected text or json)",
+  "hint": "Run `claw --help` for usage.",
+  "kind": "cli_parse",
+  "type": "error"
+}
+```
+
+**Test added:** `classify_error_kind_covers_flag_value_parse_errors_169` (4 positive cases + 1 sanity guard).
+
+**Tests:** 224/224 pass (+1 from #169).
+
+**Family:** Typed-error family. Related: #121, #127, #129, #130, #164, #247.
+
+**Closed:** Yes — shipped in cycle #94, feature branch `feat/jobdori-168c-emission-routing`.
+
