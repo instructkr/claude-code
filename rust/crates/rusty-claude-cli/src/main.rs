@@ -295,16 +295,34 @@ fn classify_error_kind(message: &str) -> &'static str {
         // #247: `claw ""` or `claw "   "` — a parse error, not `unknown`.
         "cli_parse"
     } else if message.contains("unsupported value for --") {
-        // #169: Invalid CLI flag values (e.g., `--output-format xml`,
-        // `--permission-mode bogus`) are parse errors, not `unknown`.
-        // This covers all `CliOutputFormat::parse` / `parse_permission_mode_arg`
-        // rejections and any future `unsupported value for --<flag>: <value>`
-        // messages emitted from the parse_args dispatcher.
+        // #169: Invalid CLI flag values emitted via `unsupported value for
+        // --<flag>: <value>` pattern (e.g., from `CliOutputFormat::parse`).
         "cli_parse"
     } else if message.contains("missing value for --") {
         // #169: Missing required flag values (e.g., `--output-format` with no
-        // trailing argument) are parse errors, same family as above.
+        // trailing argument).
         "cli_parse"
+    } else if message.contains("unsupported permission mode") {
+        // #170: `parse_permission_mode_arg` emits `unsupported permission mode
+        // '<value>'. Use ...` which does NOT match the `for --` pattern covered
+        // by #169. Classify explicitly as cli_parse.
+        "cli_parse"
+    } else if message.contains("invalid value for --") {
+        // #170: `--reasoning-effort yolo` emits `invalid value for
+        // --reasoning-effort: 'yolo'; must be low, medium, or high`. Same family
+        // as #169 but different prefix word.
+        "cli_parse"
+    } else if message.contains("model string cannot be empty") {
+        // #170: `--model ""` or `--model=` emits this exact message.
+        // Empty-flag-value rejection, cli_parse family.
+        "cli_parse"
+    } else if message.contains("slash command") && message.contains("is interactive-only") {
+        // #170: Bare slash-command invocation outside REPL emits
+        // `slash command /<name> is interactive-only. Start \`claw\` and run
+        // it there, or use \`claw --resume ...\``. This is a command-mode
+        // misuse — more specific than cli_parse, give it its own kind so
+        // consumers can offer REPL-launch guidance.
+        "slash_command_requires_repl"
     } else if message.contains("invalid model syntax") {
         "invalid_model_syntax"
     } else if message.contains("is not yet implemented") {
@@ -11499,6 +11517,53 @@ mod tests {
             classify_error_kind("some unsupported runtime condition we don't recognize"),
             "unknown",
             "generic `unsupported` text should still fall through to unknown"
+        );
+    }
+
+    #[test]
+    fn classify_error_kind_covers_flag_value_parse_errors_170_extended() {
+        // #170: Extended classifier coverage discovered during dogfood probe
+        // 2026-04-23 07:30 Seoul. The #169 comment claimed to cover
+        // `--permission-mode bogus` but the actual message format is
+        // `unsupported permission mode 'bogus'` (NO `for --` prefix), so it
+        // still fell through to `unknown`. Four additional patterns found
+        // in the same probe.
+        assert_eq!(
+            classify_error_kind(
+                "unsupported permission mode 'bogus'. Use read-only, workspace-write, or danger-full-access."
+            ),
+            "cli_parse",
+            "invalid --permission-mode value must classify as cli_parse"
+        );
+        assert_eq!(
+            classify_error_kind(
+                "invalid value for --reasoning-effort: 'yolo'; must be low, medium, or high"
+            ),
+            "cli_parse",
+            "invalid --reasoning-effort value must classify as cli_parse"
+        );
+        assert_eq!(
+            classify_error_kind("model string cannot be empty"),
+            "cli_parse",
+            "empty --model value must classify as cli_parse"
+        );
+        assert_eq!(
+            classify_error_kind(
+                "slash command /diff is interactive-only. Start `claw` and run it there, or use `claw --resume SESSION.jsonl /diff` / `claw --resume latest /diff` when the command is marked [resume] in /help."
+            ),
+            "slash_command_requires_repl",
+            "interactive-only slash command must classify as slash_command_requires_repl"
+        );
+        // Sanity: must not hijack generic prose that mentions these words.
+        assert_eq!(
+            classify_error_kind("some invalid value that has nothing to do with flags"),
+            "unknown",
+            "generic `invalid value` prose without `for --` should still fall through"
+        );
+        assert_eq!(
+            classify_error_kind("slash command exists and works fine"),
+            "unknown",
+            "generic mention of `slash command` without `interactive-only` should fall through"
         );
     }
 
