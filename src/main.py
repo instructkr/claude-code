@@ -36,7 +36,8 @@ def build_parser() -> argparse.ArgumentParser:
     command_graph_parser.add_argument('--output-format', choices=['text', 'json'], default='text')
     tool_pool_parser = subparsers.add_parser('tool-pool', help='show assembled tool pool with default settings')
     tool_pool_parser.add_argument('--output-format', choices=['text', 'json'], default='text')
-    subparsers.add_parser('bootstrap-graph', help='show the mirrored bootstrap/runtime graph stages')
+    bootstrap_graph_parser = subparsers.add_parser('bootstrap-graph', help='show the mirrored bootstrap/runtime graph stages')
+    bootstrap_graph_parser.add_argument('--output-format', choices=['text', 'json'], default='text')
     list_parser = subparsers.add_parser('subsystems', help='list the current Python modules in the workspace')
     list_parser.add_argument('--limit', type=int, default=32)
 
@@ -230,7 +231,13 @@ def main(argv: list[str] | None = None) -> int:
             print(pool.as_markdown())
         return 0
     if args.command == 'bootstrap-graph':
-        print(build_bootstrap_graph().as_markdown())
+        graph = build_bootstrap_graph()
+        if args.output_format == 'json':
+            import json
+            envelope = {'stages': graph.as_markdown().split('\n'), 'note': 'bootstrap-graph is markdown-only in this version'}
+            print(json.dumps(envelope))
+        else:
+            print(graph.as_markdown())
         return 0
     if args.command == 'subsystems':
         for subsystem in manifest.top_level_modules[: args.limit]:
