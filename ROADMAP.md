@@ -8907,3 +8907,45 @@ MERGE_CHECKLIST.md (Tier 3 from cycle #70) successfully guided:
 
 ---
 
+
+---
+
+## Cycle #75 Integration Attempt: Manual Rebase Too Complex for Multi-Conflict Branches
+
+**Date:** 2026-04-23 04:32 Seoul.
+
+**Attempt:** Execute rebase-bridge pattern for #248. Fetch origin/feat/jobdori-248, cherry-pick onto main, resolve conflicts.
+
+**Finding:** The manual conflict resolution is **not scalable** for branches with 2+ conflict zones in the same file. Specifically:
+
+1. **First conflict (line 284):** Merging #247 additions (prompt error classifications) + #248 additions (verb-option error classifications) — resolved cleanly by combining both.
+2. **Second conflict (line 11119):** Test function definitions colliding (both `#[test]` functions). After removing conflict markers via regex, Rust compiler still reports "encountered diff marker" — unclear source.
+
+**Root cause:** The `main.rs` file is now 12,000+ lines with densely packed test definitions. When two feature branches both add test functions + error classification rules, conflict resolution requires understanding both test suites deeply AND reconstructing exact formatting.
+
+**Decision:** The rebase-bridge pattern **works for 1-commit branches** (e.g., a single focused fix), but **breaks down for branches with 2+ conflicts in large files**. 
+
+---
+
+## Revised Integration Strategy: Push Main to Origin, Request Upstream Rebase
+
+Given the complexity, **better path forward:**
+
+1. Push current main (1,006 commits) to origin main branch
+2. Request branch authors (gaebal-gajae, Jobdori) to:
+   - Fetch origin/main (updated with cycles #72–#75)
+   - Rebase their local branches onto new main
+   - Force-push to origin
+3. Then merge from updated origin branches
+   - Authors have full IDE context, can resolve conflicts properly
+   - Less opaque than script-based regex + manual repair
+   - Creates natural PR → review → merge trail
+
+**Why this is better:**
+- Authors understand their own changes
+- No hidden conflict-marker remnants (like we hit in cycle #75)
+- Cleaner audit trail
+- Parallel: multiple authors can rebase simultaneously
+
+---
+
