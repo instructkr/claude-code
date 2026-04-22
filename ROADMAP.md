@@ -7850,3 +7850,58 @@ Or alternatively, file this as **#251b** as a natural follow-up to the session-d
 
 ---
 
+
+---
+
+## Pinpoint #160 — Investigation Update (cycle #61, 2026-04-23 03:10 Seoul)
+
+**Attempted fix and why it's harder than expected.**
+
+A naive fix — intercepting `rest.len() > 1 && bare_slash_command_guidance(rest[0]).is_some()` and emitting the guidance — **breaks 3 tests:**
+
+1. `tests::parses_bare_prompt_and_json_output_flag` expects `claw explain this` to parse as `Prompt { prompt: "explain this", ... }`
+2. `tests::removed_login_and_logout_subcommands_error_helpfully` expects specific classification for removed verbs
+3. `tests::resolves_model_aliases_in_args` involves alias resolution that collides
+
+**Root tension.** The classifier must distinguish:
+
+| User Intent | Example | Desired behavior |
+|---|---|---|
+| Slash-command verb misused | `claw resume bogus-id` | Emit `unknown`: "slash command, use /resume" |
+| Prompt starting with a verb | `claw explain this pattern` | Route to Prompt with text "explain this pattern" |
+
+**What makes a verb non-promptable?** Verbs with **reserved positional-arg semantics**:
+- `resume <session>` — positional arg is a session reference
+- `compact` — no valid positional args
+- `memory` — accesses memory, positional is a topic
+- `commit` — commits code, no freeform prompt
+- `pr` — creates PR
+- `issue` — creates issue
+
+**What makes a verb promptable?** Verbs that work both as slash commands and as natural prompt starts:
+- `explain` — "explain this" is a reasonable prompt
+- `bughunter` — "bughunter src/handlers" could be a prompt
+- `clear` — ambiguous
+
+**Proposed fix shape (complex, requires verb classification):**
+
+1. Split `bare_slash_command_guidance()` into two categories:
+   - `reserved_slash_verbs()` — list that always emits guidance regardless of args (`resume`, `compact`, `memory`, `commit`, `pr`, `issue`)
+   - `promptable_slash_verbs()` — list that only emits guidance when bare (current behavior for `explain`, `bughunter`)
+2. In the parser, check `reserved_slash_verbs()` before falling through to Prompt.
+3. Update tests to cover both paths explicitly.
+
+**Acceptance:**
+- `claw resume bogus-id` → `unknown`: slash command guidance (new behavior)
+- `claw explain this` → `Prompt { prompt: "explain this", ... }` (current behavior preserved)
+- All existing tests pass
+- New regression tests lock in the classification
+
+**Deferred from cycle #61.** The verb-classification table requires explicit decisions per verb, which needs reviewer alignment. Filing as design question: which slash-command verbs should reserve their positional-arg space vs. allow prompt-like arg flow.
+
+**Commit:** No branch pushed for this iteration. Revert applied; 181 tests pass on main. ROADMAP entry updated to reflect investigation state.
+
+**Dogfood source.** Cycle #61 probe, fresh binary `/tmp/jobdori-251/rust/target/debug/claw` (commit `0aa0d3f`).
+
+---
+
