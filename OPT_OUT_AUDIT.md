@@ -144,6 +144,7 @@ If external claws report needing JSON from any OPT_OUT surface:
 
 ## Related
 
+- **OPT_OUT_DEMAND_LOG.md** — Active survey recording real demand signals (evidentiary base for any promotion decision)
 - **SCHEMAS.md** — Clawable surface contracts
 - **CLAUDE.md** — Development guidance
 - **test_cli_parity_audit.py** — Parametrized tests for CLAWABLE_SURFACES enforcement

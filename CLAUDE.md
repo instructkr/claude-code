@@ -149,12 +149,23 @@ Target: >90% line coverage for src/ (currently ~85%).
 
 ### Promote an OPT_OUT surface to CLAWABLE
 
+**Prerequisite:** Real demand signal logged in `OPT_OUT_DEMAND_LOG.md` (threshold: 2+ independent signals per surface). Speculative promotions are not allowed.
+
+Once demand is evidenced:
 1. Add --output-format flag to argparse
 2. Emit wrap_json_envelope() output in JSON path
 3. Move command from OPT_OUT_SURFACES to CLAWABLE_SURFACES
 4. Document in SCHEMAS.md
 5. Write test for JSON output
 6. Run parity audit to confirm no regressions
+7. Update `OPT_OUT_DEMAND_LOG.md` to mark signal as resolved
+
+### File a demand signal (when a claw actually needs JSON from an OPT_OUT surface)
+
+1. Open `OPT_OUT_DEMAND_LOG.md`
+2. Find the surface's entry under Group A/B/C
+3. Append a dated entry with Source, Use Case, and Markdown-alternative-checked explanation
+4. If this is the 2nd signal for the same surface, file a promotion pinpoint in ROADMAP.md
 
 ## Dogfood principles
 
