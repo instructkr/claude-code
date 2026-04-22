@@ -9112,3 +9112,50 @@ A documentation-vs-implementation divergence can cause different amounts of cons
 
 **Formalized in ROADMAP as principle #11 (sibling to diagnostic-strictness §5).**
 
+
+---
+
+## Pinpoint #165. CLAUDE.md documents v2.0 (aspirational) envelope as current behavior — P0 active misdocumentation
+
+**Status: 📋 FILED (cycle #80, 2026-04-23 05:12 Seoul).**
+
+**Surface.** CLAUDE.md line ~31 states:
+
+> "Common fields (all envelopes): timestamp, command, exit_code, output_format, schema_version"
+
+**But the binary v1.0 doesn't emit these fields.** Cycle #76 audit proved:
+- `timestamp`: absent
+- `command`: absent
+- `exit_code`: absent
+- `output_format`: absent
+- `schema_version`: absent
+
+**CLAUDE.md is supposed to document the Python reference harness behavior.** Instead, it documents the v2.0 target design from SCHEMAS.md.
+
+**Impact.** CLAUDE.md readers (protocol validators, reference implementers) will assume the actual binary emits these fields. If they build tests or parsers based on this claim, they'll fail against real v1.0 output.
+
+**Root cause.** Same as #164: SCHEMAS.md is aspirational (v2.0 locked design), but hasn't been implemented. Documentation (CLAUDE.md, USAGE.md, ERROR_HANDLING.md) inherited the aspirational schema without clarifying "this is the target, not the current state."
+
+**Fix shape — Two options:**
+
+**Option A: Update CLAUDE.md to document actual v1.0**
+- List actual common fields: error, hint, kind, type (for errors)
+- Note that v1.0 doesn't have timestamp, command, exit_code, output_format, schema_version
+- Separate section: "v2.0 target fields (after FIX_LOCUS_164)"
+
+**Option B: Clarify that CLAUDE.md documents the target schema (v2.0)**
+- Add header: "This harness implements the v2.0 target envelope schema from SCHEMAS.md, not the current v1.0 binary"
+- Note: Python harness is aspirational, Rust binary is empirical
+
+**Recommendation:** **Option A** (document actual v1.0), to keep CLAUDE.md truthful about what the reference harness validates against.
+
+**Classification:** P0 active misdocumentation (joins #78/#79 family). Highest doc-truthfulness severity.
+
+**Related:**
+- #164 (JSON envelope schema-vs-binary divergence)
+- #78 (USAGE.md active misdoc, cycle #78 fixed)
+- #79 (ERROR_HANDLING.md P0 trap, cycle #79 fixed)
+- New doctrine principle #11 (doc-truthfulness severity scale, cycle #79)
+
+**Dogfood session.** Cycle #80 systematic sweep of README.md, CLAUDE.md for P0 copy-paste traps.
+
