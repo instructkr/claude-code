@@ -55,10 +55,14 @@ def build_parser() -> argparse.ArgumentParser:
     route_parser = subparsers.add_parser('route', help='route a prompt across mirrored command/tool inventories')
     route_parser.add_argument('prompt')
     route_parser.add_argument('--limit', type=int, default=5)
+    # #168: parity with show-command/show-tool/session-lifecycle CLI family
+    route_parser.add_argument('--output-format', choices=['text', 'json'], default='text')
 
     bootstrap_parser = subparsers.add_parser('bootstrap', help='build a runtime-style session report from the mirrored inventories')
     bootstrap_parser.add_argument('prompt')
     bootstrap_parser.add_argument('--limit', type=int, default=5)
+    # #168: parity with CLI family
+    bootstrap_parser.add_argument('--output-format', choices=['text', 'json'], default='text')
 
     loop_parser = subparsers.add_parser('turn-loop', help='run a small stateful turn loop for the mirrored runtime')
     loop_parser.add_argument('prompt')
@@ -165,10 +169,14 @@ def build_parser() -> argparse.ArgumentParser:
     exec_command_parser = subparsers.add_parser('exec-command', help='execute a mirrored command shim by exact name')
     exec_command_parser.add_argument('name')
     exec_command_parser.add_argument('prompt')
+    # #168: parity with CLI family
+    exec_command_parser.add_argument('--output-format', choices=['text', 'json'], default='text')
 
     exec_tool_parser = subparsers.add_parser('exec-tool', help='execute a mirrored tool shim by exact name')
     exec_tool_parser.add_argument('name')
     exec_tool_parser.add_argument('payload')
+    # #168: parity with CLI family
+    exec_tool_parser.add_argument('--output-format', choices=['text', 'json'], default='text')
     return parser
 
 
@@ -222,6 +230,25 @@ def main(argv: list[str] | None = None) -> int:
         return 0
     if args.command == 'route':
         matches = PortRuntime().route_prompt(args.prompt, limit=args.limit)
+        # #168: JSON envelope for machine parsing
+        if args.output_format == 'json':
+            import json
+            envelope = {
+                'prompt': args.prompt,
+                'limit': args.limit,
+                'match_count': len(matches),
+                'matches': [
+                    {
+                        'kind': m.kind,
+                        'name': m.name,
+                        'score': m.score,
+                        'source_hint': m.source_hint,
+                    }
+                    for m in matches
+                ],
+            }
+            print(json.dumps(envelope))
+            return 0
         if not matches:
             print('No mirrored command/tool matches found.')
             return 0
@@ -229,7 +256,40 @@ def main(argv: list[str] | None = None) -> int:
             print(f'{match.kind}\t{match.name}\t{match.score}\t{match.source_hint}')
         return 0
     if args.command == 'bootstrap':
-        print(PortRuntime().bootstrap_session(args.prompt, limit=args.limit).as_markdown())
+        session = PortRuntime().bootstrap_session(args.prompt, limit=args.limit)
+        # #168: JSON envelope for machine parsing
+        if args.output_format == 'json':
+            import json
+            envelope = {
+                'prompt': session.prompt,
+                'limit': args.limit,
+                'setup': {
+                    'python_version': session.setup.python_version,
+                    'implementation': session.setup.implementation,
+                    'platform_name': session.setup.platform_name,
+                    'test_command': session.setup.test_command,
+                },
+                'routed_matches': [
+                    {
+                        'kind': m.kind,
+                        'name': m.name,
+                        'score': m.score,
+                        'source_hint': m.source_hint,
+                    }
+                    for m in session.routed_matches
+                ],
+                'command_execution_messages': list(session.command_execution_messages),
+                'tool_execution_messages': list(session.tool_execution_messages),
+                'turn': {
+                    'prompt': session.turn_result.prompt,
+                    'output': session.turn_result.output,
+                    'stop_reason': session.turn_result.stop_reason,
+                },
+                'persisted_session_path': session.persisted_session_path,
+            }
+            print(json.dumps(envelope))
+            return 0
+        print(session.as_markdown())
         return 0
     if args.command == 'turn-loop':
         results = PortRuntime().run_turn_loop(
@@ -455,11 +515,59 @@ def main(argv: list[str] | None = None) -> int:
         return 0
     if args.command == 'exec-command':
         result = execute_command(args.name, args.prompt)
-        print(result.message)
+        # #168: JSON envelope with typed not-found error
+        if args.output_format == 'json':
+            import json
+            if not result.handled:
+                envelope = {
+                    'name': args.name,
+                    'prompt': args.prompt,
+                    'handled': False,
+                    'error': {
+                        'kind': 'command_not_found',
+                        'message': result.message,
+                        'retryable': False,
+                    },
+                }
+            else:
+                envelope = {
+                    'name': result.name,
+                    'prompt': result.prompt,
+                    'source_hint': result.source_hint,
+                    'handled': True,
+                    'message': result.message,
+                }
+            print(json.dumps(envelope))
+        else:
+            print(result.message)
         return 0 if result.handled else 1
     if args.command == 'exec-tool':
         result = execute_tool(args.name, args.payload)
-        print(result.message)
+        # #168: JSON envelope with typed not-found error
+        if args.output_format == 'json':
+            import json
+            if not result.handled:
+                envelope = {
+                    'name': args.name,
+                    'payload': args.payload,
+                    'handled': False,
+                    'error': {
+                        'kind': 'tool_not_found',
+                        'message': result.message,
+                        'retryable': False,
+                    },
+                }
+            else:
+                envelope = {
+                    'name': result.name,
+                    'payload': result.payload,
+                    'source_hint': result.source_hint,
+                    'handled': True,
+                    'message': result.message,
+                }
+            print(json.dumps(envelope))
+        else:
+            print(result.message)
         return 0 if result.handled else 1
     parser.error(f'unknown command: {args.command}')
     return 2
