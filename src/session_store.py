@@ -72,19 +72,50 @@ def session_exists(session_id: str, directory: Path | None = None) -> bool:
     return (target_dir / f'{session_id}.json').exists()
 
 
+class SessionDeleteError(OSError):
+    """Raised when a session file exists but cannot be removed (permission, IO error).
+    
+    Distinct from SessionNotFoundError: this means the session was present but
+    deletion failed mid-operation. Callers can retry or escalate.
+    """
+    pass
+
+
 def delete_session(session_id: str, directory: Path | None = None) -> bool:
     """Delete a session file from the store.
+    
+    Contract:
+    - **Idempotent**: `delete_session(x)` followed by `delete_session(x)` is safe.
+      Second call returns False (not found), does not raise.
+    - **Race-safe**: Uses `missing_ok=True` on unlink to avoid TOCTOU between
+      exists-check and unlink. Concurrent deletion by another process is
+      treated as a no-op success (returns False for the losing caller).
+    - **Partial-failure surfaced**: If the file exists but cannot be removed
+      (permission denied, filesystem error, directory instead of file), raises
+      `SessionDeleteError` wrapping the underlying OSError. The session store
+      may be in an inconsistent state; caller should retry or escalate.
     
     Args:
         session_id: The session ID to delete.
         directory: Target session directory. Defaults to DEFAULT_SESSION_DIR.
     
     Returns:
-        True if the session was deleted, False if it did not exist.
+        True if this call deleted the session file.
+        False if the session did not exist (either never existed or was already deleted).
+    
+    Raises:
+        SessionDeleteError: if the session existed but deletion failed.
     """
     target_dir = directory or DEFAULT_SESSION_DIR
     path = target_dir / f'{session_id}.json'
-    if path.exists():
-        path.unlink()
+    try:
+        # Python 3.8+: missing_ok=True avoids TOCTOU race
+        path.unlink(missing_ok=False)
         return True
-    return False
+    except FileNotFoundError:
+        # Either never existed or was concurrently deleted — both are no-ops
+        return False
+    except (PermissionError, IsADirectoryError, OSError) as exc:
+        raise SessionDeleteError(
+            f'session {session_id!r} exists in {target_dir} but could not be deleted: {exc}'
+        ) from exc
