@@ -202,3 +202,78 @@ class TestFamilyWideJsonParity:
             )
             # Output should not be JSON-shaped (no leading {)
             assert not result.stdout.strip().startswith('{')
+
+
+class TestEnvelopeExitCodeMatchesProcessExit:
+    """#181: Envelope exit_code field must match actual process exit code.
+    
+    Regression test for the protocol violation where exec-command/exec-tool
+    not-found cases returned exit code 1 from the process but emitted
+    envelopes with exit_code: 0 (default wrap_json_envelope). Claws reading
+    the envelope would misclassify failures as successes.
+    
+    Contract (from ERROR_HANDLING.md):
+    - Exit code 0 = success
+    - Exit code 1 = error/not-found
+    - Envelope MUST reflect process exit
+    """
+
+    def test_exec_command_not_found_envelope_exit_matches(self) -> None:
+        """exec-command 'unknown-name' must have exit_code=1 in envelope."""
+        result = _run(['exec-command', 'nonexistent-cmd-name', 'test-prompt', '--output-format', 'json'])
+        assert result.returncode == 1, f'process exit should be 1, got {result.returncode}'
+        envelope = json.loads(result.stdout)
+        assert envelope['exit_code'] == 1, (
+            f'envelope.exit_code mismatch: process=1, envelope={envelope["exit_code"]}'
+        )
+        assert envelope['handled'] is False
+        assert envelope['error']['kind'] == 'command_not_found'
+
+    def test_exec_tool_not_found_envelope_exit_matches(self) -> None:
+        """exec-tool 'unknown-tool' must have exit_code=1 in envelope."""
+        result = _run(['exec-tool', 'nonexistent-tool-name', '{}', '--output-format', 'json'])
+        assert result.returncode == 1, f'process exit should be 1, got {result.returncode}'
+        envelope = json.loads(result.stdout)
+        assert envelope['exit_code'] == 1, (
+            f'envelope.exit_code mismatch: process=1, envelope={envelope["exit_code"]}'
+        )
+        assert envelope['handled'] is False
+        assert envelope['error']['kind'] == 'tool_not_found'
+
+    def test_all_commands_exit_code_invariant(self) -> None:
+        """Audit: for every clawable command, envelope.exit_code == process exit.
+        
+        This is a stronger invariant than 'emits JSON'. Claws dispatching on
+        the envelope's exit_code field must get the truth, not a lie.
+        """
+        # Sample cases known to return non-zero
+        cases = [
+            # command, expected_exit, justification
+            (['show-command', 'nonexistent-abc'], 1, 'not-found inventory lookup'),
+            (['show-tool', 'nonexistent-xyz'], 1, 'not-found inventory lookup'),
+            (['exec-command', 'nonexistent-1', 'test'], 1, 'not-found execution'),
+            (['exec-tool', 'nonexistent-2', '{}'], 1, 'not-found execution'),
+        ]
+        mismatches = []
+        for args, expected_exit, reason in cases:
+            result = _run([*args, '--output-format', 'json'])
+            if result.returncode != expected_exit:
+                mismatches.append(
+                    f'{args}: expected process exit {expected_exit} ({reason}), '
+                    f'got {result.returncode}'
+                )
+                continue
+            try:
+                envelope = json.loads(result.stdout)
+            except json.JSONDecodeError as e:
+                mismatches.append(f'{args}: JSON parse failed: {e}')
+                continue
+            if envelope.get('exit_code') != result.returncode:
+                mismatches.append(
+                    f'{args}: envelope.exit_code={envelope.get("exit_code")} '
+                    f'!= process exit={result.returncode} ({reason})'
+                )
+        assert not mismatches, (
+            'Envelope exit_code must match process exit code:\n' + 
+            '\n'.join(mismatches)
+        )

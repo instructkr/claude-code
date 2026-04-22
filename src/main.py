@@ -687,6 +687,8 @@ def main(argv: list[str] | None = None) -> int:
     if args.command == 'exec-command':
         result = execute_command(args.name, args.prompt)
         # #168: JSON envelope with typed not-found error
+        # #181: envelope exit_code must match process exit code
+        exit_code = 0 if result.handled else 1
         if args.output_format == 'json':
             import json
             if not result.handled:
@@ -708,13 +710,15 @@ def main(argv: list[str] | None = None) -> int:
                     'handled': True,
                     'message': result.message,
                 }
-            print(json.dumps(wrap_json_envelope(envelope, args.command)))
+            print(json.dumps(wrap_json_envelope(envelope, args.command, exit_code=exit_code)))
         else:
             print(result.message)
-        return 0 if result.handled else 1
+        return exit_code
     if args.command == 'exec-tool':
         result = execute_tool(args.name, args.payload)
         # #168: JSON envelope with typed not-found error
+        # #181: envelope exit_code must match process exit code
+        exit_code = 0 if result.handled else 1
         if args.output_format == 'json':
             import json
             if not result.handled:
@@ -736,10 +740,10 @@ def main(argv: list[str] | None = None) -> int:
                     'handled': True,
                     'message': result.message,
                 }
-            print(json.dumps(wrap_json_envelope(envelope, args.command)))
+            print(json.dumps(wrap_json_envelope(envelope, args.command, exit_code=exit_code)))
         else:
             print(result.message)
-        return 0 if result.handled else 1
+        return exit_code
     parser.error(f'unknown command: {args.command}')
     return 2
 
