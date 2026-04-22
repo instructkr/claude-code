@@ -7788,3 +7788,65 @@ These cycles look identical in output volume (no commits to code) but radically 
 
 ---
 
+
+---
+
+## Pinpoint #160. `claw resume <arg>` with positional args falls through to Prompt dispatch — missing_credentials instead of slash-command guidance
+
+**Status: 📋 FILED (cycle #61, 2026-04-23 03:02 Seoul).**
+
+**Surface.** `claw resume` (bare verb) correctly routes to the slash-command guidance path:
+```
+$ claw resume
+[error-kind: unknown]
+error: `claw resume` is a slash command. Start `claw` and run `/resume` inside the REPL.
+```
+
+But `claw resume <any-positional-arg>` falls through to the `Prompt` dispatch catchall:
+```
+$ claw resume bogus-session-id
+[error-kind: missing_credentials]
+error: missing Anthropic credentials; export ANTHROPIC_AUTH_TOKEN or ANTHROPIC_API_KEY...
+```
+
+**Trace path.** Discovered during cycle #61 fresh dogfood probe.
+- `main.rs` parser has no `"resume" =>` match arm for bare positional args
+- `grep '"resume"' main.rs` → no matches → bare word not classified
+- Only `--resume` and `--resume=...` flags are recognized
+- When `resume <arg>` is parsed, `<arg>` becomes positional prompt text; `resume` becomes the first prompt word
+- Runtime interprets `"resume bogus-session-id"` as a prompt string, hits Anthropic API path, demands credentials
+
+**Dispatch asymmetry:**
+
+| Invocation | Classification | Error kind |
+|---|---|---|
+| `resume` | slash-command detection | `unknown` (helpful) |
+| `resume somearg` | Prompt fall-through | `missing_credentials` (misleading) |
+| `resume arg1 arg2` | Prompt fall-through | `missing_credentials` (misleading) |
+
+**Impact.** This is the **same class of bug as #251** (session verbs falling through to Prompt dispatch), but for a different verb. User types what looks like `resume <session-id>` (a natural shape) and gets an auth error about Anthropic credentials. The error message doesn't point to the actual problem (invalid verb shape or resume-not-supported-from-CLI).
+
+The #251 family fix added session-management verbs to the parser's early classification. `resume` was NOT added because it's a slash-command-only verb. But that leaves the positional-arg case unhandled.
+
+**Fix shape (~10 lines).**
+Add `"resume"` to the bare-slash-command detection in the parser (same place that handles the bare `resume` case). When `resume` is the first positional arg, emit the same slash-command guidance regardless of trailing positional args:
+```rust
+// Classify resume+args the same as bare resume
+"resume" => {
+    return Err(bare_slash_command_guidance("resume"));
+}
+```
+
+Or alternatively, file this as **#251b** as a natural follow-up to the session-dispatch family.
+
+**Acceptance.**
+- `claw resume` → `unknown`: "slash command. Start claw and run /resume inside the REPL."
+- `claw resume bogus-id` → same error (not missing_credentials)
+- `claw resume bogus-id extra-arg` → same error
+
+**Related.** Direct sibling of #251 (session verbs falling through to Prompt). Confirms the "verb+positional-args falls through to Prompt" anti-pattern extends beyond session-management verbs. Future audit: **all unsupported-CLI verbs** should have same classification behavior whether invoked bare or with positional args.
+
+**Dogfood session.** Probed on `/tmp/jobdori-251/rust/target/debug/claw` (commit `0aa0d3f`), verified bug is reproducible in any cwd, clean binary, no credentials configured.
+
+---
+
