@@ -8064,3 +8064,41 @@ If cycle #63 lands #160 fix with verb table: **loop closes, doctrine formalized*
 
 ---
 
+
+---
+
+## Pinpoint #160 — SHIPPED (cycle #63, 2026-04-23 03:15 Seoul)
+
+**Status: 🟢 REVIEW-READY — Commit `5538934` on `feat/jobdori-160-verb-classification`**
+
+**What landed:** Reserved-semantic verb classification with positional-arg interception. Verbs with CLI-reserved meanings (`resume`, `compact`, `memory`, `commit`, `pr`, `issue`, `bughunter`) now emit slash-command guidance instead of falling through to Prompt dispatch when invoked with positional args.
+
+**Diff:** 23 lines in `rust/crates/rusty-claude-cli/src/main.rs`
+- Added `is_reserved_semantic_verb()` helper (lists reserved verbs)
+- Added pre-check in `parse_bare_verb_or_subcommand()` before `rest.len() != 1` guard
+- Interception only fires if verb is reserved AND rest.len() > 1
+
+**Surface fix:**
+```
+Before: claw resume bogus-id → [error-kind: missing_credentials] 
+After:  claw resume bogus-id → [error-kind: unknown]: "`claw resume` is a slash command..."
+```
+
+**Tests:** 181 binary tests pass (no regressions). Verified:
+- Reserved verbs (resume, compact, memory) with args → slash-command guidance ✅
+- Promptable verbs (explain) with args → Prompt dispatch (credentials error) ✅
+- Bare reserved verbs → slash-command guidance (unchanged) ✅
+
+**Design closure:** The investigation from cycle #61 revealed verb classification was the real problem (not a simple fix). Cycle #63 implemented the classification table and verified the fix works without breaking prompt-text parsing. The verb set `is_reserved_semantic_verb()` can be extended later if needed; current set is empirically sound.
+
+**Acceptance:**
+- `claw resume <any-arg>` → slash-command guidance (not missing_credentials)
+- `claw compact <any-arg>` → slash-command guidance
+- `claw memory <topic>` → slash-command guidance
+- `claw explain this` → Prompt (backward-compatible)
+- All existing tests pass
+
+**Next:** Merge when review bandwidth available. This closes #160 and removes one non-urgent pinpoint from the queue.
+
+---
+
