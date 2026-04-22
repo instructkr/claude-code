@@ -59,6 +59,8 @@ CLAWABLE_SURFACES = frozenset({
     'command-graph',
     'tool-pool',
     'bootstrap-graph',
+    # Turn-loop with JSON output (#164 Stage B, #174)
+    'turn-loop',
 })
 
 # Commands explicitly exempt from --output-format requirement.
@@ -75,8 +77,6 @@ OPT_OUT_SURFACES = frozenset({
     'subsystems',         # use --limit
     'commands',           # use --query / --limit / --no-plugin-commands
     'tools',              # use --query / --limit / --simple-mode
-    # Turn-loop has structured_output flag; JSON mode is future work
-    'turn-loop',
     # Simulation/debug surfaces (not claw-orchestrated)
     'remote-mode',
     'ssh-mode',

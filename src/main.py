@@ -101,6 +101,12 @@ def build_parser() -> argparse.ArgumentParser:
             'suffix that used to pollute the transcript.'
         ),
     )
+    loop_parser.add_argument(
+        '--output-format',
+        choices=['text', 'json'],
+        default='text',
+        help='output format (#164 Stage B: JSON includes cancel_observed per turn)',
+    )
 
     flush_parser = subparsers.add_parser(
         'flush-transcript',
@@ -349,15 +355,40 @@ def main(argv: list[str] | None = None) -> int:
             timeout_seconds=args.timeout_seconds,
             continuation_prompt=args.continuation_prompt,
         )
+        # Exit 2 when a timeout terminated the loop so claws can distinguish
+        # 'ran to completion' from 'hit wall-clock budget'.
+        loop_exit_code = 2 if results and results[-1].stop_reason == 'timeout' else 0
+        if args.output_format == 'json':
+            # #164 Stage B + #173: JSON envelope with per-turn cancel_observed
+            # Promotes turn-loop from OPT_OUT to CLAWABLE surface.
+            import json
+            envelope = {
+                'prompt': args.prompt,
+                'max_turns': args.max_turns,
+                'turns_completed': len(results),
+                'timeout_seconds': args.timeout_seconds,
+                'continuation_prompt': args.continuation_prompt,
+                'turns': [
+                    {
+                        'prompt': r.prompt,
+                        'output': r.output,
+                        'stop_reason': r.stop_reason,
+                        'cancel_observed': r.cancel_observed,
+                        'matched_commands': list(r.matched_commands),
+                        'matched_tools': list(r.matched_tools),
+                    }
+                    for r in results
+                ],
+                'final_stop_reason': results[-1].stop_reason if results else None,
+                'final_cancel_observed': results[-1].cancel_observed if results else False,
+            }
+            print(json.dumps(wrap_json_envelope(envelope, args.command, exit_code=loop_exit_code)))
+            return loop_exit_code
         for idx, result in enumerate(results, start=1):
             print(f'## Turn {idx}')
             print(result.output)
             print(f'stop_reason={result.stop_reason}')
-        # Exit 2 when a timeout terminated the loop so claws can distinguish
-        # 'ran to completion' from 'hit wall-clock budget'.
-        if results and results[-1].stop_reason == 'timeout':
-            return 2
-        return 0
+        return loop_exit_code
     if args.command == 'flush-transcript':
         from pathlib import Path as _Path
         engine = QueryEnginePort.from_workspace()
