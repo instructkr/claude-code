@@ -739,6 +739,9 @@ enum LocalHelpTopic {
     Meta,
     Submit,
     Resume,
+    // #130e-B: help parity — surface-level bugs (plugins, prompt)
+    Plugins,
+    Prompt,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -787,20 +790,20 @@ fn parse_args(args: &[String]) -> Result<CliAction, String> {
                 if !rest.is_empty()
                     && matches!(
                         rest[0].as_str(),
-                        "prompt"
-                            | "commit"
+                        "commit"
                             | "pr"
                             | "issue"
                     ) =>
             {
                 // `--help` following a subcommand that would otherwise forward
-                // the arg to the API (e.g. `claw prompt --help`) should show
-                // top-level help instead. Subcommands that consume their own
-                // args (agents, mcp, plugins, skills) and local help-topic
-                // subcommands (status, sandbox, doctor, init, state, export,
-                // version, system-prompt, dump-manifests, bootstrap-plan) must
-                // NOT be intercepted here — they handle --help in their own
-                // dispatch paths via parse_local_help_action(). See #141.
+                // the arg to the API should show top-level help instead.
+                // Subcommands that consume their own args (agents, mcp, plugins,
+                // skills) and local help-topic subcommands (status, sandbox,
+                // doctor, init, state, export, version, system-prompt,
+                // dump-manifests, bootstrap-plan, diff, config, help, submit,
+                // resume, prompt) must NOT be intercepted here — they handle
+                // --help in their own dispatch paths via
+                // parse_local_help_action(). See #141, #130c, #130d, #130e.
                 wants_help = true;
                 index += 1;
             }
@@ -1286,6 +1289,9 @@ fn parse_local_help_action(rest: &[String]) -> Option<Result<CliAction, String>>
         "help" => LocalHelpTopic::Meta,
         "submit" => LocalHelpTopic::Submit,
         "resume" => LocalHelpTopic::Resume,
+        // #130e-B: help parity — surface fixes
+        "plugins" => LocalHelpTopic::Plugins,
+        "prompt" => LocalHelpTopic::Prompt,
         _ => return None,
     };
     Some(Ok(CliAction::HelpTopic(topic)))
@@ -6188,6 +6194,23 @@ fn render_help_topic(topic: LocalHelpTopic) -> String {
   Requires         valid Anthropic credentials (ANTHROPIC_AUTH_TOKEN or ANTHROPIC_API_KEY)
   Related          claw submit · claw --resume · /session list"
             .to_string(),
+        // #130e-B: help topic for `claw plugins --help`.
+        LocalHelpTopic::Plugins => "Plugins
+  Usage            claw plugins [list|install|enable|disable|uninstall|update] [<target>]
+  Purpose          manage bundled and user plugins from the CLI surface
+  Defaults         list (no action prints inventory)
+  Sources          .claw/plugins.json, bundled catalog, user-installed
+  Formats          text (default), json
+  Related          claw mcp · claw skills · /plugins (REPL)"
+            .to_string(),
+        // #130e-B: help topic for `claw prompt --help`.
+        LocalHelpTopic::Prompt => "Prompt
+  Usage            claw prompt <prompt-text>
+  Purpose          run a single-turn, non-interactive prompt and exit (like --print mode)
+  Flags            --model · --allowedTools · --output-format · --compact
+  Requires         valid Anthropic credentials (ANTHROPIC_AUTH_TOKEN or ANTHROPIC_API_KEY)
+  Related          claw submit · claw (bare, interactive REPL)"
+            .to_string(),
     }
 }
 
@@ -10577,6 +10600,43 @@ mod tests {
         let resume_h = parse_args(&["resume".to_string(), "-h".to_string()])
             .expect("resume -h must parse");
         assert!(matches!(resume_h, CliAction::HelpTopic(LocalHelpTopic::Resume)));
+        // #130e-B: surface-level help fixes for plugins and prompt.
+        // These previously emitted "Unknown action" (plugins) or wrong help (prompt).
+        let plugins_help = parse_args(&[
+            "plugins".to_string(),
+            "--help".to_string(),
+        ])
+        .expect("plugins --help must parse as help action");
+        assert!(
+            matches!(plugins_help, CliAction::HelpTopic(LocalHelpTopic::Plugins)),
+            "#130e-B: plugins --help must route to LocalHelpTopic::Plugins, got: {plugins_help:?}"
+        );
+        let prompt_help = parse_args(&[
+            "prompt".to_string(),
+            "--help".to_string(),
+        ])
+        .expect("prompt --help must parse as help action");
+        assert!(
+            matches!(prompt_help, CliAction::HelpTopic(LocalHelpTopic::Prompt)),
+            "#130e-B: prompt --help must route to LocalHelpTopic::Prompt, got: {prompt_help:?}"
+        );
+        // Short forms
+        let plugins_h = parse_args(&["plugins".to_string(), "-h".to_string()])
+            .expect("plugins -h must parse");
+        assert!(matches!(plugins_h, CliAction::HelpTopic(LocalHelpTopic::Plugins)));
+        let prompt_h = parse_args(&["prompt".to_string(), "-h".to_string()])
+            .expect("prompt -h must parse");
+        assert!(matches!(prompt_h, CliAction::HelpTopic(LocalHelpTopic::Prompt)));
+        // Non-regression: `prompt "actual text"` still parses as Prompt action
+        let prompt_action = parse_args(&[
+            "prompt".to_string(),
+            "hello world".to_string(),
+        ])
+        .expect("prompt with real text must parse");
+        assert!(
+            matches!(prompt_action, CliAction::Prompt { ref prompt, .. } if prompt == "hello world"),
+            "#130e-B: prompt with real text must route to Prompt action"
+        );
         // #147: empty / whitespace-only positional args must be rejected
         // with a specific error instead of falling through to the prompt
         // path (where they surface a misleading "missing Anthropic
