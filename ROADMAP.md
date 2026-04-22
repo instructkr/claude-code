@@ -9667,3 +9667,59 @@ missing Anthropic credentials; export ANTHROPIC_AUTH_TOKEN...
 
 **Total Phase 0 effort:** ~1.5 days (reduced from "unclear" to concrete work).
 
+
+---
+
+## Program: JSON Productization — Phase 0 Final Framing (Cycle #88)
+
+**Lock:** "Phase 0 = JSON emission baseline stabilization" (per gaebal-gajae review, cycle #88).
+
+**Why this framing beats previous versions:**
+
+- "Fix bootstrap silent failure" ❌ — anchored to refuted claim (#168b)
+- "Controlled JSON baseline audit + minimum invariant normalization" — accurate but vague on WHAT is being normalized
+- **"JSON emission baseline stabilization"** ✅ — names the axis: emission (what goes out, where, when)
+
+**Phase 0 = stabilize emission before designing shape.**
+
+### Phase 0 Subtasks (Locked Ordering)
+
+Before any shape-level work, answer: **"What does each verb emit, to which stream, with which exit code?"**
+
+| # | Task | Addresses | Effort |
+|---|---|---|---|
+| 1 | **Stream routing fix** — `bootstrap`/`dump-manifests`/`state` emit JSON to stdout (not stderr) under `--output-format json` | #168c | 0.5 day |
+| 2 | **No-silent guarantee** — Every verb under `--output-format json` emits valid JSON to stdout OR exits non-zero. No silent-success cases permitted. Assert via CI. | General contract | 0.25 day |
+| 3 | **Per-verb emission inventory** — Produce authoritative catalog: verb → (stdout bytes, stderr bytes, exit code, keys). Lock as baseline. | Reference artifact | 0.25 day |
+| 4 | **CI parity test** — Prevent regressions. Any new verb must conform to emission baseline. | Regression prevention | 0.25 day |
+
+**Phase 0 output (deliverables):**
+- Clean emission baseline across 16 verbs
+- `SCHEMAS.md` § "v1.5 Emission Baseline" with inventory
+- CI test `test_emission_baseline.rs` (or equivalent)
+- #168c closed, #168b formally invalid
+
+**Phase 0 does NOT include:**
+- Shape normalization (moved to Phase 1) — that's where `list-sessions` `command` → `kind` goes
+- Envelope wrapping (Phase 2)
+- Default version bump (Phase 3)
+
+**Rationale for separation:** Shape work requires a stable emission baseline. Can't normalize shapes until we know which verbs even emit to which stream. Phase 0 stabilizes the ground; Phase 1 renovates the building.
+
+### #168b — Formally Closed as INVALID
+
+**Original claim (cycle #84):** `claw bootstrap hello --output-format json` produces no output with exit 0.
+
+**Refutation evidence (cycle #87 controlled matrix):** Exit 1, stderr 483 bytes, stdout 0 bytes. Not silent; misrouted.
+
+**Reframed under #168c:** Real issue is stderr routing, not silent emission.
+
+**Marked:** INVALID. Retained in ROADMAP for audit trail; not counted in open pinpoint total.
+
+### Revised Pinpoint Accounting
+
+- Filed total: 60 (was 58; +2 from #168a/#168c split; #168b retained as invalid audit record)
+- Genuinely-open: 52 (#168a, #168c active; #168b closed invalid; others unchanged)
+- Phase 0 active targets: #168c (primary), emission CI (general)
+- Phase 1 active targets: #168a (shape normalization)
+
