@@ -1,5 +1,23 @@
 use std::env;
+use std::path::Path;
 use std::process::Command;
+
+fn resolve_git_head_path() -> Option<String> {
+    let git_path = Path::new(".git");
+    if git_path.is_file() {
+        // Worktree: .git is a pointer file containing "gitdir: /path/to/real/.git/worktrees/<name>"
+        if let Ok(content) = std::fs::read_to_string(git_path) {
+            if let Some(gitdir) = content.strip_prefix("gitdir:") {
+                let gitdir = gitdir.trim();
+                return Some(format!("{}/HEAD", gitdir));
+            }
+        }
+    } else if git_path.is_dir() {
+        // Regular repo: .git is a directory
+        return Some(".git/HEAD".to_string());
+    }
+    None
+}
 
 fn main() {
     // Get git SHA (short hash)
@@ -52,6 +70,12 @@ fn main() {
     println!("cargo:rustc-env=BUILD_DATE={build_date}");
 
     // Rerun if git state changes
-    println!("cargo:rerun-if-changed=.git/HEAD");
+    // In worktrees, .git is a pointer file, so watch the actual HEAD location
+    if let Some(head_path) = resolve_git_head_path() {
+        println!("cargo:rerun-if-changed={}", head_path);
+    } else {
+        // Fallback to .git/HEAD for regular repos (won't trigger in worktrees, but prevents silent failure)
+        println!("cargo:rerun-if-changed=.git/HEAD");
+    }
     println!("cargo:rerun-if-changed=.git/refs");
 }
