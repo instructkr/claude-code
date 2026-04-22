@@ -573,3 +573,136 @@ SCHEMAS.md was written as the **target design** for v2.0. The Rust binary is sti
 - **"When does v2.0 ship?"** See FIX_LOCUS_164.md Phase 1 estimate: ~6 dev-days. Not scheduled yet.
 - **"Can I use v2.0 now?"** Only if you explicitly pass `--envelope-version=2.0` (which doesn't exist yet in v1.0 binary).
 
+---
+
+## v1.5 Emission Baseline — Per-Verb Shape Catalog (Cycle #91, Phase 0 Task 3)
+
+**Status:** 📸 Snapshot of actual binary behavior as of cycle #91 (2026-04-23). Anchored by controlled matrix `/tmp/cycle87-audit/matrix.json` + Phase 0 tests in `output_format_contract.rs`.
+
+### Purpose
+
+This section documents **what each verb actually emits under `--output-format json`** as of the v1.5 emission baseline (post-cycle #89 emission routing fix, pre-Phase 1 shape normalization).
+
+This is a **reference artifact**, not a target schema. It describes the reality that:
+
+1. `--output-format json` exists and emits JSON (enforced by Phase 0 Task 2)
+2. All output goes to stdout (enforced by #168c fix, cycle #89)
+3. Each verb has a bespoke top-level shape (documented below; to be normalized in Phase 1)
+
+### Emission Contract (v1.5 Baseline)
+
+| Property | Rule | Enforced By |
+|---|---|---|
+| Exit 0 + stdout empty (silent success) | **Forbidden** | Test: `emission_contract_no_silent_success_under_output_format_json_168c_task2` |
+| Exit 0 + stdout contains valid JSON | Required | Test: same (parses each safe-success verb) |
+| Exit != 0 + JSON envelope on stdout | Required | Test: same + `error_envelope_emitted_to_stdout_under_output_format_json_168c` |
+| Error envelope on stderr under `--output-format json` | **Forbidden** | Test: #168c regression test |
+| Text mode routes errors to stderr | Preserved | Backward compat; not changed by cycle #89 |
+
+### Per-Verb Shape Catalog
+
+Captured from controlled matrix (cycle #87) and verified against post-#168c binary (cycle #91).
+
+#### Verbs with `kind` top-level field (12/13)
+
+| Verb | Top-level keys | Notes |
+|---|---|---|
+| `help` | `kind, message` | Minimal shape |
+| `version` | `git_sha, kind, message, target, version` | Build metadata |
+| `doctor` | `checks, has_failures, kind, message, report, summary` | Diagnostic results |
+| `mcp` | `action, config_load_error, configured_servers, kind, servers, status, working_directory` | MCP state |
+| `skills` | `action, kind, skills, summary` | Skills inventory |
+| `agents` | `action, agents, count, kind, summary, working_directory` | Agent inventory |
+| `sandbox` | `active, active_namespace, active_network, allowed_mounts, enabled, fallback_reason, filesystem_active, filesystem_mode, in_container, kind, markers, requested_namespace, requested_network, supported` | Sandbox state (14 keys) |
+| `status` | `config_load_error, kind, model, model_raw, model_source, permission_mode, sandbox, status, usage, workspace` | Runtime status |
+| `system-prompt` | `kind, message, sections` | Prompt sections |
+| `bootstrap-plan` | `kind, phases` | Bootstrap phases |
+| `export` | `file, kind, message, messages, session_id` | Export metadata |
+| `acp` | `aliases, discoverability_tracking, kind, launch_command, message, recommended_workflows, serve_alias_only, status, supported, tracking` | ACP discoverability |
+
+#### Verb with `command` top-level field (1/13) — Phase 1 normalization target
+
+| Verb | Top-level keys | Notes |
+|---|---|---|
+| `list-sessions` | `command, sessions` | **Deviation:** uses `command` instead of `kind`. Target Phase 1 fix. |
+
+#### Verbs with error-only emission in test env (exit != 0)
+
+These verbs require external state (credentials, session fixtures, manifests) and return error envelopes in clean test environments:
+
+| Verb | Error envelope keys | Notes |
+|---|---|---|
+| `bootstrap` | `error, hint, kind, type` | Requires `ANTHROPIC_AUTH_TOKEN` for success path |
+| `dump-manifests` | `error, hint, kind, type` | Requires upstream manifest source |
+| `state` | `error, hint, kind, type` | Requires worker state file |
+
+**Common error envelope shape (all verbs):** `{error, hint, kind, type}` — this is the one consistently-shaped part of v1.5.
+
+### Standard Error Envelope (v1.5)
+
+Error envelopes are the **only** part of v1.5 with a guaranteed consistent shape across all verbs:
+
+```json
+{
+  "type": "error",
+  "error": "short human-readable reason",
+  "kind": "snake_case_machine_readable_classification",
+  "hint": "optional remediation hint (may be null)"
+}
+```
+
+**Classification kinds** (from `classify_error_kind` in `main.rs`):
+- `cli_parse` — argument parsing error
+- `missing_credentials` — auth token/key missing
+- `session_not_found` — load-session target missing
+- `session_load_failed` — persisted session unreadable
+- `no_managed_sessions` — no sessions exist to list
+- `missing_manifests` — upstream manifest sources absent
+- `filesystem_io_error` — file operation failure
+- `api_http_error` — upstream API returned non-2xx
+- `unknown` — classifier fallthrough
+
+### How This Differs from v2.0 Target
+
+| Aspect | v1.5 (this doc) | v2.0 Target (SCHEMAS.md top) |
+|---|---|---|
+| Top-level verb ID | 12 use `kind`, 1 uses `command` | Common `command` field |
+| Common metadata | None (no `timestamp`, `exit_code`, etc.) | `timestamp`, `command`, `exit_code`, `output_format`, `schema_version` |
+| Error envelope | `{error, hint, kind, type}` flat | `{error: {message, kind, operation, target, retryable}, ...}` nested |
+| Success shape | Verb-specific (13 bespoke) | Common wrapper with `data` field |
+
+### Consumer Guidance (Against v1.5 Baseline)
+
+**For claws consuming v1.5 today:**
+
+1. **Always use `--output-format json`** — text format has no stability contract (#167)
+2. **Check `type` field first** — "error" or absent/other (treat as success)
+3. **For errors:** access `error` (string), `kind` (string), `hint` (nullable string)
+4. **For success:** use verb-specific keys per catalog above
+5. **Do NOT assume** `kind` field exists on success path — `list-sessions` uses `command` instead
+6. **Do NOT assume** metadata fields (`timestamp`, `exit_code`, etc.) — they are v2.0 target only
+7. **Check exit code** for pass/fail; don't infer from payload alone
+
+### Phase 1 Normalization Targets (After This Baseline Locks)
+
+Phase 1 (shape stabilization) will normalize these divergences:
+
+- `list-sessions`: `command` → `kind` (align with 12/13 convention)
+- Potentially: unify where `message` field appears (9/13 have it, inconsistently populated)
+- Potentially: unify where `action` field appears (only in 4 inventory verbs)
+
+Phase 1 does **not** add common metadata (`timestamp`, `exit_code`) — that's Phase 2 (v2.0 wrapper).
+
+### Regenerating This Catalog
+
+The catalog is derived from running the controlled matrix. Phase 0 Task 4 will add a deterministic script; for now, reproduce with:
+
+```
+for verb in help version list-sessions doctor mcp skills agents sandbox status system-prompt bootstrap-plan export acp; do
+  echo "=== $verb ==="
+  claw $verb --output-format json | jq 'keys'
+done
+```
+
+This matches what the Phase 0 Task 2 test enforces programmatically.
+
