@@ -538,6 +538,106 @@ fn whitespace_only_positional_arg_emits_cli_parse_envelope_247() {
     );
 }
 
+/// #168c Phase 0 Task 2: No-silent guarantee.
+///
+/// Under `--output-format json`, every verb must satisfy the emission contract:
+/// either emit a valid JSON envelope to stdout (with exit 0 for success, or
+/// exit != 0 for error), OR exit with an error code. Silent success (exit 0
+/// with empty stdout) is forbidden under the JSON contract because consumers
+/// cannot distinguish success from broken emission.
+///
+/// This test iterates a catalog of clawable verbs and asserts:
+/// 1. Each verb produces stdout output when exit == 0 (no silent success)
+/// 2. The stdout output parses as JSON (emission contract integrity)
+/// 3. Error cases (exit != 0) produce JSON on stdout (#168c routing fix)
+///
+/// Phase 0 Task 2 deliverable: prevents regressions in the emission contract
+/// for the full set of discoverable verbs.
+#[test]
+fn emission_contract_no_silent_success_under_output_format_json_168c_task2() {
+    let root = unique_temp_dir("168c-task2-no-silent");
+    fs::create_dir_all(&root).expect("temp dir should exist");
+
+    // Verbs expected to succeed (exit 0) with non-empty JSON on stdout.
+    // Covers the discovery-safe subset — verbs that don't require external
+    // credentials or network and should be safely invokable in CI.
+    let safe_success_verbs: &[(&str, &[&str])] = &[
+        ("help", &["help"]),
+        ("version", &["version"]),
+        ("list-sessions", &["list-sessions"]),
+        ("doctor", &["doctor"]),
+        ("mcp", &["mcp"]),
+        ("skills", &["skills"]),
+        ("agents", &["agents"]),
+        ("sandbox", &["sandbox"]),
+        ("status", &["status"]),
+        ("system-prompt", &["system-prompt"]),
+        ("bootstrap-plan", &["bootstrap-plan", "test"]),
+        ("acp", &["acp"]),
+    ];
+
+    for (verb, args) in safe_success_verbs {
+        let mut full_args = vec!["--output-format", "json"];
+        full_args.extend_from_slice(args);
+        let output = run_claw(&root, &full_args, &[]);
+
+        // Emission contract clause 1: if exit == 0, stdout must be non-empty.
+        if output.status.success() {
+            let stdout_text = String::from_utf8_lossy(&output.stdout);
+            assert!(
+                !stdout_text.trim().is_empty(),
+                "#168c Task 2 emission contract violation: `{verb}` exit 0 with empty stdout (silent success). stderr was:\n{}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+
+            // Emission contract clause 2: stdout must be valid JSON.
+            let envelope: Result<Value, _> = serde_json::from_slice(&output.stdout);
+            assert!(
+                envelope.is_ok(),
+                "#168c Task 2 emission contract violation: `{verb}` stdout is not valid JSON:\n{stdout_text}"
+            );
+        }
+        // If exit != 0, it's an error path; #168c primary test covers error routing.
+    }
+
+    // Verbs expected to fail (exit != 0) in test env (require external state).
+    // Emission contract clause 3: error paths must still emit JSON on stdout.
+    let safe_error_verbs: &[(&str, &[&str])] = &[
+        ("prompt-no-arg", &["prompt"]),
+        ("doctor-bad-arg", &["doctor", "--foo"]),
+    ];
+
+    for (label, args) in safe_error_verbs {
+        let mut full_args = vec!["--output-format", "json"];
+        full_args.extend_from_slice(args);
+        let output = run_claw(&root, &full_args, &[]);
+
+        assert!(
+            !output.status.success(),
+            "{label} was expected to fail but exited 0"
+        );
+
+        // #168c: error envelopes must be on stdout.
+        let stdout_text = String::from_utf8_lossy(&output.stdout);
+        assert!(
+            !stdout_text.trim().is_empty(),
+            "#168c Task 2 emission contract violation: {label} failed with empty stdout. stderr was:\n{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+
+        let envelope: Result<Value, _> = serde_json::from_slice(&output.stdout);
+        assert!(
+            envelope.is_ok(),
+            "#168c Task 2 emission contract violation: {label} stdout not valid JSON:\n{stdout_text}"
+        );
+        let envelope = envelope.unwrap();
+        assert_eq!(
+            envelope["type"], "error",
+            "{label} error envelope must carry type=error, got: {envelope}"
+        );
+    }
+}
+
 #[test]
 fn unrecognized_argument_still_classifies_as_cli_parse_247_regression_guard() {
     // #247 regression guard: the new empty-prompt / prompt-subcommand
