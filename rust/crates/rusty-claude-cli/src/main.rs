@@ -259,10 +259,18 @@ Run `claw --help` for usage."
 /// Returns a snake_case token that downstream consumers can switch on instead
 /// of regex-scraping the prose. The classification is best-effort prefix/keyword
 /// matching against the error messages produced throughout the CLI surface.
+/// #130b: Wrap io::Error with operation context so classifier can recognize filesystem failures.
+fn contextualize_io_error(operation: &str, target: &str, error: std::io::Error) -> String {
+    format!("{} failed: {} ({})", operation, target, error)
+}
+
 fn classify_error_kind(message: &str) -> &'static str {
     // Check specific patterns first (more specific before generic)
     if message.contains("missing Anthropic credentials") {
         "missing_credentials"
+    } else if message.contains("export failed:") || message.contains("diff failed:") || message.contains("config failed:") {
+        // #130b: Filesystem operation errors enriched with operation+path context.
+        "filesystem_io_error"
     } else if message.contains("Manifest source files are missing") {
         "missing_manifests"
     } else if message.contains("no worker state file found") {
@@ -7174,7 +7182,10 @@ fn run_export(
     let markdown = render_session_markdown(&session, &handle.id, &handle.path);
 
     if let Some(path) = output_path {
-        fs::write(path, &markdown)?;
+        // #130b: Wrap io::Error with operation context so classifier recognizes filesystem failures.
+        fs::write(path, &markdown).map_err(|e| -> Box<dyn std::error::Error> {
+            contextualize_io_error("export", &path.display().to_string(), e).into()
+        })?;
         let report = format!(
             "Export\n  Result           wrote markdown transcript\n  File             {}\n  Session          {}\n  Messages         {}",
             path.display(),
@@ -10579,6 +10590,45 @@ mod tests {
         assert!(
             extra_err.contains("unexpected extra arguments"),
             "extra-args error should be specific, got: {extra_err}"
+        );
+        // #130b: classify_error_kind must recognize filesystem operation errors.
+        // Messages produced by contextualize_io_error() must route to
+        // "filesystem_io_error" kind, not default "unknown". This closes the
+        // context-loss chain (run_export -> fs::write -> ? -> to_string ->
+        // classify miss -> unknown) that #130b identified.
+        let export_err_msg = "export failed: /tmp/bad/path (No such file or directory (os error 2))";
+        assert_eq!(
+            classify_error_kind(export_err_msg),
+            "filesystem_io_error",
+            "#130b: export fs::write errors must classify as filesystem_io_error, not unknown"
+        );
+        let diff_err_msg = "diff failed: /tmp/nowhere (Permission denied (os error 13))";
+        assert_eq!(
+            classify_error_kind(diff_err_msg),
+            "filesystem_io_error",
+            "#130b: diff fs errors must classify as filesystem_io_error"
+        );
+        let config_err_msg = "config failed: /tmp/x (Is a directory (os error 21))";
+        assert_eq!(
+            classify_error_kind(config_err_msg),
+            "filesystem_io_error",
+            "#130b: config fs errors must classify as filesystem_io_error"
+        );
+        // #130b: contextualize_io_error must produce messages that the classifier recognizes.
+        let io_err = std::io::Error::new(std::io::ErrorKind::NotFound, "No such file or directory");
+        let enriched = super::contextualize_io_error("export", "/tmp/bad/path", io_err);
+        assert!(
+            enriched.contains("export failed:"),
+            "#130b: contextualize_io_error must include operation name, got: {enriched}"
+        );
+        assert!(
+            enriched.contains("/tmp/bad/path"),
+            "#130b: contextualize_io_error must include target path, got: {enriched}"
+        );
+        assert_eq!(
+            classify_error_kind(&enriched),
+            "filesystem_io_error",
+            "#130b: enriched messages must be classifier-recognizable"
         );
         // #147: empty / whitespace-only positional args must be rejected
         // with a specific error instead of falling through to the prompt
