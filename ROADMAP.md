@@ -10289,3 +10289,123 @@ This naming follows `feat/jobdori-<number>-<brief>` convention and surfaces the 
 6. Single-commit PR, easy review
 
 **Family alignment:** Part of doc-truthfulness family (#76, #79, #82, #172, #180). Different from SCHEMAS.md gaps (#172 = inventory drift, #180 = narrative/surface divergence).
+
+## Pinpoint #181. `plugins bogus-subcommand` returns success-shaped envelope instead of error — FILED (cycle #104, 2026-04-23 10:33 Seoul)
+
+**Gap.** When a user runs `claw --output-format json plugins bogus-subcommand`, the CLI emits a success-shaped envelope (no `type: "error"`, no `error` field) but the error is buried inside a natural-language `message` field:
+
+```json
+{
+  "action": "bogus-subcommand",
+  "kind": "plugin",
+  "message": "Unknown /plugins action 'bogus-subcommand'. Use list, install, enable, disable, uninstall, or update.",
+  "reload_runtime": false,
+  "target": null
+}
+```
+
+**Problem for consumers:**
+- No `type: "error"` discriminator
+- No `error` field with machine-parseable text
+- No `kind: "cli_parse"` for error classification
+- Consumer parsing via `if envelope.get("type") == "error"` will **treat this as success**
+- Only way to detect the error is NLP parsing of the `message` field — fragile
+
+**Compare to `mcp bogus`:**
+```json
+{
+  "action": "help",
+  "kind": "mcp",
+  "unexpected": "bogus",
+  "usage": {...}
+}
+```
+Different shape, but also **not** marked as error. Both verbs are fundamentally broken on unknown subcommands.
+
+**Expected shape (per SCHEMAS.md error envelope):**
+```json
+{
+  "error": "Unknown /plugins action 'bogus-subcommand'. Use list, install, enable, disable, uninstall, or update.",
+  "hint": "Run `claw plugins --help` for usage.",
+  "kind": "cli_parse",
+  "type": "error"
+}
+```
+
+**Fix shape.** Unknown-subcommand handler should route to error envelope path, not success envelope. Applies to both `plugins` and `mcp` verbs (potentially more).
+
+**Family:** Emission routing family (related to Phase 0 #168c work). Also consumer-parity family (envelope shape).
+
+**Status:** FILED. Per freeze doctrine, no fix on 168c. Proposed: `feat/jobdori-181-unknown-subcommand-error-routing`.
+
+## Pinpoint #182. `plugins install/enable` not-found errors classified as `unknown` — FILED (cycle #104, 2026-04-23 10:33 Seoul)
+
+**Gap.** Part of the broader classifier coverage hole documented in #169-#179, but specific to plugins:
+
+```bash
+# Probe A: plugins install nonexistent
+claw --output-format json plugins install /tmp/does-not-exist
+# → {"error": "plugin source `/tmp/does-not-exist` was not found", "hint": null, "kind": "unknown", "type": "error"}
+
+# Probe B: plugins enable nonexistent
+claw --output-format json plugins enable nonexistent-plugin
+# → {"error": "plugin `nonexistent-plugin` is not installed or discoverable", "hint": null, "kind": "unknown", "type": "error"}
+```
+
+Both should be `kind: "session_not_found"` or new `kind: "plugin_not_found"` — there's already precedent in SCHEMAS.md for `session_not_found` and `command_not_found` as error kinds.
+
+**Fix shape.**
+```rust
+} else if message.contains("was not found") ||
+          message.contains("is not installed or discoverable") {
+    "plugin_not_found"  // or reuse "not_found" if enum is simplified
+}
+```
+
+**Family:** Typed-error classifier family (now 14 members). Sub-family: resource-not-found errors for plugins/skills/sessions.
+
+**Status:** FILED. Per freeze doctrine, no fix on 168c.
+
+## Pinpoint #183. `plugins` and `mcp` emit different shapes on unknown subcommand (discriminator inconsistency) — FILED (cycle #104, 2026-04-23 10:33 Seoul)
+
+**Gap.** Two sibling verbs emit fundamentally different JSON shapes when given an unknown subcommand, forcing consumers to special-case each verb:
+
+```json
+// claw plugins bogus-subcommand →
+{
+  "action": "bogus-subcommand",
+  "kind": "plugin",
+  "message": "Unknown /plugins action...",
+  "reload_runtime": false,
+  "target": null
+}
+
+// claw mcp bogus →
+{
+  "action": "help",
+  "kind": "mcp",
+  "unexpected": "bogus",
+  "usage": {
+    "direct_cli": "claw mcp [list|show <server>|help]",
+    "slash_command": "/mcp [list|show <server>|help]",
+    "sources": [...]
+  }
+}
+```
+
+**Observations:**
+- `mcp` has `unexpected` + `usage` fields (helpful discoverability)
+- `plugins` has `reload_runtime` + `target` + natural-language `message` (not useful for consumers)
+- Field sets overlap only on `action` and `kind`
+
+**Fix shape.** Canonicalize unknown-subcommand shape across all verbs:
+1. Unified error envelope (preferred, fixes #181 at same time)
+2. OR: Unified discovery envelope with `unexpected` + `usage` (`mcp`-style pattern)
+
+**Consumer impact:** Current state means **ambition of JSON output contract (parse-once, dispatch-all) is broken**. Phase 0 work on emission routing should address this but current output reveals it doesn't.
+
+**Family:** Shape parity + emission routing family. Directly relevant to 168c Phase 0 work.
+
+**Status:** FILED. Per freeze doctrine, no fix on 168c. Note: might be already partially addressed by Phase 0; re-verify after merge.
+
+**Pinpoint count:** 73 filed (+3 from #181, #182, #183), 59 genuinely open.
