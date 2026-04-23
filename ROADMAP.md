@@ -10500,3 +10500,71 @@ Branches in this order:
 4. Flag enum expansion as separate sub-task (requires schema bump + baseline test + regression lock)
 
 This prevents pinpoint fixes from cascading into unintended schema changes. Cycle #104 caught this pattern early thanks to gaebal-gajae review.
+
+## Cycle #104 Addendum 2 — Reviewer-Ready Framings (gaebal-gajae, 2026-04-23 10:38 Seoul)
+
+**Per gaebal-gajae cycle #104 final framing pass.** Compressed one-liners for reviewer consumption:
+
+### #181 Framing (HIGH — contract bug)
+
+> "`plugins` unknown-subcommand errors currently emit on the success path instead of the JSON error path."
+
+**Captures:**
+- Scope: `plugins` verb
+- Trigger: unknown-subcommand
+- Bug: success path emission vs. error path emission
+- Consumer impact: implicit (breaks `type == "error"` dispatch)
+
+### #183 Framing (HIGH — contract drift sibling)
+
+> "Invalid subcommand handling is not normalized across `plugins` and `mcp` JSON surfaces."
+
+**Captures:**
+- Scope: both verbs (plugins + mcp)
+- Trigger: invalid subcommand
+- Bug: different JSON shapes, no unified normalization
+- Relationship to #181: same family, different symptom
+
+### #182 Framing (MEDIUM — classifier cleanup)
+
+> "Plugin lifecycle failures still fall through to `unknown` instead of canonical error kinds."
+
+**Captures:**
+- Scope: plugin lifecycle (install, enable)
+- Bug: classifier falls through to `unknown`
+- Fix direction: canonical existing enum values, not new enum
+- Dependency on #22 doctrine (schema baseline check before enum proposal)
+
+### Reviewer-Order Summary
+
+All three framings go together as a **severity-ordered bundle**:
+
+| # | Level | Framing |
+|---|---|---|
+| **#181** | HIGH | `plugins` unknown-subcommand errors emit on success path, not error path |
+| **#183** | HIGH | Invalid subcommand handling not normalized across `plugins` and `mcp` |
+| **#182** | MEDIUM | Plugin lifecycle failures fall through to `unknown`, not canonical kinds |
+
+This ordering makes it clear that:
+1. #181 is the **root bug** (contract break)
+2. #183 is a **sibling symptom** of lack of unified handling
+3. #182 is **below-the-line cleanup** that follows from (1) + (2) landing
+
+### Branch Sequencing (locked)
+
+```
+feat/jobdori-181-error-envelope-contract-drift   (bundles #181 + #183)
+  ↓ post-merge
+feat/jobdori-182-plugin-classifier-alignment    (#182, alignment-first)
+```
+
+**Rationale:** Fixing #181/#183 first means the #182 classifier has a clean error-envelope shape to classify against. Reverse order would create work that's thrown away when #181 lands.
+
+### Final Status
+
+- **Pinpoints:** 73 filed, 59 genuinely open
+- **Framings:** all three locked via gaebal-gajae
+- **Prep:** branch names + sequencing + fix shapes all documented
+- **Doctrine:** schema baseline check (#22) formalized from #182 correction
+
+**This concludes cycle #104 filing + framing + prep. Branch now at 27 commits, 227/227 tests, ready for review + sequenced fix implementation.**
