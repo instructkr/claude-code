@@ -10568,3 +10568,112 @@ feat/jobdori-182-plugin-classifier-alignment    (#182, alignment-first)
 - **Doctrine:** schema baseline check (#22) formalized from #182 correction
 
 **This concludes cycle #104 filing + framing + prep. Branch now at 27 commits, 227/227 tests, ready for review + sequenced fix implementation.**
+
+## Pinpoint #184. `claw init` silently accepts unknown positional arguments — FILED (cycle #105, 2026-04-23 11:03 Seoul)
+
+**Gap.** `claw init` accepts any number of arbitrary positional arguments without error:
+
+```bash
+claw --output-format json init total-garbage-12345 another-garbage-67890
+# → Executes successfully, emits init artifacts list. NO error about unexpected args.
+```
+
+**Comparison to working classifier patterns (#171):** Other verbs reject trailing arguments:
+```bash
+claw list-sessions extra-garbage  # → {"error": "unexpected extra arguments after `claw list-sessions`", "kind": "cli_parse", ...}
+```
+
+But `init` has no such guard.
+
+**Impact:**
+- User typos (e.g., `claw init .claw` intending `claw init` in `.claw` directory) silently succeed, hiding user intent
+- Script automation can't catch argument mistakes at parse time
+- Inconsistent with #171 CLI contract hygiene (no-arg verbs uniformly reject trailing arguments)
+
+**Fix shape:**
+```rust
+// In init verb handler, before execution:
+if !positional_args.is_empty() {
+    return error("unexpected extra arguments after `claw init`");
+}
+```
+
+Classifier already covers this via #171 pattern (`unexpected extra arguments after \`claw\`` → `cli_parse`).
+
+**Family:** CLI contract hygiene (#171 family). Would close another verb that should reject trailing args.
+
+**Status:** FILED. Per freeze doctrine, no fix on 168c.
+
+## Pinpoint #185. `claw bootstrap-plan` silently accepts unknown flags — FILED (cycle #105, 2026-04-23 11:03 Seoul)
+
+**Gap.** `claw bootstrap-plan` accepts arbitrary unknown flags without error:
+
+```bash
+claw --output-format json bootstrap-plan --total-garbage
+# → Executes successfully, emits phases list. NO error about unknown flag.
+```
+
+**Compare to well-behaved verbs (#170):**
+```bash
+claw prompt --bogus-flag   # → cli_parse error
+claw --bogus-flag status   # → cli_parse error
+```
+
+But `bootstrap-plan` has no such guard.
+
+**Impact:**
+- User can't trust flag behavior — typo silently ignored
+- Automation scripts can't detect flag drift (if a flag is renamed/removed in future)
+- Inconsistent with sibling verbs
+
+**Fix shape:** Standard clap-style flag validation. Reject unknown flags with `cli_parse` error.
+
+**Family:** CLI contract hygiene (#171 family).
+
+**Status:** FILED. Per freeze doctrine, no fix on 168c.
+
+## Pinpoint #186. `claw system-prompt --<unknown>` classified as `unknown` instead of `cli_parse` — FILED (cycle #105, 2026-04-23 11:03 Seoul)
+
+**Gap.** Classifier coverage hole for `system-prompt` unknown options:
+
+```bash
+claw --output-format json system-prompt --bogus-flag
+# → {"error": "unknown system-prompt option: --bogus-flag", "hint": null, "kind": "unknown", "type": "error"}
+```
+
+Error message is clear but classifier doesn't catch it, so:
+- `kind` falls through to `unknown` ❌ (should be `cli_parse`)
+- `hint` is null ❌ (should be "Run `claw system-prompt --help` for usage.")
+
+**Fix shape:**
+```rust
+} else if message.starts_with("unknown system-prompt option:") {
+    "cli_parse"
+}
+```
+
+Or broader pattern matching:
+```rust
+} else if message.contains("unknown") && message.contains("option:") {
+    "cli_parse"
+}
+```
+
+**Family:** Typed-error classifier family (now 15 members). Exact parallel to #169/#170 (unknown flag values/names).
+
+**Status:** FILED. Per freeze doctrine, no fix on 168c.
+
+## Cycle #105 Summary
+
+**Probe focus:** `claw agents`, `claw init`, `claw bootstrap-plan`, `claw system-prompt` (unaudited verbs per cycle #104 hypothesis).
+
+**Hypothesis validation:** Yes — unaudited verb surface had **3 pinpoints** in one probe (matches cycle #104 yield).
+
+**Pinpoint summary:**
+- #184: `init` accepts unknown positional args
+- #185: `bootstrap-plan` accepts unknown flags
+- #186: `system-prompt` classifier gap
+
+**Bonus observation (NOT filed):** `claw agents bogus-action` correctly emits `mcp`-style `{action: "help", unexpected: ..., usage: ...}` shape. This is the shape that #183 wants as canonical, NOT the `plugins`-style success envelope. **`agents` is the reference implementation** of the "unknown subcommand" pattern. The fix for #183 could canonicalize to the `agents`/`mcp` shape.
+
+**Pinpoint count:** 76 filed (+3 from #184-#186), 62 genuinely open.
