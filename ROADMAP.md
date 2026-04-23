@@ -10258,3 +10258,34 @@ That's 14 verbs not covered by USAGE.md's "quick-start" framing.
 **Status:** FILED. Per freeze doctrine, no doc changes on 168c. Proposed separate branch: `feat/jobdori-180-usage-verb-coverage`.
 
 **Pinpoint count:** 70 filed, 56 genuinely open.
+
+## Pinpoint #180 Framing Lock (cycle #103 addendum, 2026-04-23 10:27 Seoul)
+
+**Authoritative framing** (per gaebal-gajae cycle #103 framing pass):
+
+> "USAGE.md currently teaches entry modes, but not the actual standalone command surface exposed by `claw --help`."
+
+**Why this framing is stable:**
+- **Subject:** USAGE.md (the narrative)
+- **What it does:** teaches entry modes
+- **What it misses:** standalone command surface exposed by `claw --help`
+- **Implied assertion:** documentation narrative ≠ CLI surface ⇒ parity gap
+
+**Comparative wording options considered:**
+- ❌ "USAGE.md is incomplete" (vague, doesn't pinpoint why)
+- ❌ "USAGE.md misses 14 verbs" (numerical, brittle to future verbs)
+- ✅ "USAGE.md teaches entry modes, but not the actual standalone command surface" (captures narrative choice + reality divergence)
+
+**Proposed branch name:** `feat/jobdori-180-usage-standalone-surface`
+
+This naming follows `feat/jobdori-<number>-<brief>` convention and surfaces the exact fix scope in the branch name.
+
+**Next-branch prep (after 168c merge):**
+1. Create `feat/jobdori-180-usage-standalone-surface` from main
+2. Add `## Standalone Commands` section to USAGE.md with all `--help`-exposed verbs
+3. For each verb: one-line description + one-line example
+4. Special disambiguation: `/doctor` vs `claw doctor`, `/status` vs `claw status` (REPL slash vs. standalone)
+5. Add regression test: audit script that greps USAGE.md coverage against `--help` output
+6. Single-commit PR, easy review
+
+**Family alignment:** Part of doc-truthfulness family (#76, #79, #82, #172, #180). Different from SCHEMAS.md gaps (#172 = inventory drift, #180 = narrative/surface divergence).
