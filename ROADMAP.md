@@ -10914,3 +10914,99 @@ Rationale: Minimizes contract-shape changes per cycle. Each consumer update cycl
 **Pinpoint count:** 77 filed (+1 from #187), 63 genuinely open.
 
 **Branch:** `feat/jobdori-168c-emission-routing` @ 32 commits (unchanged, freeze held).
+
+## Cycle #106 Addendum — #187 Framing Lock + Bundle Refinement (gaebal-gajae, 2026-04-23 11:24 Seoul)
+
+**Per gaebal-gajae cycle #106 validation pass.** Two refinements:
+
+### Refinement 1: #187 Authoritative Framing
+
+> "`export` unknown-option errors still fall through to `unknown`, unlike the already-canonical `sandbox` CLI-parse path."
+
+**Why this framing is surgical:**
+- Names the broken surface (`export`)
+- Names the working reference (`sandbox`)
+- Names the specific classifier drift (unknown → cli_parse)
+- Reviewer reads this and immediately understands: "port `sandbox` pattern to `export` handler"
+
+**Comparison to #186 framing** (cycle #105 gaebal-gajae pass):
+> "`system-prompt` unknown-option errors still fall through to `unknown` instead of the existing CLI-parse classification path."
+
+**Same surgical pattern:** verb + drift + reference path. Cross-pollinate these framings to make the family visible at-a-glance.
+
+### Refinement 2: #186 + #187 Bundle Into One Classifier Sweep
+
+**Per gaebal-gajae:** "#187은 단독 이슈라기보다 #186의 sibling으로 묶는 게 맞습니다."
+
+**Before (cycle #105 + #106 proposed):**
+- `feat/jobdori-186-system-prompt-classifier` (standalone)
+- `feat/jobdori-187-export-classifier` (standalone)
+
+**After (gaebal-gajae bundle refinement):**
+- `feat/jobdori-186-187-classifier-sweep` (bundled, both verbs in one PR)
+
+**Bundle rationale:**
+1. **Identical fix pattern.** Both add same classifier branch (different message match):
+   ```rust
+   // For #186
+   } else if message.starts_with("unknown system-prompt option:") {
+       "cli_parse"
+   }
+   // For #187
+   } else if message.starts_with("unknown export option:") {
+       "cli_parse"
+   }
+   ```
+2. **Identical test pattern.** Both assert `kind: "cli_parse"` + hint present.
+3. **Same review burden.** One reviewer cycle, two fixes.
+4. **Same merge risk profile.** Classifier branch additions are minimal-risk.
+
+**Cost of separation (rejected):** Two PRs, two review cycles, two merge events = 2x overhead for effectively-identical work.
+
+### Updated Merge Priority Queue (post-refinement)
+
+**Per gaebal-gajae cycle #106 ordering confirmation:**
+
+| Priority | Bundle | Scope | Severity |
+|---|---|---|---|
+| 1 | `feat/jobdori-181-error-envelope-contract-drift` | #181 + #183 | HIGH |
+| 2 | `feat/jobdori-184-cli-contract-hygiene-sweep` | #184 + #185 | MEDIUM |
+| 3 | `feat/jobdori-186-187-classifier-sweep` | #186 + #187 | MEDIUM |
+| 4+ | (independent) | #182, #177/#178/#179, #180, #173, #174, #175 | MEDIUM–LOW |
+
+**Key observation:** Every "Priority 1–3" bundle pair has now received gaebal-gajae's explicit validation. The queue is reviewer-blessed end-to-end.
+
+### Doctrine Observation (#27)
+
+**"Same-pattern pinpoints should bundle into one classifier sweep PR."** When two or more pinpoints:
+1. Share the same classifier pattern (e.g. "unknown X option: → cli_parse")
+2. Touch the same source file(s)
+3. Add similar test cases
+
+...they belong in the same PR. Rationale: halves review/merge overhead while preserving independent tracking in ROADMAP.md.
+
+**Anti-pattern (rejected):** "One pinpoint = one branch = one PR" is not universal. Batching same-pattern fixes is often correct.
+
+### Updated Pinpoint Family Tree (final post-cycle #106)
+
+```
+77 filed, 63 genuinely-open
+
+├── Typed-error classifier (16)
+│   ├── CLI parse leaves (10): #121, #127, #129-#130, #164, #169-#171, #174, #247
+│   ├── CLI contract hygiene sub-lineage (#171 lineage):
+│   │   ├── #171 (closed, cycle #97)
+│   │   ├── #184 (filed, cycle #105)
+│   │   └── #185 (filed, cycle #105)
+│   └── Unknown-option sub-lineage (#169/#170 lineage):
+│       ├── #186 (filed, cycle #105)
+│       └── #187 (filed, cycle #106) ← BUNDLED with #186
+│
+├── Error envelope contract drift (2): #181, #183
+│   └── Reference implementation: `agents` (locked, cycle #105)
+│
+├── Doc-truthfulness (5): #76, #79, #82, #172, #180
+├── Install-surface taxonomy (3): #177, #178, #179
+├── CI/workflow (1): #175
+└── Consumer-parity (1): #173
+```
