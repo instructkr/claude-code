@@ -9960,3 +9960,74 @@ Then run:
 **Status:** FILED only, not fixed. Current branch `feat/jobdori-168c-emission-routing` is under freeze (cycles #98-#99 doctrine: 5 axes complete, review-ready, no axis #6). Fix will land on a separate branch post-review.
 
 **Discovery cycle:** #100 (non-classifier axis pivot continues — event/log opacity probe surfaced a structured-output parity gap).
+
+## Pinpoint #174. `--resume trailing arguments must be slash commands` classifier gap — FILED (cycle #101, 2026-04-23 09:32 Seoul)
+
+**Gap.** When user invokes `claw --resume <session-id> <non-slash-command-arg>`, parser rejects the trailing positional with:
+
+```
+error: --resume trailing arguments must be slash commands
+```
+
+But the JSON envelope classifies this as:
+
+```json
+{
+  "error": "--resume trailing arguments must be slash commands",
+  "hint": null,
+  "kind": "unknown",
+  "type": "error"
+}
+```
+
+**Two problems (same pattern as #169/#170/#171):**
+
+1. `kind: "unknown"` — this is clearly a CLI parse error (user violated flag contract), should be `cli_parse`
+2. `hint: null` — #247 hint synthesizer only triggers for `cli_parse`, so misclassification also loses the hint
+
+**Reproduction:**
+```bash
+claw --output-format json --resume nonexistent-session-id-xyz prompt "test"
+claw --output-format json --resume "../etc/passwd" prompt "test"
+```
+
+Both return the same `--resume trailing arguments must be slash commands` error with `kind: "unknown"`.
+
+**Expected:**
+```json
+{
+  "error": "--resume trailing arguments must be slash commands",
+  "hint": "Run `claw --help` for usage.",
+  "kind": "cli_parse",
+  "type": "error"
+}
+```
+
+**Fix shape.** Add classifier branch to `classify_error_kind`:
+```rust
+} else if message.contains("--resume trailing arguments must be slash commands") {
+    "cli_parse"
+}
+```
+
+Alternatively, broader pattern matching on `--resume trailing arguments`:
+```rust
+} else if message.contains("--resume trailing arguments") {
+    "cli_parse"
+}
+```
+
+**Family:** Typed-error classifier family. Related: #121, #127, #129, #130, #164, #169, #170, #171, #247.
+
+**Verified working paths (for comparison):**
+- `claw --resume <id> /help` — works (help handler dispatches)
+- `claw --resume nonexistent-id /help` — `kind: "session_not_found"` with useful hint including partition path
+- `claw --resume <id> prompt "..."` — emits `kind: "unknown"` ← GAP
+
+**Discovery:** Cycle #101 probe of session-boot axis (prompt misdelivery / resume lifecycle). Probe found one classifier gap on the error surface.
+
+**Proposed branch:** `feat/jobdori-174-resume-trailing-classifier` (separate from `feat/jobdori-168c-emission-routing` per freeze doctrine — file-only on current branch).
+
+**Status:** FILED only, not fixed. Per freeze doctrine (cycles #98-#100), no new code axis added to `feat/jobdori-168c-emission-routing`. Fix to land on separate branch.
+
+**Pinpoint count:** 66 filed, 52 genuinely-open + #174 new.
