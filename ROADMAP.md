@@ -10677,3 +10677,109 @@ Or broader pattern matching:
 **Bonus observation (NOT filed):** `claw agents bogus-action` correctly emits `mcp`-style `{action: "help", unexpected: ..., usage: ...}` shape. This is the shape that #183 wants as canonical, NOT the `plugins`-style success envelope. **`agents` is the reference implementation** of the "unknown subcommand" pattern. The fix for #183 could canonicalize to the `agents`/`mcp` shape.
 
 **Pinpoint count:** 76 filed (+3 from #184-#186), 62 genuinely open.
+
+## Cycle #105 Addendum — Lineage Corrections + Reference Implementation Lock (gaebal-gajae review, 2026-04-23 11:06 Seoul)
+
+**Per gaebal-gajae cycle #105 review pass.** Three lineage/framing corrections:
+
+### Correction 1: #184 + #185 belong to #171 lineage (NOT new family)
+
+**My original error:** Created "CLI contract hygiene" as a "NEW family" in the tree diagram.
+
+**Correction per gaebal-gajae:** #184/#185 are **same enforcement hole** pattern as #171, just on unaudited verbs. Filing as a sibling of #171 means reviewer reads them as "same lineage, expanding coverage" — NOT "new one-off family each cycle".
+
+**Framing (reviewer-ready):**
+- **#184:** "`init` should reject trailing positional arguments instead of silently proceeding."
+- **#185:** "`bootstrap-plan` should reject unknown flags instead of silently proceeding."
+
+**Family tree correction:**
+```
+# BEFORE (wrong):
+├── CLI contract hygiene (NEW: 2): #184, #185
+
+# AFTER (correct):
+├── Typed-error classifier (15) — contains #171 lineage
+│   └── CLI contract hygiene (sub-family of #171):
+│       ├── #171: extra arguments after `claw` (closed, cycle #97)
+│       ├── #184: init silent accept (filed, cycle #105)
+│       └── #185: bootstrap-plan silent accept (filed, cycle #105)
+```
+
+**Doctrine implication:** Pinpoint families don't split — they extend. New pinpoints join existing lineages when the enforcement pattern matches. New families only when pattern is genuinely novel.
+
+### Correction 2: #186 Framing Lock
+
+Per gaebal-gajae: **"`system-prompt` unknown-option errors still fall through to `unknown` instead of the existing CLI-parse classification path."**
+
+**Why this framing is correct:**
+- Surface: `system-prompt` verb
+- Error mode: unknown-option
+- Bug: falls through to `unknown` classifier
+- Fix direction: existing CLI-parse classification path (no new enum)
+
+**Family:** Classifier family sub-lineage `#169/#170` (unknown flag values/names). #186 is a direct sibling of these, same classifier coverage hole pattern on a different verb.
+
+**Proposed branch name:** `feat/jobdori-186-system-prompt-classifier` (single-verb classifier addition, small scope).
+
+### Correction 3: `agents` as #183 alignment reference (locked)
+
+**Per gaebal-gajae:** The reference implementation discovery reframes #183 family:
+- **Before:** "invalid subcommand handling is not normalized across `plugins` and `mcp` JSON surfaces" (implies both are broken)
+- **After:** "`agents` is the reference, `plugins` and `mcp` should align to it"
+
+**Canonical reference shape (locked):**
+```json
+{
+  "action": "help",
+  "kind": "<verb>",
+  "unexpected": "<bad-name>",
+  "usage": {
+    "direct_cli": "...",
+    "slash_command": "...",
+    "sources": [...]
+  }
+}
+```
+
+**Fix path for #181 + #183 bundle:**
+1. Audit every verb's unknown-subcommand handler
+2. Identify outliers (`plugins` confirmed outlier; `mcp` has `usage` but missing some fields? re-verify)
+3. Port outliers to the `agents` reference
+4. Add regression test that asserts shape parity across all subcommand-having verbs
+
+**This reframes `feat/jobdori-181-error-envelope-contract-drift` scope** from "design new contract" to "align to existing reference" — much smaller, lower-risk scope.
+
+### Updated Pinpoint Family Tree
+
+```
+76 filed, 62 genuinely-open
+
+├── Typed-error classifier (15)
+│   ├── CLI parse leaves (10): #121, #127, #129-#130, #164, #169-#171, #174, #247
+│   ├── CLI contract hygiene sub-lineage (#171 lineage):
+│   │   ├── #171 (closed, cycle #97)
+│   │   ├── #184 (filed, cycle #105)
+│   │   └── #185 (filed, cycle #105)
+│   └── Unknown-option sub-lineage (#169/#170 lineage):
+│       └── #186 (filed, cycle #105)
+│
+├── Error envelope contract drift (2): #181, #183
+│   └── Reference implementation: `agents` (locked, cycle #105)
+│
+├── Doc-truthfulness (5): #76, #79, #82, #172, #180
+├── Install-surface taxonomy (3): #177, #178, #179
+├── CI/workflow (1): #175
+└── Consumer-parity (1): #173
+```
+
+### Doctrine Update (#24)
+
+**"Pinpoint lineage continuity"** — When filing a new pinpoint, check if existing family/lineage applies before creating a "new family." Reviewers follow pattern lineages; splitting them fragments the enforcement narrative.
+
+Pattern-match heuristic:
+1. What's the **enforcement rule** being violated? (CLI reject unknown flags? Classifier cover pattern X?)
+2. Is there an **existing pinpoint** with the same enforcement rule?
+3. If yes → sibling in that lineage
+4. If no → new family warranted
+
+This was corrected from "CLI contract hygiene (NEW: 2)" back to "#171 lineage (3 members now)".
