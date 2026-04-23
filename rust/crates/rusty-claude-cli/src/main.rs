@@ -4290,6 +4290,85 @@ impl LiveCli {
                     TerminalRenderer::new().color_theme(),
                     &mut stdout,
                 )?;
+                
+                // ============================================================================
+                // Auto-compact retry on context window errors
+                // ============================================================================
+                // When the model API returns a context_window_blocked error (because the request
+                // exceeds the model's context window), we automatically:
+                // 1. Compact the session (remove old messages to free up space)
+                // 2. Retry the original request with the compacted session
+                // 3. Report results to the user
+                //
+                // This eliminates the need for users to manually run /compact when they
+                // hit context limits - the recovery happens automatically.
+                //
+                // Detection: We look for "context_window" or "Context window" in the error
+                // message, which covers error types like:
+                // - "context_window_blocked"
+                // - "Context window blocked"
+                // - "This model's maximum context length is X tokens..."
+                // ============================================================================
+                
+                let error_str = error.to_string();
+                let is_context_window = error_str.contains("context_window") || error_str.contains("Context window");
+                
+                if is_context_window {
+                    println!("  Auto-compacting session and retrying...");
+                    
+                    // Step 1: Compact the session to free up context space
+                    // We set max_estimated_tokens to 0 to compact as aggressively as needed
+                    let result = runtime::compact_session(
+                        runtime.session(),
+                        CompactionConfig {
+                            max_estimated_tokens: 0,
+                            ..CompactionConfig::default()
+                        },
+                    );
+                    let removed = result.removed_message_count;
+                    
+                    // Only proceed if compaction actually happened (messages were removed)
+                    // or there's still a session to work with
+                    if removed > 0 || result.compacted_session.messages.len() > 0 {
+                        if removed > 0 {
+                            // Report compaction results to user
+                            println!("{}", format_compact_report(removed, result.compacted_session.messages.len(), false));
+                        }
+                        
+                        // Step 2: Build a new runtime with the compacted session and retry
+                        let (mut new_runtime, hook_abort_monitor) = self.prepare_turn_runtime(true)?;
+                        drop(hook_abort_monitor); // not needed for retry
+                        
+                        // Step 3: Run the turn again with the smaller session
+                        let mut rp = CliPermissionPrompter::new(self.permission_mode);
+                        match new_runtime.run_turn(input, Some(&mut rp)) {
+                            Ok(summary) => {
+                                // Success! Replace old runtime with the new compacted one
+                                self.replace_runtime(new_runtime)?;
+                                spinner.finish(
+                                    "✨ Done (after auto-compact)",
+                                    TerminalRenderer::new().color_theme(),
+                                    &mut stdout,
+                                )?;
+                                println!();
+                                // If additional auto-compaction happened during retry,
+                                // report that too
+                                if let Some(event) = summary.auto_compaction {
+                                    println!("{}", format_auto_compaction_notice(event.removed_message_count));
+                                }
+                                // Save the compacted session to disk
+                                self.persist_session()?;
+                                return Ok(());
+                            }
+                            // If retry also fails, propagate the new error
+                            Err(retry_error) => {
+                                return Err(Box::new(retry_error));
+                            }
+                        }
+                    }
+                }
+                
+                // If not a context window error, return original error
                 Err(Box::new(error))
             }
         }
