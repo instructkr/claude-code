@@ -11483,3 +11483,111 @@ Once closure is declared (discovery → merge-wait), the mode label acts as an o
 **Current state: MERGE-WAIT MODE.** Awaiting signal.
 
 🪨
+
+---
+
+## Cycle #115 Validation + Doctrine #31 Formalized (gaebal-gajae, 2026-04-23 12:33 Seoul)
+
+### Authoritative Reframe (per gaebal-gajae)
+
+> **"Cycle #115 was not an exception to merge-wait mode; it was the first turn where merge-wait mode actually did what merge-wait mode is supposed to do."**
+
+### Reviewer-Ready Compression
+
+> **"The branch was frozen but not yet reviewable because it had never been pushed; this cycle converted merge-wait from a declared state into a remotely visible one."**
+
+### Mode Semantic Correction
+
+**Wrong understanding of merge-wait:**
+- "Do nothing"
+- "Pure deflection"
+- "Status-repeat until signal"
+
+**Correct understanding of merge-wait (per gaebal-gajae):**
+- Block discovery mode triggers (probes, new pinpoints, new branches)
+- **Enable merge-readiness actions** (push to origin, PR prep, review facilitation)
+- Detect and fix readiness gaps (like cycle #115 did)
+
+### Doctrine #31 (Formalized)
+
+**"Merge-wait mode requires remote visibility."**
+
+**Protocol:**
+When declaring a branch merge-ready or review-ready, verify:
+```bash
+git ls-remote origin <branch>
+# Must return a commit hash, not empty
+```
+
+**If empty:**
+1. Push branch to origin (`git push origin <branch>`)
+2. Update cycle report to reference GitHub URL
+3. PR creation is now possible
+
+**Rationale:**
+Review requires visibility. Claiming "ready for merge" on a local-only branch is **semi-false readiness**. Reviewers need access to:
+- Commit diffs
+- CI run results
+- PR diff UI
+- Comment/review interface
+
+None of these exist on an unpushed branch. Therefore merge-wait mode must actively enforce origin visibility, not just passively declare it.
+
+### Self-Process Pinpoint #193 (Formalized)
+
+**Filed:** 2026-04-23 12:31 Seoul
+
+**Title:** "Dogfood process hygiene gap — declared review-ready claims lacked remote visibility check"
+
+**Description:**
+Cycles #109-#114 (40+ minutes of "merge-wait" claims) referenced a branch that had never been pushed to origin. The branch was local-only throughout all "review-ready" declarations. This is a process hygiene gap, not a claw-code bug.
+
+**Applies to:**
+- Dogfood methodology only (not claw-code binary)
+- Future cycles should pattern-match against this hygiene check
+
+**Remediation:**
+- Cycle #115: branch pushed (commit 3bbaefc, pushed by Jobdori 12:31)
+- Cycle #115: Doctrine #31 proposed + now formalized
+- Future cycles: apply Doctrine #31 pre-check before "review-ready" claims
+
+### Gate Sequence (Next Steps)
+
+Per gaebal-gajae:
+> **"이제 진짜 다음 게이트는: PR 생성, 리뷰, 머지 신호입니다."**
+
+**Sequential gates:**
+1. ✅ **Branch on origin** (cycle #115)
+2. ⏳ **PR creation** (next concrete action)
+3. ⏳ **Review cycle** (reviewer sign-off)
+4. ⏳ **Merge signal** (author approval)
+5. ⏳ **Phase 1 Bundle 1 kickoff** (#181 + #183 branch creation)
+
+### Doctrine Count (Post #31)
+
+**31 doctrines total** in Phase 0 + dogfood cycles.
+
+Phase 0 + dogfood journey:
+- Cycles #97-#109: Discovery mode (probes, filings, refinements)
+- Cycles #109-#110: Closure + mode designation (doctrines #29, #30)
+- Cycles #111-#114: Mode guard validation (pure deflection, 4 Clawhip nudges)
+- **Cycle #115: First real merge-readiness action (Doctrine #31)**
+
+### State Update (Post-Sync)
+
+```
+Mode:            MERGE-WAIT (both claws synced)
+Branch:          feat/jobdori-168c-emission-routing @ 3bbaefc
+Origin:          PUSHED (visible)
+URL:             https://github.com/ultraworkers/claw-code/tree/feat/jobdori-168c-emission-routing
+PR target:       https://github.com/ultraworkers/claw-code/pull/new/feat/jobdori-168c-emission-routing
+Tests:           564 pass
+Next gate:       PR creation
+Doctrines:       31 accumulated
+```
+
+---
+
+**Mode-wait is now semantically correct AND remotely visible. Ready for PR creation as next gate.**
+
+🪨
