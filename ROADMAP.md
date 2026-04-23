@@ -10409,3 +10409,94 @@ Both should be `kind: "session_not_found"` or new `kind: "plugin_not_found"` —
 **Status:** FILED. Per freeze doctrine, no fix on 168c. Note: might be already partially addressed by Phase 0; re-verify after merge.
 
 **Pinpoint count:** 73 filed (+3 from #181, #182, #183), 59 genuinely open.
+
+## Pinpoint #181 Framing Lock + #182 Scope Correction (cycle #104 addendum, 2026-04-23 10:37 Seoul)
+
+**Per gaebal-gajae cycle #104 framing + severity pass.**
+
+### #181 Authoritative Framing
+
+> "`plugins` unknown-subcommand errors are emitted through the success envelope instead of the JSON error envelope."
+
+**Why this is surgical:**
+- Names the specific verb (`plugins`)
+- Names the specific failure mode (unknown-subcommand)
+- Names the specific emission path error (success envelope vs. JSON error envelope)
+- No ambiguity about fix target
+
+**Proposed branch:** `feat/jobdori-181-plugins-unknown-subcommand-error-envelope`
+
+### #181 + #183 Family Consolidation
+
+Per gaebal-gajae framing: **"error envelope contract drift"** family.
+
+| Pinpoint | Sub-symptom |
+|---|---|
+| #181 | `plugins bogus` → success envelope with error text in `message` |
+| #183 | `mcp bogus` → alternate ad-hoc `usage`/`unexpected` shape |
+
+Both share root cause: **invalid subcommand handling is not normalized onto one JSON error contract.** Fix shape unifies both:
+1. Canonical error envelope for all unknown-subcommand paths
+2. Both `plugins` and `mcp` (and any other verb) route through same error emission helper
+
+**Proposed branch:** `feat/jobdori-181-error-envelope-contract-drift` (covers #181 + #183 bundled).
+
+### #182 Scope Correction (IMPORTANT)
+
+**Original filing error:** I proposed new kind `plugin_not_found` without verifying whether it exists in declared enum. Per gaebal-gajae: "새 enum 제안보다 현행 계약 정렬이 먼저".
+
+**Verified against SCHEMAS.md current enum:**
+- v2.0 io-error kinds: `filesystem, auth, session, parse, runtime, mcp, delivery, usage, policy, unknown`
+- v2.0 discovery errors: `command_not_found, tool_not_found, session_not_found`
+- `plugin_not_found` **does not exist** in any current enum
+
+**Corrected fix mapping:**
+
+| Probe | Original (wrong) | Corrected (existing contract) |
+|---|---|---|
+| `plugins install /nonexistent` | `plugin_not_found` | **`filesystem`** (path doesn't exist) |
+| `plugins enable nonexistent` | `plugin_not_found` | **Design decision needed** — candidates: `runtime` (plugin resolution failure), `mcp` (if plugin routing mirrors mcp), or expand enum with `plugin_not_found` in a separate SCHEMAS update |
+
+**Doctrine: existing contract alignment > new enum proposal.** This preserves contract stability for consumers and only expands enum when a real new semantic appears.
+
+**Updated fix shape for #182:**
+```rust
+// plugins install → use filesystem for path-not-found
+} else if message.contains("plugin source") && message.contains("was not found") {
+    "filesystem"
+}
+// plugins enable → design decision pending, safest is 'runtime'
+} else if message.contains("is not installed or discoverable") {
+    "runtime"  // resolution/discovery failure
+}
+```
+
+**Proposed branch:** `feat/jobdori-182-plugin-classifier-alignment` — smaller scope, alignment-first.
+
+### Severity-Ordered Merge Plan
+
+Per gaebal-gajae:
+1. **#181** (HIGH) — success-shaped error envelope (contract bug)
+2. **#183** (HIGH) — invalid subcommand JSON shape divergence (contract drift)
+3. **#182** (MEDIUM) — plugin lifecycle classifier holes (alignment work)
+
+Branches in this order:
+- `feat/jobdori-181-error-envelope-contract-drift` (bundles #181 + #183)
+- `feat/jobdori-182-plugin-classifier-alignment` (alignment-first, existing enums)
+
+### Pinpoint Accounting (post-correction)
+
+- **Filed total:** 73 (unchanged — same pinpoints, corrected fix shapes)
+- **Genuinely open:** 59
+- **Typed-error family:** 14 members (#182 still counted, scope clarified)
+- **Error envelope contract drift family:** 2 members (#181, #183)
+
+### Doctrine Lesson
+
+**Enum proposal requires schema baseline check first.** When filing classifier pinpoints, always:
+1. Read SCHEMAS.md current enum
+2. Propose fix using existing values if possible
+3. Only propose enum expansion if **all existing values are semantically wrong**
+4. Flag enum expansion as separate sub-task (requires schema bump + baseline test + regression lock)
+
+This prevents pinpoint fixes from cascading into unintended schema changes. Cycle #104 caught this pattern early thanks to gaebal-gajae review.
