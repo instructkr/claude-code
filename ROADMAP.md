@@ -10031,3 +10031,33 @@ Alternatively, broader pattern matching on `--resume trailing arguments`:
 **Status:** FILED only, not fixed. Per freeze doctrine (cycles #98-#100), no new code axis added to `feat/jobdori-168c-emission-routing`. Fix to land on separate branch.
 
 **Pinpoint count:** 66 filed, 52 genuinely-open + #174 new.
+
+## Pinpoint #174 Framing Lock (cycle #101 addendum, 2026-04-23 09:34 Seoul)
+
+**Authoritative framing** (per gaebal-gajae cycle #101 framing pass):
+
+> "`--resume` trailing-argument parse failures should classify as `cli_parse` so synthesized usage hints survive in JSON output."
+
+**Why this framing is stable:**
+- **Scope:** `--resume` trailing-argument (specific surface)
+- **Root cause:** parse failures not classified as `cli_parse`
+- **Visible effect:** synthesized usage hints don't survive
+- **Surface:** JSON output (`--output-format json`)
+
+**Proposed branch name:** `feat/jobdori-174-resume-trailing-cli-parse`
+
+This naming follows the established `feat/jobdori-<number>-<brief>` convention and surfaces the fix scope in the branch name itself (no need to read ROADMAP to understand what merges).
+
+**Next-branch prep (after 168c merge):**
+1. Create `feat/jobdori-174-resume-trailing-cli-parse` from main
+2. Add classifier branch:
+   ```rust
+   } else if message.contains("--resume trailing arguments") {
+       "cli_parse"
+   }
+   ```
+3. Add regression test `classify_error_kind_covers_resume_trailing_args_174`
+4. Update SCHEMAS.md v1.5 baseline if test coverage expands
+5. Single-commit PR, easy review
+
+**Family alignment:** Part of typed-error classifier family (#121, #127, #129, #130, #164, #169, #170, #171, #174, #247). Future sweep might batch all remaining `unknown` classifications into a single pass.
