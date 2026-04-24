@@ -12187,3 +12187,35 @@ cat ~/.claw/settings.json
 **Status:** Open. No code changed. Merge-wait mode.
 
 🪨
+
+---
+
+## Pinpoint #198 — MCP approval-prompt opacity: no `blocked.mcp_approval` state, pane-scrape required to detect approval-blocked sessions (gaebal-gajae, cycle #135 / Jobdori cross-filed cycle #248)
+
+**Observed:** `clawcode-human` session alive but blocked on `omx_memory.project_memory_read(...)` TUI approval prompt (`Allow / Allow for this session / Always allow / Cancel`). From outside (clawhip, downstream monitors), the session emits no typed blocked state — it appears identical to ordinary idle/live work. Operator cannot distinguish "waiting for human MCP approval" from "working quietly" without pane scraping.
+
+**Gap:** `lane.blocked` taxonomy (ROADMAP item around `blocked.mcp_handshake`, `blocked.trust_gate` etc.) does not include `blocked.mcp_approval` — the state where the runtime is paused at an interactive permission prompt awaiting operator decision. This means:
+- Clawhip nudges can misread approval-blocked sessions as ordinary idle/live work
+- No structured event (`needs_operator_decision`) emitted on approval-prompt display
+- Recovery recipes cannot route "approve / deny / escalate" without pane scraping
+
+**Repro:**
+```
+# Start session with MCP tool requiring approval
+claw --session clawcode-human
+# Session reaches omx_memory.project_memory_read(...) approval prompt
+# From outside: session appears live/idle — no blocked.mcp_approval event emitted
+claw status --session clawcode-human  # → no approval-blocked indicator
+```
+
+**Expected:** Session status JSON includes `blocked.mcp_approval` when runtime is paused at approval prompt. Downstream monitors can act without pane scraping.
+
+**Fix sketch:**
+1. Emit `blocked.mcp_approval` event when TUI approval prompt is displayed
+2. Include in session status JSON: `state: blocked`, `blocked_reason: mcp_approval`, `pending_tool: "<tool_name>"`
+3. Add `claw approve` / `claw deny` CLI subcommand to resolve remotely without pane interaction
+4. Surface in `claw doctor` as active blocked session
+
+**Status:** Open. No code changed. Merge-wait mode. Filed from DOGFOOD_FINDINGS.md evidence (gaebal-gajae).
+
+🪨
