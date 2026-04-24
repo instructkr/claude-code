@@ -12125,3 +12125,65 @@ Pattern: #35 complements #33 — where #33 prevents repetitive narrative during 
 
 🪨
 
+
+---
+
+## Pinpoint #197 — `enabledPlugins` deprecation: no migration path, warning on every invocation (Jobdori, cycle #132)
+
+**Filed:** 2026-04-24 09:27 KST
+**Cluster:** config-hygiene / migration UX
+**Branch:** `feat/jobdori-197-config-migration-ux` (not yet created)
+
+### Observation
+
+`~/.claw/settings.json` contains `enabledPlugins` (deprecated field). On **every** claw invocation — including `/help`, `claw config`, and `claw doctor` — the runtime emits:
+
+```
+warning: /Users/yeongyu/.claw/settings.json: field "enabledPlugins" is deprecated (line 2). Use "plugins.enabled" instead
+```
+
+The warning fires twice on some invocations (`claw config` emits it twice: once for `--help` flag parse, once for subcommand dispatch). There is no `claw config migrate`, `claw doctor --fix`, or `claw config upgrade` command to auto-remediate. `claw doctor` does not report the stale field as a warning item in its structured output — it only surfaces auth and sandbox issues.
+
+### Repro
+
+```bash
+# Check current settings
+cat ~/.claw/settings.json
+# → {"enabledPlugins": {"example-bundled@bundled": false}}
+
+# Every invocation emits warning
+./rust/target/release/claw --help 2>&1 | grep "deprecated"
+# → warning: ...settings.json: field "enabledPlugins" is deprecated (line 2)...
+./rust/target/release/claw config 2>&1 | grep "deprecated"
+# → warning x2 (double-emit)
+
+# Doctor does NOT surface this
+./rust/target/release/claw doctor 2>&1 | grep -i "plugin\|deprecated"
+# → (no output in structured doctor body)
+```
+
+### Gap
+
+- Deprecated config field has no automated migration path
+- Warning emits on every invocation — noise pollution that claws learn to ignore (cry-wolf degradation)
+- `claw doctor` does not flag the stale field as a config warning; its structured `Config: ok` output gives false confidence
+- Double-emit on `claw config` suggests the deprecation check runs at flag-parse time AND at subcommand dispatch time independently
+- Correct field name (`plugins.enabled`) is only available in the warning string — not in `claw config` output or docs
+
+### Proposed Fix
+
+1. `claw doctor` to add config deprecation check: scan loaded settings files for known deprecated keys and surface them as `Config: warn` items
+2. Add `claw config migrate` (or `claw config fix`) subcommand that rewrites deprecated keys to current schema in-place
+3. Deduplicate deprecation warning to emit once per process lifecycle, not per parse phase
+4. Document migration path in `claw config` output when stale keys are present
+
+### Acceptance Criteria
+
+- `claw doctor` reports `Config: warn` with `deprecated key: enabledPlugins → plugins.enabled` when stale field is present
+- `claw config migrate` rewrites the file and confirms success
+- Deprecation warning emits at most once per invocation after dedup fix
+- `claw config` output references migration command when deprecated keys detected
+
+**Status:** Open. No code changed. Merge-wait mode.
+
+🪨
