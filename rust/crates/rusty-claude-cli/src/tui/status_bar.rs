@@ -1,6 +1,8 @@
 use std::io::Write;
 use std::time::Instant;
 
+use crate::tui::theme::Theme;
+
 /// Data needed to render the status bar.
 pub struct StatusBarState {
     pub model: String,
@@ -47,7 +49,14 @@ impl StatusBar {
         };
 
         // ANSI: save position, move to col 0, clear line, dark grey, print, reset, restore
-        write!(out, "\x1b7\x1b[0G\x1b[2K\x1b[90m{}\x1b[0m\x1b8", display)?;
+        write!(
+            out,
+            "\x1b7\x1b[0G\x1b[2K{}{}{}",
+            Theme::status_bar_fg(),
+            display,
+            Theme::RESET,
+        )?;
+        write!(out, "\x1b8")?;
         out.flush()
     }
 

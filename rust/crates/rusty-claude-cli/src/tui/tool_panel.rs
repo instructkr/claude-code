@@ -1,5 +1,7 @@
 use std::fmt::Write as _;
 
+use crate::tui::theme::Theme;
+
 /// Configuration for tool output truncation.
 pub struct ToolDisplayConfig {
     pub visible_lines: usize,

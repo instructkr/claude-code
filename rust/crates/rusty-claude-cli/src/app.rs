@@ -52,6 +52,8 @@ use crate::tui::permission::{
     format_enhanced_permission_prompt, parse_permission_response, PermissionDecision,
 };
 use crate::tui::status_bar::{StatusBar, StatusBarState};
+use crate::tui::terminal::TerminalSize;
+use crate::tui::timeline::ToolCallTimeline;
 use crate::{
     AllowedToolSet, RuntimePluginStateBuildOutput, DEFAULT_DATE,
     INTERNAL_PROGRESS_HEARTBEAT_INTERVAL, POST_TOOL_STALL_TIMEOUT,
@@ -2133,7 +2135,8 @@ impl AnthropicRuntimeClient {
         let mut cumulative_input_tokens: u64 = 0;
         let mut cumulative_output_tokens: u64 = 0;
         let turn_start = std::time::Instant::now();
-        let terminal_width = crossterm::terminal::size().map(|(w, _)| w).unwrap_or(80);
+        let terminal_size = TerminalSize::new();
+        let mut tool_timeline = ToolCallTimeline::new();
 
         loop {
             let next = if apply_stall_timeout && !received_any_event {
@@ -2219,6 +2222,7 @@ impl AnthropicRuntimeClient {
                         if let Some(progress_reporter) = &self.progress_reporter {
                             progress_reporter.mark_tool_phase(&name, &input);
                         }
+                        tool_timeline.start_tool(&name);
                         writeln!(out, "\n{}", format_tool_call_start(&name, &input))
                             .and_then(|()| out.flush())
                             .map_err(|error| RuntimeError::new(error.to_string()))?;
@@ -2247,7 +2251,7 @@ impl AnthropicRuntimeClient {
                         estimated_cost_usd: cost_str,
                         turn_start,
                         git_branch: None,
-                        terminal_width,
+                        terminal_width: terminal_size.width(),
                     };
                     let _ = StatusBar::render(&status_state, out);
                 }
@@ -2278,6 +2282,13 @@ impl AnthropicRuntimeClient {
             .iter()
             .any(|event| matches!(event, AssistantEvent::MessageStop))
         {
+            // Render tool timeline if any tools were called
+            if !tool_timeline.events().is_empty() {
+                let timeline_render = tool_timeline.render();
+                write!(out, "{timeline_render}")
+                    .and_then(|()| out.flush())
+                    .map_err(|error| RuntimeError::new(error.to_string()))?;
+            }
             return Ok(events);
         }
 

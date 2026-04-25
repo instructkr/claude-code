@@ -1,5 +1,7 @@
 use std::fmt::Write as _;
 
+use crate::tui::theme::Theme;
+
 /// A single line in a parsed unified diff.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum DiffLine {
