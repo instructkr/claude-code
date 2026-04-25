@@ -12597,3 +12597,122 @@ stop_reason: choice
 **Status:** Open. No code changed. Filed 2026-04-25 18:20 KST. Branch: feat/jobdori-168c-emission-routing. HEAD: dba4f28.
 
 🪨
+
+---
+
+## Pinpoint #207 — `OpenAiUsage` struct discards `prompt_tokens_details.cached_tokens` and `completion_tokens_details.reasoning_tokens`: cache hits and reasoning splits silently zero-fill `Usage`, breaking cost parity with the Anthropic provider path (Jobdori, cycle #358 / anomalyco/opencode #24233 sibling)
+
+**Observed:** In `rust/crates/api/src/providers/openai_compat.rs:710-714`, the `OpenAiUsage` deserialization struct only captures two fields:
+
+```rust
+#[derive(Debug, Deserialize)]
+struct OpenAiUsage {
+    #[serde(default)]
+    prompt_tokens: u32,
+    #[serde(default)]
+    completion_tokens: u32,
+}
+```
+
+The canonical OpenAI Chat Completions usage object (since Oct 2024) returns at minimum:
+
+```json
+{
+  "usage": {
+    "prompt_tokens": 2350,
+    "completion_tokens": 675,
+    "total_tokens": 3025,
+    "prompt_tokens_details": { "cached_tokens": 1920, "audio_tokens": 0 },
+    "completion_tokens_details": { "reasoning_tokens": 350, "audio_tokens": 0, "accepted_prediction_tokens": 0, "rejected_prediction_tokens": 0 }
+  }
+}
+```
+
+Neither nested object is deserialized. Both `prompt_tokens_details.cached_tokens` and `completion_tokens_details.reasoning_tokens` are dropped silently.
+
+Downstream, every site that lifts `OpenAiUsage` into the canonical `Usage` struct hardcodes the cache fields to zero. Four hits in this single file:
+
+1. `openai_compat.rs:475-480` (`MessageStart` synthetic event): `cache_creation_input_tokens: 0, cache_read_input_tokens: 0`
+2. `openai_compat.rs:487-492` (streaming `chunk.usage` ingestion): `cache_creation_input_tokens: 0, cache_read_input_tokens: 0`
+3. `openai_compat.rs:595-599` (stream-finish fallback `Usage`): `cache_creation_input_tokens: 0, cache_read_input_tokens: 0`
+4. `openai_compat.rs:1206-1217` (non-streaming `normalize_response`): `cache_creation_input_tokens: 0, cache_read_input_tokens: 0`
+
+**Gap:**
+
+1. **Cache hits invisible on OpenAI-compat path.** OpenAI's automatic prompt caching (≥1024-token prefix, GPT-4o+) returns `cached_tokens` in every response. The Anthropic provider correctly threads `cache_creation_input_tokens` and `cache_read_input_tokens` through `Usage` and the integration tests (`client_integration.rs:271-272, 416-417`) assert this. The OpenAI-compat provider zeros both fields unconditionally. A claw consuming `usage.cache_read_input_tokens` to detect cache effectiveness or surface cost savings sees zero on OpenAI-compat sessions even when OpenAI reports 90% cache hit rates.
+
+2. **Reasoning tokens still missing here even with #204 filed.** Pinpoint #204 calls out that `TokenUsage` lacks a `reasoning_tokens` field. #207 is the *upstream* gap: even if `TokenUsage` is extended, the OpenAI-compat deserializer cannot supply the value because `completion_tokens_details.reasoning_tokens` is not parsed at the provider boundary. #204 cannot ship without #207 plumbing the value through. They are a fix-pair, not duplicates.
+
+3. **Cost asymmetry between provider paths.** `Usage::total_input_tokens()` (`api/src/types.rs:184`) sums `input_tokens + cache_creation_input_tokens + cache_read_input_tokens`. On the Anthropic path this matches the provider's billed input. On the OpenAI-compat path the cache buckets are zero, so total_input_tokens == prompt_tokens, which double-counts cached tokens at full price in any cost-estimate consumer that prices cache reads differently from fresh input.
+
+4. **No structured event when a parsing-capable field is dropped.** `serde(default)` on the two captured fields means missing-or-malformed values default to 0, but the *unmapped* fields (`prompt_tokens_details`, `completion_tokens_details`) never enter the struct in the first place. There is no `unmapped_usage_field` event, no warning, no log line. A claw inspecting events cannot tell whether a session ran on an old API that didn't return `prompt_tokens_details`, on a new API where the field was present but discarded, or on a backend that doesn't support caching at all.
+
+5. **Test coverage absent.** Searching `rust/crates/api/src/providers/openai_compat.rs` test module and the integration tests for `cached_tokens` or `reasoning_tokens` returns zero hits. The existing `client_integration.rs` tests fixture cache values for the Anthropic path only. Even if the deserializer were fixed today, no test would catch a regression in the OpenAI-compat path.
+
+**Repro:**
+
+```rust
+// Hypothetical test against openai_compat::OpenAiUsage:
+let body = r#"{
+  "prompt_tokens": 2350,
+  "completion_tokens": 675,
+  "prompt_tokens_details": { "cached_tokens": 1920 },
+  "completion_tokens_details": { "reasoning_tokens": 350 }
+}"#;
+let usage: OpenAiUsage = serde_json::from_str(body).unwrap();
+assert_eq!(usage.prompt_tokens, 2350);   // ok
+assert_eq!(usage.completion_tokens, 675); // ok
+// no field exists for cached_tokens or reasoning_tokens — they are silently dropped
+
+// Live behavior:
+// Run a session against an OpenAI gpt-4o backend with a >1024-token reused system prompt.
+// Provider returns: prompt_tokens=2350, prompt_tokens_details.cached_tokens=1920
+// claw-code Usage records: input_tokens=2350, cache_read_input_tokens=0
+// Cost-estimate consumer prices all 2350 at full input rate; the 90% cache savings
+// (cached at 50% rate per OpenAI pricing) are lost.
+```
+
+**Verification check:**
+- `grep -n "prompt_tokens_details\|completion_tokens_details\|cached_tokens" rust/crates/api/src/providers/openai_compat.rs` returns zero hits
+- `grep -rn "cache_creation_input_tokens\|cache_read_input_tokens" rust/crates/api/` shows the Anthropic-path tests assert non-zero cache values; the OpenAI-compat path has no such fixtures
+- `grep -n "cache_creation_input_tokens: 0," rust/crates/api/src/providers/openai_compat.rs` returns 4 distinct call sites all hardcoded to 0
+
+**Expected:**
+
+- `OpenAiUsage` deserializes `prompt_tokens_details.cached_tokens` and `completion_tokens_details.reasoning_tokens` (both `Option<u32>` with serde default)
+- All four lift-to-`Usage` sites in `openai_compat.rs` populate `cache_read_input_tokens` from `cached_tokens` (mapping cache *hits*; OpenAI-compat does not separately surface cache *creation* events, so `cache_creation_input_tokens` may legitimately stay 0 with a comment marking the asymmetry)
+- A new `Usage.reasoning_tokens` field (or extension; aligns with #204) carries the reasoning split for downstream cost attribution
+- An `unmapped_usage_field` event fires when a future provider returns a usage subfield the deserializer does not recognize, instead of silently dropping it
+- Integration tests exercise: (a) OpenAI-compat response with cache hits, (b) OpenAI-compat response with reasoning tokens (o-series), (c) backward-compat OpenAI-compat response with neither nested object
+- `claw doctor --json` surfaces the cached-token ratio and reasoning-token share for active sessions on both provider paths
+
+**Fix sketch:**
+
+1. Extend `OpenAiUsage` with two `Option<NestedDetails>` fields and a `NestedDetails { cached_tokens: Option<u32>, reasoning_tokens: Option<u32>, ... }` struct. ~15 LOC.
+2. Update the four lift sites to thread `cached_tokens` into `cache_read_input_tokens` and (after #204/#207 land together) `reasoning_tokens` into the new `reasoning_tokens` slot. ~20 LOC.
+3. Add three regression tests under the `openai_compat` test module: cache-hit response, reasoning-token response, backward-compat no-details response. ~60 LOC test additions.
+4. Document the `cache_creation_input_tokens` asymmetry (Anthropic distinguishes create vs read, OpenAI-compat does not) in SCHEMAS.md so consumers cannot infer cache *write* events from this provider.
+5. Add classifier event `unmapped_usage_field { provider, field_name, raw_value }` for future-proofing.
+6. Pair with #204 in the impl PR — both describe the same cost-parity surface and ship cleanly together.
+
+**Why this matters for clawability:**
+
+- Principle #2 ("Truth is split across layers") — the same `Usage` shape carries different truth on Anthropic vs OpenAI-compat paths. A claw branching on `cache_read_input_tokens > 0` to detect cache effectiveness gets correct answers on Anthropic and silent zeros on OpenAI-compat with no way to distinguish "cache disabled" from "cache active but invisible."
+- Principle #5 ("Partial success is first-class") — cache hits are partial cost-recovery success states. The provider knows; claw-code drops the field; the operator never sees it.
+- Sibling of #201 (silent tool-arg parse fallback), #202 (silent tool-message drop), #203 (auto-compaction no SSE event), #204 (reasoning_tokens not surfaced), #206 (silent finish_reason pass-through) — all six are silent-fallback / silent-drop gaps at the provider boundary that the structured-event taxonomy was designed to close. #207 is the same pattern at the usage-deserialization layer.
+- #204 + #207 are an explicit fix-pair: #204 names the missing `TokenUsage` field, #207 names the missing deserialization that would supply it. Filing both is not redundant; collapsing them obscures whether a fix is a struct change, a parser change, or both.
+- Real-world impact: cost dashboards and `claw doctor` output for OpenAI-compat sessions are systematically wrong on cache-heavy workloads. With OpenAI reporting up to 80% latency reduction and 90% input cost reduction from prompt caching, this is not a rounding error — it is the *primary* cost signal for any system-prompt-heavy claw session.
+
+**Acceptance criteria:**
+
+- `OpenAiUsage` deserializes a real OpenAI response containing `prompt_tokens_details.cached_tokens` and `completion_tokens_details.reasoning_tokens` without dropping either field
+- All four `Usage` construction sites in `openai_compat.rs` populate `cache_read_input_tokens` from the parsed `cached_tokens` value
+- Regression test asserts: given a fixture response with `cached_tokens: 1920`, the resulting `MessageResponse.usage.cache_read_input_tokens == 1920`
+- Regression test asserts: given a fixture response with `reasoning_tokens: 350`, the resulting usage carries the reasoning split (field name follows the #204 resolution)
+- Backward-compat regression test asserts: given a response missing `prompt_tokens_details` entirely, `cache_read_input_tokens == 0` and no panic, no error event
+- An `unmapped_usage_field` event is emitted (or this behavior is explicitly deferred with a roadmap pointer) when a recognized-but-unmapped field is observed
+- SCHEMAS.md documents the Anthropic-vs-OpenAI-compat cache-bucket asymmetry so consumers do not infer cache *creation* from OpenAI-compat traffic
+
+**Status:** Open. No code changed. Filed 2026-04-25 18:35 KST. Branch: feat/jobdori-168c-emission-routing. HEAD: 0e9cff5. Sibling/fix-pair: #204 (TokenUsage struct extension). Parity reference: anomalyco/opencode #24233.
+
+🪨
