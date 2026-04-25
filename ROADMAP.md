@@ -12506,3 +12506,94 @@ claw doctor
 **Status:** Open. No code changed. Filed 2026-04-25 17:16 KST by Q *YeonGyu Kim, formalized to ROADMAP by Jobdori cycle #351. Branch: feat/jobdori-168c-emission-routing.
 
 🪨
+
+---
+
+## Pinpoint #206 — `normalize_finish_reason` covers 2 of 5 OpenAI finish reasons: `length`, `content_filter`, `function_call` pass through unmapped, breaking Anthropic-vocabulary parity that downstream consumers assume (Jobdori, cycle #357)
+
+**Observed:** In `rust/crates/api/src/providers/openai_compat.rs`, `normalize_finish_reason()` (line 1389) translates OpenAI-compat `finish_reason` strings into Anthropic-compatible `stop_reason` vocabulary. The mapping only handles two cases:
+
+```rust
+fn normalize_finish_reason(value: &str) -> String {
+    match value {
+        "stop" => "end_turn",
+        "tool_calls" => "tool_use",
+        other => other,
+    }
+    .to_string()
+}
+```
+
+The `other => other` arm passes any other value through unchanged. OpenAI's actual finish_reason enum includes at minimum five values: `stop`, `length`, `content_filter`, `tool_calls`, `function_call` (legacy). Three of those — `length`, `content_filter`, `function_call` — silently bypass normalization.
+
+**Gap:**
+
+1. **`length` is not mapped to `max_tokens`.** When the model hits the max_tokens cap, OpenAI returns `finish_reason: "length"`. Anthropic returns `stop_reason: "max_tokens"`. claw-code surfaces a raw `"length"` to downstream consumers expecting Anthropic vocabulary. Any orchestrator branching on `stop_reason == "max_tokens"` to detect output truncation will silently miss the OpenAI-compat path.
+
+2. **`content_filter` is not mapped to `refusal` or a typed safety state.** When OpenAI's content filter blocks output (`finish_reason: "content_filter"`), claw-code surfaces a raw `"content_filter"` instead of routing it through a refusal/safety taxonomy. Anthropic uses `stop_reason: "refusal"` for the equivalent state. Downstream code that watches for refusal/safety stops cannot detect the OpenAI safety stop without a separate code path. Worse: no event is emitted indicating the model was blocked — the message just ends with an unfamiliar `stop_reason` value.
+
+3. **`function_call` (legacy single-tool format) is not mapped to `tool_use`.** Some OpenAI-compat backends still emit `finish_reason: "function_call"` instead of `tool_calls`. claw-code passes this through unchanged, but most consumers branch on `stop_reason == "tool_use"` (the Anthropic vocabulary) which never matches the legacy form. Tool-use detection silently fails on those backends.
+
+4. **No structured event for unmapped values.** The pass-through path emits no log, no warning, no `unknown_finish_reason` event. A claw cannot tell from the JSON output alone whether a `stop_reason` value came from a recognized mapping or fell through unchanged. This compounds with #201/#202/#203 — silent fallbacks at the provider boundary keep widening the observability gap that the structured-event taxonomy is supposed to close.
+
+5. **Test coverage locks in only the two-case happy path.** `normalizes_stop_reasons` test (line 1635-1638) asserts `"stop" → "end_turn"` and `"tool_calls" → "tool_use"`. There is no test for `length`, `content_filter`, or `function_call`, so the missing mappings are invisible to CI. The test also does not assert pass-through behavior for unknown values, leaving room for silent regressions when new finish_reason values are added by OpenAI.
+
+**Repro:**
+
+```rust
+// rust/crates/api/src/providers/openai_compat.rs:1389
+fn normalize_finish_reason(value: &str) -> String {
+    match value {
+        "stop" => "end_turn",
+        "tool_calls" => "tool_use",
+        other => other,  // <-- silent pass-through
+    }
+    .to_string()
+}
+
+// At call site (line 1202):
+stop_reason: choice
+    .finish_reason
+    .map(|value| normalize_finish_reason(&value)),
+
+// When OpenAI returns finish_reason="length":
+// stop_reason in MessageResponse becomes Some("length")
+// Downstream code branching on stop_reason == "max_tokens" never matches
+```
+
+**Verification check:** `grep -n "normalize_finish_reason" rust/crates/api/src/providers/openai_compat.rs` returns 5 hits — implementation, two call sites (streaming + non-streaming), and two test imports/assertions. The pass-through path has no caller-side guard or post-normalization assertion.
+
+**Expected:**
+
+- `normalize_finish_reason` exhaustively covers OpenAI's documented finish_reason enum: `stop` → `end_turn`, `length` → `max_tokens`, `content_filter` → `refusal`, `tool_calls` → `tool_use`, `function_call` → `tool_use`
+- Unknown finish_reason values emit a structured `unknown_finish_reason` event with the raw value, source provider, and request id, before falling through to the raw string (or to a typed `unknown` placeholder)
+- A `claw doctor` check or session diagnostic surfaces sessions where unmapped finish_reasons were observed
+- Test coverage extends to all five mapped cases plus an explicit pass-through-with-event assertion for unknown values
+
+**Fix sketch:**
+
+1. Extend `normalize_finish_reason` to a full mapping table covering `length`, `content_filter`, `function_call`. ~5 LOC.
+2. Change the `other` arm to either (a) return a typed `(String, bool)` where the bool indicates whether normalization was recognized, or (b) emit an `unknown_finish_reason` event before returning the raw string. ~10 LOC + event channel plumbing.
+3. Add per-arm regression tests in the existing `normalizes_stop_reasons` test. ~15 LOC test additions.
+4. Add to classifier event taxonomy and document the mapping table in SCHEMAS.md (companion to #200's derive-from-source enforcement gap).
+5. Verify Anthropic-side `stop_reason` enum: confirm `max_tokens` and `refusal` are the canonical Anthropic spellings before locking the OpenAI → Anthropic mapping.
+
+**Why this matters for clawability:**
+
+- Principle #2 ("Truth is split across layers") — finish_reason is the canonical signal for *why* the model stopped. Half of the truth values silently leak through unmapped to downstream consumers that expect Anthropic vocabulary.
+- Principle #5 ("Partial success is first-class — degraded-mode reporting") — `content_filter` is a partial-success / safety-blocked state; the current code path emits zero structured signal for it.
+- Sibling of #201 (silent tool-arg parse fallback), #202 (silent tool-message drop), #203 (auto-compaction no SSE event), #204 (reasoning_tokens not surfaced) — all four are silent-fallback gaps at the provider boundary that the structured-event taxonomy was designed to close, and #206 is the same pattern at the finish_reason translation layer.
+- Real-world impact: a claw consuming `--output-format json` and branching on `stop_reason` to decide "was output truncated, was it refused, was a tool used" gets wrong answers on three of OpenAI's five finish_reason values when that path runs against an OpenAI-compat backend.
+
+**Acceptance criteria:**
+
+- `normalize_finish_reason("length")` returns `"max_tokens"`
+- `normalize_finish_reason("content_filter")` returns `"refusal"` (or a documented Anthropic-canonical equivalent)
+- `normalize_finish_reason("function_call")` returns `"tool_use"`
+- Unknown values emit an `unknown_finish_reason` event before returning the raw string
+- `normalizes_stop_reasons` test asserts all five mappings plus the unknown-event behavior
+- Downstream consumers branching on Anthropic stop_reason vocabulary work correctly against OpenAI-compat backends without per-provider special-casing
+
+**Status:** Open. No code changed. Filed 2026-04-25 18:20 KST. Branch: feat/jobdori-168c-emission-routing. HEAD: dba4f28.
+
+🪨
