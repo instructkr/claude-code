@@ -14219,3 +14219,197 @@ The deeper fix is a unified-registry refactor (`MODEL_PARAM_REQUIREMENTS` table 
 **Status:** Open. No code changed. Filed 2026-04-25 22:00 KST. Branch: feat/jobdori-168c-emission-routing. HEAD: 347102d. Sibling-shape cluster (silent-fallback / silent-drop / silent-strip / silent-misnomer / silent-shadow / silent-prefix-mismatch / structural-absence / silent-zero-coercion / silent-content-discard at provider/CLI boundary): #201/#202/#203/#206/#207/#208/#209/#210/#211/#212/#213/#214 — thirteen pinpoints, one unified-registry refactor (`MODEL_PARAM_REQUIREMENTS` with six columns: `tuning_params_strip`, `max_output_tokens`, `max_tokens_param_name`, `default_parallel_tool_calls`, `cache_token_wire_shape`, `response_reasoning_field`) closes them all. Reasoning-fidelity cluster (the openai-compat reasoning-model lifecycle): #207 (reasoning_tokens counter) + #211 (max_completion_tokens param) + #214 (reasoning_content stream) — three pinpoints, one reasoning lane. Wire-format-parity cluster: #211 (max_tokens) + #212 (parallel_tool_calls) + #213 (cached_tokens) + #214 (reasoning_content) — four pinpoints, all upstream-contract divergence at the provider boundary. External validation: DeepSeek API docs (https://api-docs.deepseek.com/guides/reasoning_model + https://api-docs.deepseek.com/guides/thinking_mode), vLLM reasoning-outputs docs (https://docs.vllm.ai/en/latest/features/reasoning_outputs.html), anomalyco/opencode#24124 (active issue, identical pattern), charmbracelet/crush usage telemetry, simonw/llm `--show-cot`, Vercel AI SDK `LanguageModelV1Usage.reasoningTokens` + message stream `reasoning` parts, LangChain `BaseChatOpenAI` `additional_kwargs.reasoning_content`, LiteLLM `provider_specific_fields.reasoning`, continue.dev#9245, siliconflow.cn reasoning capabilities, agentscope-ai/QwenPaw#3782, dataleadsfuture.com R1 integration guide — same control surface available across the entire ecosystem, absent only in claw-code.
 
 🪨
+
+## Pinpoint #215 — `expect_success` reads only `request-id`/`x-request-id` headers and discards the rest of the response head; the upstream `Retry-After` header (RFC 7231 §7.1.3, mandated for 429 by Anthropic and emitted on 429/503/529 by OpenAI / DeepSeek / Moonshot kimi / Alibaba DashScope / xAI grok / SiliconFlow / OpenRouter) is silently dropped on the floor; both `OpenAiCompatClient::send_with_retry` and `AnthropicClient::send_with_retry` then sleep on a pure exponential-backoff schedule (`jittered_backoff_for_attempt(attempt) = 2^(attempt-1) * initial_backoff + jitter ∈ [0, base]`) that is wholly indifferent to the upstream-suggested wait, retrying ahead of the server-specified cooldown and burning quota on guaranteed-rejection retries (Jobdori, cycle #367 / extends #168c emission-routing audit / sibling-shape cluster grows to fourteen / completes the upstream-contract-honoring trio with #211 + #213)
+
+**Observed:** In `rust/crates/api/src/providers/openai_compat.rs:1336-1372`, the failure path of `expect_success` reads exactly two header families and discards everything else:
+
+```rust
+fn request_id_from_headers(headers: &reqwest::header::HeaderMap) -> Option<String> {
+    headers
+        .get(REQUEST_ID_HEADER)
+        .or_else(|| headers.get(ALT_REQUEST_ID_HEADER))
+        .and_then(|value| value.to_str().ok())
+        .map(ToOwned::to_owned)
+}
+
+async fn expect_success(response: reqwest::Response) -> Result<reqwest::Response, ApiError> {
+    let status = response.status();
+    if status.is_success() {
+        return Ok(response);
+    }
+
+    let request_id = request_id_from_headers(response.headers());
+    let body = response.text().await.unwrap_or_default();
+    let parsed_error = serde_json::from_str::<ErrorEnvelope>(&body).ok();
+    let retryable = is_retryable_status(status);
+
+    let suggested_action = suggested_action_for_status(status);
+
+    Err(ApiError::Api {
+        status,
+        error_type: parsed_error.as_ref().and_then(|error| error.error.error_type.clone()),
+        message: parsed_error.as_ref().and_then(|error| error.error.message.clone()),
+        request_id,
+        body,
+        retryable,
+        suggested_action,
+    })
+}
+
+const fn is_retryable_status(status: reqwest::StatusCode) -> bool {
+    matches!(status.as_u16(), 408 | 409 | 429 | 500 | 502 | 503 | 504)
+}
+```
+
+There is no read of `Retry-After`, no read of `retry-after-ms`, no read of `x-ratelimit-reset` / `x-ratelimit-reset-tokens` / `x-ratelimit-reset-requests` / `anthropic-ratelimit-requests-reset` / `anthropic-ratelimit-tokens-reset`, no fallback accessor, no `serde(flatten)` capture into a side-channel `extra_headers: HashMap<String, String>`. The `reqwest::Response` head is dropped at the `.text().await` consumption point — every header except `request-id`/`x-request-id` is gone before the retry scheduler sees the error. The Anthropic native path at `rust/crates/api/src/providers/anthropic.rs:866-894` has the same gap with the same shape.
+
+The retry scheduler then sleeps according to its local fixed schedule. `OpenAiCompatClient::backoff_for_attempt` (lines 283-294) and `OpenAiCompatClient::jittered_backoff_for_attempt` (lines 296-299) compute:
+
+```rust
+fn backoff_for_attempt(&self, attempt: u32) -> Result<Duration, ApiError> {
+    let Some(multiplier) = 1_u32.checked_shl(attempt.saturating_sub(1)) else {
+        return Err(ApiError::BackoffOverflow { attempt, base_delay: self.initial_backoff });
+    };
+    Ok(self.initial_backoff.checked_mul(multiplier).map_or(self.max_backoff, |delay| delay.min(self.max_backoff)))
+}
+
+fn jittered_backoff_for_attempt(&self, attempt: u32) -> Result<Duration, ApiError> {
+    let base = self.backoff_for_attempt(attempt)?;
+    Ok(base + jitter_for_base(base))
+}
+```
+
+— a function whose entire input is the local attempt counter and the local config (`initial_backoff`, `max_backoff`); the `ApiError::Api` carrying the failure does not feed back into the schedule. `tokio::time::sleep(self.jittered_backoff_for_attempt(attempts)?).await` at line 256 in `openai_compat.rs` and line 457 in `anthropic.rs` is the entire scheduling decision. The upstream-suggested wait time, even when present and parseable, has zero influence on when the next retry fires.
+
+The `ApiError::Api` variant in `rust/crates/api/src/error.rs:49-58` carries `status`, `error_type`, `message`, `request_id`, `body`, `retryable`, `suggested_action` — and structurally has no slot to hold a parsed `retry_after: Option<Duration>` that downstream consumers (TUI, hooks, plugins, session telemetry, autonomous-claw retry policies) could consult to render an honest "backing off for N seconds per upstream" status instead of inventing a number from the local backoff table.
+
+**Repository surface (verified 2026-04-25 22:35 KST):**
+
+```bash
+$ cd ~/clawd/claw-code
+$ grep -rni --include="*.rs" "retry-after\|retry_after\|RetryAfter" rust/crates/
+# rust/crates/tools/src/lib.rs:4152:        "retry_after_tool_failure"
+# (one hit — unrelated tool-error retry config; zero hits in api/ or runtime/)
+
+$ grep -rni --include="*.rs" "x-ratelimit\|ratelimit-reset\|ratelimit_reset" rust/crates/
+# (empty — zero hits anywhere in the codebase)
+
+$ grep -rni --include="*.rs" "anthropic-ratelimit\|anthropic_ratelimit" rust/crates/
+# (empty)
+
+$ grep -n "request_id_from_headers\|expect_success" rust/crates/api/src/providers/openai_compat.rs rust/crates/api/src/providers/anthropic.rs
+# rust/crates/api/src/providers/openai_compat.rs:1335:fn request_id_from_headers
+# rust/crates/api/src/providers/openai_compat.rs:1343:async fn expect_success
+# rust/crates/api/src/providers/anthropic.rs:771:fn request_id_from_headers
+# rust/crates/api/src/providers/anthropic.rs:866:async fn expect_success
+
+# Result: both providers have a header reader that captures request-id only;
+# both providers have an expect_success that consumes the response body and
+# discards every other header; the retry scheduler depends solely on local
+# backoff configuration; no field exists on ApiError to carry a server-suggested
+# wait. The capability is structurally absent on every layer of the stack.
+```
+
+**Blast radius (verified by `grep -rn "send_with_retry\|jittered_backoff" rust/crates/`):**
+
+- Every `claw prompt`, `claw send`, `claw chat`, and every plugin/hook-driven message that hits a 429 or 503 or 529 retries on the local schedule (default `initial_backoff = 500ms`, `max_backoff = 30s`, `max_retries = 3`). When Anthropic's response says `Retry-After: 60` (a one-minute server-specified cooldown that is the documented norm for 5_minute-window rate-limit recovery — see https://platform.claude.com/docs/en/api/rate-limits), claw-code retries at 500ms / 1s / 2s, all three of which return 429 again with the same `Retry-After: 60` (because the upstream window has not advanced), exhausts the retry budget in under 4 seconds, and surfaces `ApiError::RetriesExhausted` to the caller — with the original 1-minute cooldown as the only correct answer, three retries away from being honored. The correct shape is one wait of 60s and a single retry; the actual shape is three retries against a closed gate.
+
+- The same dynamic applies to OpenAI's `x-ratelimit-reset-requests` / `x-ratelimit-reset-tokens` (which OpenAI emits even on 200 responses to give clients early warning), DeepSeek's documented `Retry-After` on 429 (https://api-docs.deepseek.com/quick_start/rate_limit), Moonshot kimi's 60s cooldown after burst (kimi-k2.5 docs), and Alibaba DashScope's `X-DashScope-RequestId` + `Retry-After` pair on QwQ rate limits. Each upstream has a precise self-described reset window; claw-code overrides every one with its local 500ms/1s/2s/4s/8s sequence.
+
+- Retry-on-429 with no `Retry-After` honoring is **the** documented anti-pattern in OpenAI's official cookbook (https://developers.openai.com/cookbook/examples/how_to_handle_rate_limits) — "the Retry-After header tells you how long to wait, in seconds" — and in Anthropic's official rate-limits page (https://platform.claude.com/docs/en/api/rate-limits) — "on a 429, respect Retry-After". The `openai-python` SDK parses `retry-after-ms` and `Retry-After` natively (https://github.com/openai/openai-python/issues/957 and the merged sibling fix). Vercel AI SDK has supported it via `LanguageModelV1RateLimit.retryAfter` since v3.4. LangChain `BaseChatOpenAI` exposes the same. claw-code is the outlier in the ecosystem.
+
+- For burst-traffic claws (lane orchestrators, MCP fan-out, session resume after long pause, plugin-event pipelines that fire N requests on session-start), the local-backoff-only pattern manifests as: the first claw to hit the ceiling burns its 3 retries in ~7.5s, and every subsequent claw scheduled in the same orchestration fires immediately (no shared retry-after ledger), each burning its own 3 retries against the same closed gate, multiplying the upstream rate-limit pressure by `N * 4` and earning a longer cooldown than would have happened with a single honest 60s wait. The system-design failure mode of ignoring `Retry-After` is well-documented as "retry storm" in distributed-systems literature.
+
+- Quota-billed providers (every non-Anthropic upstream charges per request including 429s in some plans) charge claw-code for every blocked retry; the cost-parity cluster (#204+#207+#209+#210+#213) catches the per-token cost mis-calc but not the per-request retry cost; #215 is the per-request-cost dual: every non-Retry-After-honoring 429 retry is a billable round-trip with zero output value.
+
+- Hooks / plugins / claws that would render an honest "server says wait 47s" countdown in the TUI cannot fire on 429: the data is gone before the error reaches them. The TUI shows "retrying (attempt 2/3)" with an opaque local backoff number that bears no relation to when the upstream will actually accept the next call. The session tracer (anthropic.rs:413-433) records `record_http_request_started` and `record_http_request_failed` — neither carries the upstream-suggested wait, so historical replay of a session cannot reconstruct "why did this session take 12 minutes to recover from a rate limit" from the trace alone.
+
+- Multi-provider fall-through routers (a clawable harness pattern: when Anthropic 429s, route to OpenAI on the next attempt) cannot use upstream signal as the routing input: claw-code does not expose the signal. The router has to scrape error bodies for substring `"rate_limit"` (the same anti-pattern that Principle 3 of this roadmap calls out: "events over scraped prose").
+
+- **Stream-mid retries are not retries at all.** The retry loop guards `send_with_retry` (the request *opening*); if the connection succeeds and the rate limit lands mid-stream as a `data: {"error":...}` SSE frame (the `parse_sse_frame` path at openai_compat.rs:1244-1304 explicitly handles this case with `retryable: false` at line 1295), there is zero retry, zero `Retry-After` consultation, and the stream errors out. That is a separate gap (sibling to #215) that the current trio (#211+#213+#215) does not yet cover.
+
+- The Anthropic native path additionally has `enrich_bearer_auth_error` at anthropic.rs:906+ that mutates the `ApiError::Api` shape post-hoc to attach hints — proving the post-hoc enrichment plumbing exists; the `Retry-After` value would slot into the same hint pipeline structurally, and is one early-return short of being capturable. The lane is half-built here too.
+
+**Gap:**
+
+The gap is not "claw-code does not retry" — it does — and not "claw-code retries 429s wrong" — its retryable-status table is correct. The gap is: **claw-code retries on a self-determined schedule that is provably divergent from the upstream-suggested schedule, with no surface to even know the upstream gave a number.** Three nested absences: (1) `expect_success` does not read the `Retry-After` header off the `reqwest::Response` head before the body is consumed; (2) `ApiError::Api` has no field to carry a parsed wait-time; (3) `send_with_retry` has no decision branch that consults a server-suggested wait when one is available. Each absence is structural — the wire field has nowhere to live, the error type has nowhere to hold it, the scheduler has no input port for it — and each absence is one import / one field / one branch away from being filled.
+
+The taxonomy is half-built upstream: the `retryable: bool` flag on `ApiError::Api` correctly classifies which statuses qualify for retry; the missing dual is a `retry_after: Option<Duration>` companion field that says *when*. The scheduler has the `retryable` flag wired (line 245+247 in openai_compat.rs check `error.is_retryable()`); it does not have a parallel check for `error.retry_after()` because the method does not exist.
+
+**Reproduction sketch (not implemented, recorded for the regression suite that lands with the fix):**
+
+```rust
+#[tokio::test]
+async fn rate_limit_response_carries_retry_after_to_scheduler() {
+    // Mock Anthropic 429 with Retry-After: 47
+    let mock = mock_server::respond_with(
+        StatusCode::TOO_MANY_REQUESTS,
+        &[("retry-after", "47")],
+        r#"{"error":{"type":"rate_limit_error","message":"rpm exceeded"}}"#,
+    );
+    let client = AnthropicClient::new("test").with_retry_policy(RetryPolicy::default());
+    let err = client.send_message(&request).await.unwrap_err();
+    // currently: err.retry_after() is uncallable — method does not exist
+    // expected: err.retry_after() == Some(Duration::from_secs(47))
+    assert_eq!(err.retry_after(), Some(Duration::from_secs(47)));
+}
+
+#[tokio::test]
+async fn scheduler_honors_retry_after_over_local_backoff() {
+    // Mock 429 with Retry-After: 5, then 200
+    let mock = sequenced_mock([
+        (StatusCode::TOO_MANY_REQUESTS, &[("retry-after", "5")], rate_limit_body()),
+        (StatusCode::OK, &[], success_body()),
+    ]);
+    let client = OpenAiCompatClient::new(...).with_retry_policy(
+        RetryPolicy { initial_backoff: Duration::from_millis(100), max_retries: 3, ..default() },
+    );
+    let start = Instant::now();
+    let _ = client.send_message(&request).await.unwrap();
+    // currently: total elapsed ≈ 100ms (local backoff wins) — bug
+    // expected: total elapsed ≈ 5s (upstream wins when present)
+    let elapsed = start.elapsed();
+    assert!(elapsed >= Duration::from_secs(5));
+    assert!(elapsed < Duration::from_secs(7)); // upper bound — no double-wait
+}
+
+#[tokio::test]
+async fn missing_retry_after_falls_back_to_local_backoff() {
+    // Backward compat — 429 without header behaves exactly as before #215
+    let mock = mock_server::respond_with(
+        StatusCode::TOO_MANY_REQUESTS, &[], rate_limit_body(),
+    );
+    let client = AnthropicClient::new("test").with_retry_policy(
+        RetryPolicy { initial_backoff: Duration::from_millis(100), max_retries: 1, ..default() },
+    );
+    let start = Instant::now();
+    let _ = client.send_message(&request).await.unwrap_err();
+    // expected: ≈ 100ms — same as today
+    assert!(start.elapsed() < Duration::from_millis(500));
+}
+
+#[tokio::test]
+async fn retry_after_http_date_format_parsed_correctly() {
+    // RFC 7231 §7.1.3: Retry-After can be HTTP-date OR delta-seconds
+    let future = httpdate::fmt_http_date(SystemTime::now() + Duration::from_secs(30));
+    let mock = mock_server::respond_with(
+        StatusCode::TOO_MANY_REQUESTS, &[("retry-after", &future)], rate_limit_body(),
+    );
+    let err = client.send_message(&request).await.unwrap_err();
+    // currently: err.retry_after() is None — bug (only delta-seconds parsed if anything)
+    // expected: err.retry_after() == Some(~30s)
+    let after = err.retry_after().expect("http-date variant");
+    assert!(after >= Duration::from_secs(28) && after <= Duration::from_secs(32));
+}
+```
+
+**Fix shape (not implemented in this cycle, recorded for cluster refactor):**
+
+The minimal fix is a five-touch change: (a) add a free function `parse_retry_after(headers: &reqwest::header::HeaderMap) -> Option<Duration>` to `rust/crates/api/src/providers/mod.rs` that handles both `Retry-After: <delta-seconds>` (RFC 7231 §7.1.3 form 1) and `Retry-After: <HTTP-date>` (form 2), plus the OpenAI-specific `retry-after-ms` (millisecond resolution); (b) add a `retry_after: Option<Duration>` field to `ApiError::Api`; (c) populate it in both `expect_success` functions (openai_compat.rs:1343 and anthropic.rs:866) before the body consumption; (d) add an `ApiError::retry_after(&self) -> Option<Duration>` method; (e) modify `send_with_retry` in both providers so the sleep duration is `error.retry_after().map(|d| d.min(MAX_RETRY_AFTER)).unwrap_or_else(|| jittered_backoff_for_attempt(attempt))` — clamp the upstream-suggested value at a sanity ceiling (e.g. `MAX_RETRY_AFTER = Duration::from_secs(120)`) to defend against malicious or buggy upstreams suggesting hour-long waits, and fall back to the existing local schedule when the header is absent. Estimate: ~80 LOC production + ~120 LOC test (httpmock or wiremock-rs based). Plus a `StreamEvent::RetryAfterReceived { wait: Duration, source: "upstream" | "local_backoff" }` for cluster-wide event-emission parity (sibling fix to #201/#202/#203/#208/#211/#212/#213/#214) so claws can render an honest cooldown UI.
+
+The deeper fix is a unified `RateLimitContext` struct on `ApiError::Api` that consolidates `retry_after`, all `x-ratelimit-*` headers (for proactive backoff before the ceiling is hit), and `anthropic-ratelimit-*` headers, then a cluster-wide `RetryScheduler` trait that owns the schedule decision (`schedule(error, attempt) -> Duration`) so the local-backoff vs upstream-suggested vs hybrid-cap policy is one composable input rather than scattered across two `send_with_retry` implementations. This closes #215 cleanly and structurally preempts the sibling stream-mid retry gap (parse_sse_frame error path at openai_compat.rs:1295 forces `retryable: false` even for 429-shaped error frames in-stream).
+
+**Status:** Open. No code changed. Filed 2026-04-25 22:40 KST. Branch: feat/jobdori-168c-emission-routing. HEAD: 959bdf8. Sibling-shape cluster (silent-fallback / silent-drop / silent-strip / silent-misnomer / silent-shadow / silent-prefix-mismatch / structural-absence / silent-zero-coercion / silent-content-discard / silent-header-discard at provider/CLI boundary): #201/#202/#203/#206/#207/#208/#209/#210/#211/#212/#213/#214/#215 — fourteen pinpoints. Upstream-contract-honoring trio (the wire-protocol-as-input dimension that #214 left half-covered): #211 (max_completion_tokens — claw chooses the wrong request param) + #213 (cached_tokens — claw drops upstream-counted cache hits) + #215 (Retry-After — claw ignores upstream-specified wait) — three pinpoints, all "upstream told us; claw was not listening." Wire-format-parity cluster: #211 + #212 + #213 + #214 + #215. External validation: Anthropic rate-limits docs (https://platform.claude.com/docs/en/api/rate-limits — `Retry-After` is the documented mechanism), OpenAI cookbook on rate limits (https://developers.openai.com/cookbook/examples/how_to_handle_rate_limits — `Retry-After` is the documented mechanism), DeepSeek rate-limit docs (https://api-docs.deepseek.com/quick_start/rate_limit), RFC 7231 §7.1.3 (the canonical wire spec for the header — both delta-seconds and HTTP-date), openai-python SDK (parses `retry-after-ms` + `Retry-After` natively — https://github.com/openai/openai-python/issues/957), Vercel AI SDK `LanguageModelV1RateLimit.retryAfter` (v3.4+), LangChain `BaseChatOpenAI` retry-after handling, anomalyco/opencode#16993/#16994/#9091/#17583 (active issue cluster — same gap reported and partially fixed in the upstream peer; opencode#11705 specifically calls out hanging on 429), charmbracelet/crush retry-after honoring, simonw/llm rate-limit handling, LiteLLM `Router.retry_after_strategy`, semantic-kernel Azure-OpenAI retry policy, alexwlchan/handling-http-429-with-tenacity (canonical Python pattern) — same control surface available across the entire ecosystem, absent only in claw-code at three structural layers (wire-read, error-shape, scheduler-input) simultaneously.
+
+🪨
