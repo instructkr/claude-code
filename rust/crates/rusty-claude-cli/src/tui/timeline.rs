@@ -1,0 +1,169 @@
+use std::time::Instant;
+
+/// A recorded tool call event in the session.
+#[derive(Debug, Clone)]
+pub struct ToolCallEvent {
+    pub step: usize,
+    pub name: String,
+    pub started_at: Instant,
+    pub completed_at: Option<Instant>,
+    pub is_error: bool,
+    pub was_truncated: bool,
+    pub output_lines: usize,
+}
+
+/// Accumulator for building a tool call timeline during a turn.
+#[derive(Debug, Default)]
+pub struct ToolCallTimeline {
+    events: Vec<ToolCallEvent>,
+    start: Option<Instant>,
+}
+
+impl ToolCallTimeline {
+    /// Create a new empty timeline.
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Record the start of a tool call.
+    pub fn start_tool(&mut self, name: &str) {
+        if self.start.is_none() {
+            self.start = Some(Instant::now());
+        }
+        self.events.push(ToolCallEvent {
+            step: self.events.len() + 1,
+            name: name.to_string(),
+            started_at: Instant::now(),
+            completed_at: None,
+            is_error: false,
+            was_truncated: false,
+            output_lines: 0,
+        });
+    }
+
+    /// Mark the most recent tool call as completed.
+    pub fn complete_tool(&mut self, is_error: bool, was_truncated: bool, output_lines: usize) {
+        if let Some(event) = self.events.last_mut() {
+            event.completed_at = Some(Instant::now());
+            event.is_error = is_error;
+            event.was_truncated = was_truncated;
+            event.output_lines = output_lines;
+        }
+    }
+
+    /// Get the current events.
+    pub fn events(&self) -> &[ToolCallEvent] {
+        &self.events
+    }
+
+    /// Total elapsed time since the first tool call started.
+    pub fn total_elapsed(&self) -> Option<std::time::Duration> {
+        self.start.map(|s| s.elapsed())
+    }
+
+    /// Render the timeline as a string.
+    pub fn render(&self) -> String {
+        if self.events.is_empty() {
+            return String::new();
+        }
+
+        let mut out = String::new();
+        out.push_str("\x1b[38;5;245m── Tool calls ──\x1b[0m\n");
+
+        for event in &self.events {
+            let elapsed = event
+                .completed_at
+                .map(|c| c.duration_since(event.started_at))
+                .unwrap_or_default();
+            let status_icon = if event.is_error {
+                "\x1b[1;31m✗\x1b[0m"
+            } else {
+                "\x1b[1;32m✓\x1b[0m"
+            };
+            let truncated_mark = if event.was_truncated {
+                " (truncated)"
+            } else {
+                ""
+            };
+            let secs = elapsed.as_secs_f64();
+            out.push_str(&format!(
+                "  {}. {status_icon} \x1b[1;36m{}\x1b[0m  \x1b[2m{:.1}s  {} lines{}\x1b[0m\n",
+                event.step, event.name, secs, event.output_lines, truncated_mark
+            ));
+        }
+
+        if let Some(elapsed) = self.total_elapsed() {
+            out.push_str(&format!(
+                "\n  \x1b[2mTotal: {:.1}s across {} tool call(s)\x1b[0m\n",
+                elapsed.as_secs_f64(),
+                self.events.len(),
+            ));
+        }
+
+        out
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::thread::sleep;
+    use std::time::Duration;
+
+    #[test]
+    fn empty_timeline_renders_nothing() {
+        let timeline = ToolCallTimeline::new();
+        assert!(timeline.render().is_empty());
+    }
+
+    #[test]
+    fn single_tool_call_appears_in_render() {
+        let mut timeline = ToolCallTimeline::new();
+        timeline.start_tool("bash");
+        sleep(Duration::from_millis(10));
+        timeline.complete_tool(false, false, 5);
+        let rendered = timeline.render();
+        assert!(rendered.contains("bash"));
+        assert!(rendered.contains("✓"));
+        assert!(rendered.contains("Tool calls"));
+    }
+
+    #[test]
+    fn error_tool_call_shows_error_icon() {
+        let mut timeline = ToolCallTimeline::new();
+        timeline.start_tool("read_file");
+        timeline.complete_tool(true, false, 0);
+        let rendered = timeline.render();
+        assert!(rendered.contains("✗"));
+    }
+
+    #[test]
+    fn truncated_tool_call_marks_truncated() {
+        let mut timeline = ToolCallTimeline::new();
+        timeline.start_tool("bash");
+        timeline.complete_tool(false, true, 100);
+        let rendered = timeline.render();
+        assert!(rendered.contains("truncated"));
+    }
+
+    #[test]
+    fn multiple_tool_calls_are_numbered() {
+        let mut timeline = ToolCallTimeline::new();
+        timeline.start_tool("read_file");
+        timeline.complete_tool(false, false, 10);
+        timeline.start_tool("edit_file");
+        timeline.complete_tool(false, false, 3);
+        let rendered = timeline.render();
+        assert!(rendered.contains("1."));
+        assert!(rendered.contains("2."));
+        assert!(rendered.contains("2 tool call(s)"));
+    }
+
+    #[test]
+    fn events_reflects_count() {
+        let mut timeline = ToolCallTimeline::new();
+        assert_eq!(timeline.events().len(), 0);
+        timeline.start_tool("bash");
+        assert_eq!(timeline.events().len(), 1);
+    }
+}
