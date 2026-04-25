@@ -61,10 +61,28 @@ use crate::{
 // LiveCli
 // ═══════════════════════════════════════════════════════════════════════════
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum BannerStyle {
+    Full,
+    Compact,
+    None,
+}
+
+impl BannerStyle {
+    pub(crate) fn from_config(value: Option<&str>) -> Self {
+        match value {
+            Some("full") => BannerStyle::Full,
+            Some("none") => BannerStyle::None,
+            _ => BannerStyle::Compact,
+        }
+    }
+}
+
 pub(crate) struct LiveCli {
     pub(crate) model: String,
     allowed_tools: Option<AllowedToolSet>,
     permission_mode: PermissionMode,
+    banner_style: BannerStyle,
     system_prompt: Vec<String>,
     runtime: BuiltRuntime,
     session: SessionHandle,
@@ -77,6 +95,7 @@ impl LiveCli {
         enable_tools: bool,
         allowed_tools: Option<AllowedToolSet>,
         permission_mode: PermissionMode,
+        banner_style: Option<BannerStyle>,
     ) -> Result<Self, Box<dyn std::error::Error>> {
         let system_prompt = build_system_prompt()?;
         let session_state = new_cli_session()?;
@@ -96,6 +115,7 @@ impl LiveCli {
             model,
             allowed_tools,
             permission_mode,
+            banner_style: banner_style.unwrap_or(BannerStyle::Compact),
             system_prompt,
             runtime,
             session,
@@ -112,6 +132,14 @@ impl LiveCli {
     }
 
     pub(crate) fn startup_banner(&self) -> String {
+        match self.banner_style {
+            BannerStyle::Full => self.full_banner(),
+            BannerStyle::Compact => self.compact_banner(),
+            BannerStyle::None => String::new(),
+        }
+    }
+
+    fn full_banner(&self) -> String {
         let cwd = env::current_dir().map_or_else(
             |_| "<unknown>".to_string(),
             |path| path.display().to_string(),
@@ -152,6 +180,30 @@ impl LiveCli {
             cwd,
             self.session.id,
             session_path,
+        )
+    }
+
+    fn compact_banner(&self) -> String {
+        let cwd = env::current_dir().map_or_else(
+            |_| "<unknown>".to_string(),
+            |path| path.display().to_string(),
+        );
+        let status = status_context(None).ok();
+        let git_branch = status
+            .as_ref()
+            .and_then(|context| context.git_branch.as_deref())
+            .unwrap_or("unknown");
+        format!(
+            "\x1b[38;5;196mCLAW\x1b[0m \x1b[38;5;208mCode\x1b[0m 🦞  \
+             \x1b[2mmodel\x1b[0m {}  \
+             \x1b[2mperm\x1b[0m {}  \
+             \x1b[2mbranch\x1b[0m {}\n\
+             \x1b[2m{}/  \
+             Type \x1b[1m/help\x1b[0m for commands · \x1b[1m/diff\x1b[0m then \x1b[1m/commit\x1b[0m to ship · \x1b[2mTab\x1b[0m for completions\x1b[0m",
+            self.model,
+            self.permission_mode.as_str(),
+            git_branch,
+            cwd,
         )
     }
 
@@ -2464,7 +2516,7 @@ pub(crate) fn run_repl(
     enforce_broad_cwd_policy(allow_broad_cwd, CliOutputFormat::Text)?;
     run_stale_base_preflight(base_commit.as_deref());
     let resolved_model = resolve_repl_model(model);
-    let mut cli = LiveCli::new(resolved_model, true, allowed_tools, permission_mode)?;
+    let mut cli = LiveCli::new(resolved_model, true, allowed_tools, permission_mode, None)?;
     cli.set_reasoning_effort(reasoning_effort);
     let mut editor =
         input::LineEditor::new("> ", cli.repl_completion_candidates().unwrap_or_default());

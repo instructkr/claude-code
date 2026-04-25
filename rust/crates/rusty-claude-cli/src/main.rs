@@ -299,7 +299,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
                 None
             };
             let effective_prompt = merge_prompt_with_stdin(&prompt, stdin_context.as_deref());
-            let mut cli = LiveCli::new(model, true, allowed_tools, permission_mode)?;
+            let mut cli = LiveCli::new(model, true, allowed_tools, permission_mode, None)?;
             cli.set_reasoning_effort(reasoning_effort);
             cli.run_turn_with_output(&effective_prompt, output_format, compact)?;
         }
@@ -3950,13 +3950,14 @@ mod tests {
                 true,
                 None,
                 PermissionMode::DangerFullAccess,
+                None,
             )
             .expect("cli should initialize")
             .startup_banner()
         });
 
         assert!(banner.contains("Tab"));
-        assert!(banner.contains("workflow completions"));
+        assert!(banner.contains("completions"));
 
         fs::remove_dir_all(root).expect("cleanup temp dir");
         std::env::remove_var("ANTHROPIC_API_KEY");
