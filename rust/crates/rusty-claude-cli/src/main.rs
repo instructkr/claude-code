@@ -6,9 +6,53 @@
     clippy::unnecessary_wraps,
     clippy::unused_self
 )]
+mod format;
 mod init;
 mod input;
 mod render;
+
+// Re-exports from extracted format modules so existing code still compiles.
+// After Phase 0 is complete, this import brings all extracted items into scope
+// as if they were still defined in main.rs.
+use format::*;
+
+// These functions are NOT yet extracted to format/ because they depend on
+// build_runtime_plugin_state_with_loader (Phase 0.4 extraction). They must
+// stay in main.rs until app.rs is created.
+#[allow(clippy::trivially_copy_pass_by_ref)]
+fn normalize_allowed_tools(values: &[String]) -> Result<Option<AllowedToolSet>, String> {
+    if values.is_empty() {
+        return Ok(None);
+    }
+    current_tool_registry()?.normalize_allowed_tools(values)
+}
+
+fn current_tool_registry() -> Result<GlobalToolRegistry, String> {
+    let cwd = env::current_dir().map_err(|error| error.to_string())?;
+    let loader = ConfigLoader::default_for(&cwd);
+    let runtime_config = loader.load().map_err(|error| error.to_string())?;
+    let state = build_runtime_plugin_state_with_loader(&cwd, &loader, &runtime_config)
+        .map_err(|error| error.to_string())?;
+    let registry = state.tool_registry.clone();
+    if let Some(mcp_state) = state.mcp_state {
+        mcp_state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .shutdown()
+            .map_err(|error| error.to_string())?;
+    }
+    Ok(registry)
+}
+
+/// Summarize a tool payload for use inside a markdown session export.
+/// Produces a compact one-line string suitable for a blockquote.
+fn summarize_tool_payload_for_markdown(payload: &str) -> String {
+    let compact = match serde_json::from_str::<serde_json::Value>(payload) {
+        Ok(value) => value.to_string(),
+        Err(_) => payload.trim().to_string(),
+    };
+    format::tool_fmt::truncate_for_summary(&compact, 96)
+}
 
 use std::collections::BTreeSet;
 use std::env;
@@ -58,102 +102,6 @@ use tools::{
 
 const DEFAULT_MODEL: &str = "claude-opus-4-6";
 
-/// #148: Model provenance for `claw status` JSON/text output. Records where
-/// the resolved model string came from so claws don't have to re-read argv
-/// to audit whether their `--model` flag was honored vs falling back to env
-/// or config or default.
-#[derive(Debug, Clone, PartialEq, Eq)]
-enum ModelSource {
-    /// Explicit `--model` / `--model=` CLI flag.
-    Flag,
-    /// ANTHROPIC_MODEL environment variable (when no flag was passed).
-    Env,
-    /// `model` key in `.claw.json` / `.claw/settings.json` (when neither
-    /// flag nor env set it).
-    Config,
-    /// Compiled-in DEFAULT_MODEL fallback.
-    Default,
-}
-
-impl ModelSource {
-    fn as_str(&self) -> &'static str {
-        match self {
-            ModelSource::Flag => "flag",
-            ModelSource::Env => "env",
-            ModelSource::Config => "config",
-            ModelSource::Default => "default",
-        }
-    }
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-struct ModelProvenance {
-    /// Resolved model string (after alias expansion).
-    resolved: String,
-    /// Raw user input before alias resolution. None when source is Default.
-    raw: Option<String>,
-    /// Where the resolved model string originated.
-    source: ModelSource,
-}
-
-impl ModelProvenance {
-    fn default_fallback() -> Self {
-        Self {
-            resolved: DEFAULT_MODEL.to_string(),
-            raw: None,
-            source: ModelSource::Default,
-        }
-    }
-
-    fn from_flag(raw: &str) -> Self {
-        Self {
-            resolved: resolve_model_alias_with_config(raw),
-            raw: Some(raw.to_string()),
-            source: ModelSource::Flag,
-        }
-    }
-
-    fn from_env_or_config_or_default(cli_model: &str) -> Self {
-        // Only called when no --model flag was passed. Probe env first,
-        // then config, else fall back to default. Mirrors the logic in
-        // resolve_repl_model() but captures the source.
-        if cli_model != DEFAULT_MODEL {
-            // Already resolved from some prior path; treat as flag.
-            return Self {
-                resolved: cli_model.to_string(),
-                raw: Some(cli_model.to_string()),
-                source: ModelSource::Flag,
-            };
-        }
-        if let Some(env_model) = env::var("ANTHROPIC_MODEL")
-            .ok()
-            .map(|value| value.trim().to_string())
-            .filter(|value| !value.is_empty())
-        {
-            return Self {
-                resolved: resolve_model_alias_with_config(&env_model),
-                raw: Some(env_model),
-                source: ModelSource::Env,
-            };
-        }
-        if let Some(config_model) = config_model_for_current_dir() {
-            return Self {
-                resolved: resolve_model_alias_with_config(&config_model),
-                raw: Some(config_model),
-                source: ModelSource::Config,
-            };
-        }
-        Self::default_fallback()
-    }
-}
-
-fn max_tokens_for_model(model: &str) -> u32 {
-    if model.contains("opus") {
-        32_000
-    } else {
-        64_000
-    }
-}
 // Build-time constants injected by build.rs (fall back to static values when
 // build.rs hasn't run, e.g. in doc-test or unusual toolchain environments).
 const DEFAULT_DATE: &str = match option_env!("BUILD_DATE") {
@@ -228,8 +176,10 @@ fn main() {
             // don't need to regex-scrape the prose.
             let kind = classify_error_kind(&message);
             if message.contains("`claw --help`") {
-                eprintln!("[error-kind: {kind}]
-error: {message}");
+                eprintln!(
+                    "[error-kind: {kind}]
+error: {message}"
+                );
             } else {
                 eprintln!(
                     "[error-kind: {kind}]
@@ -240,55 +190,6 @@ Run `claw --help` for usage."
             }
         }
         std::process::exit(1);
-    }
-}
-
-/// #77: Classify a stringified error message into a machine-readable kind.
-///
-/// Returns a snake_case token that downstream consumers can switch on instead
-/// of regex-scraping the prose. The classification is best-effort prefix/keyword
-/// matching against the error messages produced throughout the CLI surface.
-fn classify_error_kind(message: &str) -> &'static str {
-    // Check specific patterns first (more specific before generic)
-    if message.contains("missing Anthropic credentials") {
-        "missing_credentials"
-    } else if message.contains("Manifest source files are missing") {
-        "missing_manifests"
-    } else if message.contains("no worker state file found") {
-        "missing_worker_state"
-    } else if message.contains("session not found") {
-        "session_not_found"
-    } else if message.contains("failed to restore session") {
-        "session_load_failed"
-    } else if message.contains("no managed sessions found") {
-        "no_managed_sessions"
-    } else if message.contains("unrecognized argument") || message.contains("unknown option") {
-        "cli_parse"
-    } else if message.contains("invalid model syntax") {
-        "invalid_model_syntax"
-    } else if message.contains("is not yet implemented") {
-        "unsupported_command"
-    } else if message.contains("unsupported resumed command") {
-        "unsupported_resumed_command"
-    } else if message.contains("confirmation required") {
-        "confirmation_required"
-    } else if message.contains("api failed") || message.contains("api returned") {
-        "api_http_error"
-    } else {
-        "unknown"
-    }
-}
-
-/// #77: Split a multi-line error message into (short_reason, optional_hint).
-///
-/// The short_reason is the first line (up to the first newline), and the hint
-/// is the remaining text or `None` if there's no newline. This prevents the
-/// runbook prose from being stuffed into the `error` field that downstream
-/// parsers expect to be the short reason alone.
-fn split_error_hint(message: &str) -> (String, Option<String>) {
-    match message.split_once('\n') {
-        Some((short, hint)) => (short.to_string(), Some(hint.trim().to_string())),
-        None => (message.to_string(), None),
     }
 }
 
@@ -372,7 +273,12 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
             model_flag_raw,
             permission_mode,
             output_format,
-        } => print_status_snapshot(&model, model_flag_raw.as_deref(), permission_mode, output_format)?,
+        } => print_status_snapshot(
+            &model,
+            model_flag_raw.as_deref(),
+            permission_mode,
+            output_format,
+        )?,
         CliAction::Sandbox { output_format } => print_sandbox_status_snapshot(output_format)?,
         CliAction::Prompt {
             prompt,
@@ -412,19 +318,17 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         CliAction::Config {
             section,
             output_format,
-        } => {
-            match output_format {
-                CliOutputFormat::Text => {
-                    println!("{}", render_config_report(section.as_deref())?);
-                }
-                CliOutputFormat::Json => {
-                    println!(
-                        "{}",
-                        serde_json::to_string_pretty(&render_config_json(section.as_deref())?)?
-                    );
-                }
+        } => match output_format {
+            CliOutputFormat::Text => {
+                println!("{}", render_config_report(section.as_deref())?);
             }
-        }
+            CliOutputFormat::Json => {
+                println!(
+                    "{}",
+                    serde_json::to_string_pretty(&render_config_json(section.as_deref())?)?
+                );
+            }
+        },
         CliAction::Diff { output_format } => match output_format {
             CliOutputFormat::Text => {
                 println!("{}", render_diff_report()?);
@@ -567,23 +471,6 @@ enum CliAction {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum LocalHelpTopic {
-    Status,
-    Sandbox,
-    Doctor,
-    Acp,
-    // #141: extend the local-help pattern to every subcommand so
-    // `claw <subcommand> --help` has one consistent contract.
-    Init,
-    State,
-    Export,
-    Version,
-    SystemPrompt,
-    DumpManifests,
-    BootstrapPlan,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum CliOutputFormat {
     Text,
     Json,
@@ -627,13 +514,7 @@ fn parse_args(args: &[String]) -> Result<CliAction, String> {
             }
             "--help" | "-h"
                 if !rest.is_empty()
-                    && matches!(
-                        rest[0].as_str(),
-                        "prompt"
-                            | "commit"
-                            | "pr"
-                            | "issue"
-                    ) =>
+                    && matches!(rest[0].as_str(), "prompt" | "commit" | "pr" | "issue") =>
             {
                 // `--help` following a subcommand that would otherwise forward
                 // the arg to the API (e.g. `claw prompt --help`) should show
@@ -844,9 +725,13 @@ fn parse_args(args: &[String]) -> Result<CliAction, String> {
     if let Some(action) = parse_local_help_action(&rest) {
         return action;
     }
-    if let Some(action) =
-        parse_single_word_command_alias(&rest, &model, model_flag_raw.as_deref(), permission_mode_override, output_format)
-    {
+    if let Some(action) = parse_single_word_command_alias(
+        &rest,
+        &model,
+        model_flag_raw.as_deref(),
+        permission_mode_override,
+        output_format,
+    ) {
         return action;
     }
 
@@ -1237,138 +1122,8 @@ fn parse_direct_slash_cli_action(
     }
 }
 
-fn format_unknown_option(option: &str) -> String {
-    let mut message = format!("unknown option: {option}");
-    if let Some(suggestion) = suggest_closest_term(option, CLI_OPTION_SUGGESTIONS) {
-        message.push_str("\nDid you mean ");
-        message.push_str(suggestion);
-        message.push('?');
-    }
-    message.push_str("\nRun `claw --help` for usage.");
-    message
-}
-
-fn format_unknown_direct_slash_command(name: &str) -> String {
-    let mut message = format!("unknown slash command outside the REPL: /{name}");
-    if let Some(suggestions) = render_suggestion_line("Did you mean", &suggest_slash_commands(name))
-    {
-        message.push('\n');
-        message.push_str(&suggestions);
-    }
-    if let Some(note) = omc_compatibility_note_for_unknown_slash_command(name) {
-        message.push('\n');
-        message.push_str(note);
-    }
-    message.push_str("\nRun `claw --help` for CLI usage, or start `claw` and use /help.");
-    message
-}
-
-fn format_unknown_slash_command(name: &str) -> String {
-    let mut message = format!("Unknown slash command: /{name}");
-    if let Some(suggestions) = render_suggestion_line("Did you mean", &suggest_slash_commands(name))
-    {
-        message.push('\n');
-        message.push_str(&suggestions);
-    }
-    if let Some(note) = omc_compatibility_note_for_unknown_slash_command(name) {
-        message.push('\n');
-        message.push_str(note);
-    }
-    message.push_str("\n  Help             /help lists available slash commands");
-    message
-}
-
-fn omc_compatibility_note_for_unknown_slash_command(name: &str) -> Option<&'static str> {
-    name.starts_with("oh-my-claudecode:")
-        .then_some(
-            "Compatibility note: `/oh-my-claudecode:*` is a Claude Code/OMC plugin command. `claw` does not yet load plugin slash commands, Claude statusline stdin, or OMC session hooks.",
-        )
-}
-
-fn render_suggestion_line(label: &str, suggestions: &[String]) -> Option<String> {
-    (!suggestions.is_empty()).then(|| format!("  {label:<16} {}", suggestions.join(", "),))
-}
-
-fn suggest_slash_commands(input: &str) -> Vec<String> {
-    let mut candidates = slash_command_specs()
-        .iter()
-        .flat_map(|spec| {
-            std::iter::once(spec.name)
-                .chain(spec.aliases.iter().copied())
-                .map(|name| format!("/{name}"))
-                .collect::<Vec<_>>()
-        })
-        .collect::<Vec<_>>();
-    candidates.sort();
-    candidates.dedup();
-    let candidate_refs = candidates.iter().map(String::as_str).collect::<Vec<_>>();
-    ranked_suggestions(input.trim_start_matches('/'), &candidate_refs)
-        .into_iter()
-        .map(str::to_string)
-        .collect()
-}
-
 fn suggest_closest_term<'a>(input: &str, candidates: &'a [&'a str]) -> Option<&'a str> {
     ranked_suggestions(input, candidates).into_iter().next()
-}
-
-
-fn suggest_similar_subcommand(input: &str) -> Option<Vec<String>> {
-    const KNOWN_SUBCOMMANDS: &[&str] = &[
-        "help",
-        "version",
-        "status",
-        "sandbox",
-        "doctor",
-        "state",
-        "dump-manifests",
-        "bootstrap-plan",
-        "agents",
-        "mcp",
-        "skills",
-        "system-prompt",
-        "acp",
-        "init",
-        "export",
-        "prompt",
-    ];
-
-    let normalized_input = input.to_ascii_lowercase();
-    let mut ranked = KNOWN_SUBCOMMANDS
-        .iter()
-        .filter_map(|candidate| {
-            let normalized_candidate = candidate.to_ascii_lowercase();
-            let distance = levenshtein_distance(&normalized_input, &normalized_candidate);
-            let prefix_match = common_prefix_len(&normalized_input, &normalized_candidate) >= 4;
-            let substring_match = normalized_candidate.contains(&normalized_input)
-                || normalized_input.contains(&normalized_candidate);
-            ((distance <= 2) || prefix_match || substring_match)
-                .then_some((distance, *candidate))
-        })
-        .collect::<Vec<_>>();
-    ranked.sort_by(|left, right| left.cmp(right).then_with(|| left.1.cmp(right.1)));
-    ranked.dedup_by(|left, right| left.1 == right.1);
-    let suggestions = ranked
-        .into_iter()
-        .map(|(_, candidate)| candidate.to_string())
-        .take(3)
-        .collect::<Vec<_>>();
-    (!suggestions.is_empty()).then_some(suggestions)
-}
-
-fn common_prefix_len(left: &str, right: &str) -> usize {
-    left.chars()
-        .zip(right.chars())
-        .take_while(|(l, r)| l == r)
-        .count()
-}
-
-
-fn looks_like_subcommand_typo(input: &str) -> bool {
-    !input.is_empty()
-        && input
-            .chars()
-            .all(|ch| ch.is_ascii_alphabetic() || ch == '-')
 }
 
 fn ranked_suggestions<'a>(input: &str, candidates: &'a [&'a str]) -> Vec<&'a str> {
@@ -1392,224 +1147,6 @@ fn ranked_suggestions<'a>(input: &str, candidates: &'a [&'a str]) -> Vec<&'a str
         .map(|(_, candidate)| candidate)
         .take(3)
         .collect()
-}
-
-fn levenshtein_distance(left: &str, right: &str) -> usize {
-    if left.is_empty() {
-        return right.chars().count();
-    }
-    if right.is_empty() {
-        return left.chars().count();
-    }
-
-    let right_chars = right.chars().collect::<Vec<_>>();
-    let mut previous = (0..=right_chars.len()).collect::<Vec<_>>();
-    let mut current = vec![0; right_chars.len() + 1];
-
-    for (left_index, left_char) in left.chars().enumerate() {
-        current[0] = left_index + 1;
-        for (right_index, right_char) in right_chars.iter().enumerate() {
-            let substitution_cost = usize::from(left_char != *right_char);
-            current[right_index + 1] = (previous[right_index + 1] + 1)
-                .min(current[right_index] + 1)
-                .min(previous[right_index] + substitution_cost);
-        }
-        previous.clone_from(&current);
-    }
-
-    previous[right_chars.len()]
-}
-
-fn resolve_model_alias(model: &str) -> &str {
-    match model {
-        "opus" => "claude-opus-4-6",
-        "sonnet" => "claude-sonnet-4-6",
-        "haiku" => "claude-haiku-4-5-20251213",
-        _ => model,
-    }
-}
-
-/// Resolve a model name through user-defined config aliases first, then fall
-/// back to the built-in alias table. This is the entry point used wherever a
-/// user-supplied model string is about to be dispatched to a provider.
-fn resolve_model_alias_with_config(model: &str) -> String {
-    let trimmed = model.trim();
-    if let Some(resolved) = config_alias_for_current_dir(trimmed) {
-        return resolve_model_alias(&resolved).to_string();
-    }
-    resolve_model_alias(trimmed).to_string()
-}
-
-/// Validate model syntax at parse time.
-/// Accepts: known aliases (opus, sonnet, haiku) or provider/model pattern.
-/// Rejects: empty, whitespace-only, strings with spaces, or invalid chars.
-fn validate_model_syntax(model: &str) -> Result<(), String> {
-    let trimmed = model.trim();
-    if trimmed.is_empty() {
-        return Err("model string cannot be empty".to_string());
-    }
-    // Known aliases are always valid
-    match trimmed {
-        "opus" | "sonnet" | "haiku" => return Ok(()),
-        _ => {}
-    }
-    // Check for spaces (malformed)
-    if trimmed.contains(' ') {
-        return Err(format!(
-            "invalid model syntax: '{}' contains spaces. Use provider/model format or known alias",
-            trimmed
-        ));
-    }
-    // Check provider/model format: provider_id/model_id
-    let parts: Vec<&str> = trimmed.split('/').collect();
-    if parts.len() != 2 || parts[0].is_empty() || parts[1].is_empty() {
-        // #154: hint if the model looks like it belongs to a different provider
-        let mut err_msg = format!(
-            "invalid model syntax: '{}'. Expected provider/model (e.g., anthropic/claude-opus-4-6) or known alias (opus, sonnet, haiku)",
-            trimmed
-        );
-        if trimmed.starts_with("gpt-") || trimmed.starts_with("gpt_") {
-            err_msg.push_str("\nDid you mean `openai/");
-            err_msg.push_str(trimmed);
-            err_msg.push_str("`? (Requires OPENAI_API_KEY env var)");
-        }
-        else if trimmed.starts_with("qwen") {
-            err_msg.push_str("\nDid you mean `qwen/");
-            err_msg.push_str(trimmed);
-            err_msg.push_str("`? (Requires DASHSCOPE_API_KEY env var)");
-        }
-        else if trimmed.starts_with("grok") {
-            err_msg.push_str("\nDid you mean `xai/");
-            err_msg.push_str(trimmed);
-            err_msg.push_str("`? (Requires XAI_API_KEY env var)");
-        }
-        return Err(err_msg);
-    }
-    Ok(())
-}
-
-fn config_alias_for_current_dir(alias: &str) -> Option<String> {
-    if alias.is_empty() {
-        return None;
-    }
-    let cwd = env::current_dir().ok()?;
-    let loader = ConfigLoader::default_for(&cwd);
-    let config = loader.load().ok()?;
-    config.aliases().get(alias).cloned()
-}
-
-fn normalize_allowed_tools(values: &[String]) -> Result<Option<AllowedToolSet>, String> {
-    if values.is_empty() {
-        return Ok(None);
-    }
-    current_tool_registry()?.normalize_allowed_tools(values)
-}
-
-fn current_tool_registry() -> Result<GlobalToolRegistry, String> {
-    let cwd = env::current_dir().map_err(|error| error.to_string())?;
-    let loader = ConfigLoader::default_for(&cwd);
-    let runtime_config = loader.load().map_err(|error| error.to_string())?;
-    let state = build_runtime_plugin_state_with_loader(&cwd, &loader, &runtime_config)
-        .map_err(|error| error.to_string())?;
-    let registry = state.tool_registry.clone();
-    if let Some(mcp_state) = state.mcp_state {
-        mcp_state
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .shutdown()
-            .map_err(|error| error.to_string())?;
-    }
-    Ok(registry)
-}
-
-fn parse_permission_mode_arg(value: &str) -> Result<PermissionMode, String> {
-    normalize_permission_mode(value)
-        .ok_or_else(|| {
-            format!(
-                "unsupported permission mode '{value}'. Use read-only, workspace-write, or danger-full-access."
-            )
-        })
-        .map(permission_mode_from_label)
-}
-
-fn permission_mode_from_label(mode: &str) -> PermissionMode {
-    match mode {
-        "read-only" => PermissionMode::ReadOnly,
-        "workspace-write" => PermissionMode::WorkspaceWrite,
-        "danger-full-access" => PermissionMode::DangerFullAccess,
-        other => panic!("unsupported permission mode label: {other}"),
-    }
-}
-
-fn permission_mode_from_resolved(mode: ResolvedPermissionMode) -> PermissionMode {
-    match mode {
-        ResolvedPermissionMode::ReadOnly => PermissionMode::ReadOnly,
-        ResolvedPermissionMode::WorkspaceWrite => PermissionMode::WorkspaceWrite,
-        ResolvedPermissionMode::DangerFullAccess => PermissionMode::DangerFullAccess,
-    }
-}
-
-fn default_permission_mode() -> PermissionMode {
-    env::var("RUSTY_CLAUDE_PERMISSION_MODE")
-        .ok()
-        .as_deref()
-        .and_then(normalize_permission_mode)
-        .map(permission_mode_from_label)
-        .or_else(config_permission_mode_for_current_dir)
-        .unwrap_or(PermissionMode::DangerFullAccess)
-}
-
-fn config_permission_mode_for_current_dir() -> Option<PermissionMode> {
-    let cwd = env::current_dir().ok()?;
-    let loader = ConfigLoader::default_for(&cwd);
-    loader
-        .load()
-        .ok()?
-        .permission_mode()
-        .map(permission_mode_from_resolved)
-}
-
-fn config_model_for_current_dir() -> Option<String> {
-    let cwd = env::current_dir().ok()?;
-    let loader = ConfigLoader::default_for(&cwd);
-    loader.load().ok()?.model().map(ToOwned::to_owned)
-}
-
-fn resolve_repl_model(cli_model: String) -> String {
-    if cli_model != DEFAULT_MODEL {
-        return cli_model;
-    }
-    if let Some(env_model) = env::var("ANTHROPIC_MODEL")
-        .ok()
-        .map(|value| value.trim().to_string())
-        .filter(|value| !value.is_empty())
-    {
-        return resolve_model_alias_with_config(&env_model);
-    }
-    if let Some(config_model) = config_model_for_current_dir() {
-        return resolve_model_alias_with_config(&config_model);
-    }
-    cli_model
-}
-
-fn provider_label(kind: ProviderKind) -> &'static str {
-    match kind {
-        ProviderKind::Anthropic => "anthropic",
-        ProviderKind::Xai => "xai",
-        ProviderKind::OpenAi => "openai",
-    }
-}
-
-fn format_connected_line(model: &str) -> String {
-    let provider = provider_label(detect_provider_kind(model));
-    format!("Connected: {model} via {provider}")
-}
-
-fn filter_tool_specs(
-    tool_registry: &GlobalToolRegistry,
-    allowed_tools: Option<&AllowedToolSet>,
-) -> Vec<ToolDefinition> {
-    tool_registry.definitions(allowed_tools)
 }
 
 fn parse_system_prompt_args(
@@ -2791,76 +2328,6 @@ struct ResumeCommandOutcome {
     json: Option<serde_json::Value>,
 }
 
-#[derive(Debug, Clone)]
-struct StatusContext {
-    cwd: PathBuf,
-    session_path: Option<PathBuf>,
-    loaded_config_files: usize,
-    discovered_config_files: usize,
-    memory_file_count: usize,
-    project_root: Option<PathBuf>,
-    git_branch: Option<String>,
-    git_summary: GitWorkspaceSummary,
-    sandbox_status: runtime::SandboxStatus,
-    /// #143: when `.claw.json` (or another loaded config file) fails to parse,
-    /// we capture the parse error here and still populate every field that
-    /// doesn't depend on runtime config (workspace, git, sandbox defaults,
-    /// discovery counts). Top-level JSON output then reports
-    /// `status: "degraded"` so claws can distinguish "status ran but config
-    /// is broken" from "status ran cleanly".
-    config_load_error: Option<String>,
-}
-
-#[derive(Debug, Clone, Copy)]
-struct StatusUsage {
-    message_count: usize,
-    turns: u32,
-    latest: TokenUsage,
-    cumulative: TokenUsage,
-    estimated_tokens: usize,
-}
-
-#[allow(clippy::struct_field_names)]
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
-struct GitWorkspaceSummary {
-    changed_files: usize,
-    staged_files: usize,
-    unstaged_files: usize,
-    untracked_files: usize,
-    conflicted_files: usize,
-}
-
-impl GitWorkspaceSummary {
-    fn is_clean(self) -> bool {
-        self.changed_files == 0
-    }
-
-    fn headline(self) -> String {
-        if self.is_clean() {
-            "clean".to_string()
-        } else {
-            let mut details = Vec::new();
-            if self.staged_files > 0 {
-                details.push(format!("{} staged", self.staged_files));
-            }
-            if self.unstaged_files > 0 {
-                details.push(format!("{} unstaged", self.unstaged_files));
-            }
-            if self.untracked_files > 0 {
-                details.push(format!("{} untracked", self.untracked_files));
-            }
-            if self.conflicted_files > 0 {
-                details.push(format!("{} conflicted", self.conflicted_files));
-            }
-            format!(
-                "dirty · {} files · {}",
-                self.changed_files,
-                details.join(", ")
-            )
-        }
-    }
-}
-
 #[cfg(test)]
 fn format_unknown_slash_command_message(name: &str) -> String {
     let suggestions = suggest_slash_commands(name);
@@ -2876,252 +2343,6 @@ fn format_unknown_slash_command_message(name: &str) -> String {
     }
     message.push_str(" Use /help to list available commands.");
     message
-}
-
-fn format_model_report(model: &str, message_count: usize, turns: u32) -> String {
-    format!(
-        "Model
-  Current model    {model}
-  Session messages {message_count}
-  Session turns    {turns}
-
-Usage
-  Inspect current model with /model
-  Switch models with /model <name>"
-    )
-}
-
-fn format_model_switch_report(previous: &str, next: &str, message_count: usize) -> String {
-    format!(
-        "Model updated
-  Previous         {previous}
-  Current          {next}
-  Preserved msgs   {message_count}"
-    )
-}
-
-fn format_permissions_report(mode: &str) -> String {
-    let modes = [
-        ("read-only", "Read/search tools only", mode == "read-only"),
-        (
-            "workspace-write",
-            "Edit files inside the workspace",
-            mode == "workspace-write",
-        ),
-        (
-            "danger-full-access",
-            "Unrestricted tool access",
-            mode == "danger-full-access",
-        ),
-    ]
-    .into_iter()
-    .map(|(name, description, is_current)| {
-        let marker = if is_current {
-            "● current"
-        } else {
-            "○ available"
-        };
-        format!("  {name:<18} {marker:<11} {description}")
-    })
-    .collect::<Vec<_>>()
-    .join(
-        "
-",
-    );
-
-    format!(
-        "Permissions
-  Active mode      {mode}
-  Mode status      live session default
-
-Modes
-{modes}
-
-Usage
-  Inspect current mode with /permissions
-  Switch modes with /permissions <mode>"
-    )
-}
-
-fn format_permissions_switch_report(previous: &str, next: &str) -> String {
-    format!(
-        "Permissions updated
-  Result           mode switched
-  Previous mode    {previous}
-  Active mode      {next}
-  Applies to       subsequent tool calls
-  Usage            /permissions to inspect current mode"
-    )
-}
-
-fn format_cost_report(usage: TokenUsage) -> String {
-    format!(
-        "Cost
-  Input tokens     {}
-  Output tokens    {}
-  Cache create     {}
-  Cache read       {}
-  Total tokens     {}",
-        usage.input_tokens,
-        usage.output_tokens,
-        usage.cache_creation_input_tokens,
-        usage.cache_read_input_tokens,
-        usage.total_tokens(),
-    )
-}
-
-fn format_resume_report(session_path: &str, message_count: usize, turns: u32) -> String {
-    format!(
-        "Session resumed
-  Session file     {session_path}
-  Messages         {message_count}
-  Turns            {turns}"
-    )
-}
-
-fn render_resume_usage() -> String {
-    format!(
-        "Resume
-  Usage            /resume <session-path|session-id|{LATEST_SESSION_REFERENCE}>
-  Auto-save        .claw/sessions/<session-id>.{PRIMARY_SESSION_EXTENSION}
-  Tip              use /session list to inspect saved sessions"
-    )
-}
-
-fn format_compact_report(removed: usize, resulting_messages: usize, skipped: bool) -> String {
-    if skipped {
-        format!(
-            "Compact
-  Result           skipped
-  Reason           session below compaction threshold
-  Messages kept    {resulting_messages}"
-        )
-    } else {
-        format!(
-            "Compact
-  Result           compacted
-  Messages removed {removed}
-  Messages kept    {resulting_messages}"
-        )
-    }
-}
-
-fn format_auto_compaction_notice(removed: usize) -> String {
-    format!("[auto-compacted: removed {removed} messages]")
-}
-
-fn parse_git_status_metadata(status: Option<&str>) -> (Option<PathBuf>, Option<String>) {
-    parse_git_status_metadata_for(
-        &env::current_dir().unwrap_or_else(|_| PathBuf::from(".")),
-        status,
-    )
-}
-
-fn parse_git_status_branch(status: Option<&str>) -> Option<String> {
-    let status = status?;
-    let first_line = status.lines().next()?;
-    let line = first_line.strip_prefix("## ")?;
-    if line.starts_with("HEAD") {
-        return Some("detached HEAD".to_string());
-    }
-    let branch = line.split(['.', ' ']).next().unwrap_or_default().trim();
-    if branch.is_empty() {
-        None
-    } else {
-        Some(branch.to_string())
-    }
-}
-
-fn parse_git_workspace_summary(status: Option<&str>) -> GitWorkspaceSummary {
-    let mut summary = GitWorkspaceSummary::default();
-    let Some(status) = status else {
-        return summary;
-    };
-
-    for line in status.lines() {
-        if line.starts_with("## ") || line.trim().is_empty() {
-            continue;
-        }
-
-        summary.changed_files += 1;
-        let mut chars = line.chars();
-        let index_status = chars.next().unwrap_or(' ');
-        let worktree_status = chars.next().unwrap_or(' ');
-
-        if index_status == '?' && worktree_status == '?' {
-            summary.untracked_files += 1;
-            continue;
-        }
-
-        if index_status != ' ' {
-            summary.staged_files += 1;
-        }
-        if worktree_status != ' ' {
-            summary.unstaged_files += 1;
-        }
-        if (matches!(index_status, 'U' | 'A') && matches!(worktree_status, 'U' | 'A'))
-            || index_status == 'U'
-            || worktree_status == 'U'
-        {
-            summary.conflicted_files += 1;
-        }
-    }
-
-    summary
-}
-
-fn resolve_git_branch_for(cwd: &Path) -> Option<String> {
-    let branch = run_git_capture_in(cwd, &["branch", "--show-current"])?;
-    let branch = branch.trim();
-    if !branch.is_empty() {
-        return Some(branch.to_string());
-    }
-
-    let fallback = run_git_capture_in(cwd, &["rev-parse", "--abbrev-ref", "HEAD"])?;
-    let fallback = fallback.trim();
-    if fallback.is_empty() {
-        None
-    } else if fallback == "HEAD" {
-        Some("detached HEAD".to_string())
-    } else {
-        Some(fallback.to_string())
-    }
-}
-
-fn run_git_capture_in(cwd: &Path, args: &[&str]) -> Option<String> {
-    let output = std::process::Command::new("git")
-        .args(args)
-        .current_dir(cwd)
-        .output()
-        .ok()?;
-    if !output.status.success() {
-        return None;
-    }
-    String::from_utf8(output.stdout).ok()
-}
-
-fn find_git_root_in(cwd: &Path) -> Result<PathBuf, Box<dyn std::error::Error>> {
-    let output = std::process::Command::new("git")
-        .args(["rev-parse", "--show-toplevel"])
-        .current_dir(cwd)
-        .output()?;
-    if !output.status.success() {
-        return Err("not a git repository".into());
-    }
-    let path = String::from_utf8(output.stdout)?.trim().to_string();
-    if path.is_empty() {
-        return Err("empty git root".into());
-    }
-    Ok(PathBuf::from(path))
-}
-
-fn parse_git_status_metadata_for(
-    cwd: &Path,
-    status: Option<&str>,
-) -> (Option<PathBuf>, Option<String>) {
-    let branch = resolve_git_branch_for(cwd).or_else(|| parse_git_status_branch(status));
-    let project_root = find_git_root_in(cwd).ok();
-    (project_root, branch)
 }
 
 #[allow(clippy::too_many_lines)]
@@ -3626,23 +2847,6 @@ fn run_repl(
     Ok(())
 }
 
-#[derive(Debug, Clone)]
-struct SessionHandle {
-    id: String,
-    path: PathBuf,
-}
-
-#[derive(Debug, Clone)]
-struct ManagedSessionSummary {
-    id: String,
-    path: PathBuf,
-    updated_at_ms: u64,
-    modified_epoch_millis: u128,
-    message_count: usize,
-    parent_session_id: Option<String>,
-    branch_name: Option<String>,
-}
-
 struct LiveCli {
     model: String,
     allowed_tools: Option<AllowedToolSet>,
@@ -3651,12 +2855,6 @@ struct LiveCli {
     runtime: BuiltRuntime,
     session: SessionHandle,
     prompt_history: Vec<PromptHistoryEntry>,
-}
-
-#[derive(Debug, Clone)]
-struct PromptHistoryEntry {
-    timestamp_ms: u64,
-    text: String,
 }
 
 struct RuntimePluginState {
@@ -4321,7 +3519,6 @@ impl LiveCli {
         println!("{final_text}");
         Ok(())
     }
-
 
     fn run_prompt_compact_json(&mut self, input: &str) -> Result<(), Box<dyn std::error::Error>> {
         let (mut runtime, hook_abort_monitor) = self.prepare_turn_runtime(false)?;
@@ -5350,68 +4547,6 @@ fn render_session_list(active_session_id: &str) -> Result<String, Box<dyn std::e
     Ok(lines.join("\n"))
 }
 
-fn format_session_modified_age(modified_epoch_millis: u128) -> String {
-    let now = std::time::SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .ok()
-        .map_or(modified_epoch_millis, |duration| duration.as_millis());
-    let delta_seconds = now
-        .saturating_sub(modified_epoch_millis)
-        .checked_div(1_000)
-        .unwrap_or_default();
-    match delta_seconds {
-        0..=4 => "just-now".to_string(),
-        5..=59 => format!("{delta_seconds}s-ago"),
-        60..=3_599 => format!("{}m-ago", delta_seconds / 60),
-        3_600..=86_399 => format!("{}h-ago", delta_seconds / 3_600),
-        _ => format!("{}d-ago", delta_seconds / 86_400),
-    }
-}
-
-fn write_session_clear_backup(
-    session: &Session,
-    session_path: &Path,
-) -> Result<PathBuf, Box<dyn std::error::Error>> {
-    let backup_path = session_clear_backup_path(session_path);
-    session.save_to_path(&backup_path)?;
-    Ok(backup_path)
-}
-
-fn session_clear_backup_path(session_path: &Path) -> PathBuf {
-    let timestamp = std::time::SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .ok()
-        .map_or(0, |duration| duration.as_millis());
-    let file_name = session_path
-        .file_name()
-        .and_then(|value| value.to_str())
-        .unwrap_or("session.jsonl");
-    session_path.with_file_name(format!("{file_name}.before-clear-{timestamp}.bak"))
-}
-
-fn render_repl_help() -> String {
-    [
-        "REPL".to_string(),
-        "  /exit                Quit the REPL".to_string(),
-        "  /quit                Quit the REPL".to_string(),
-        "  Up/Down              Navigate prompt history".to_string(),
-        "  Ctrl-R               Reverse-search prompt history".to_string(),
-        "  Tab                  Complete commands, modes, and recent sessions".to_string(),
-        "  Ctrl-C               Clear input (or exit on empty prompt)".to_string(),
-        "  Shift+Enter/Ctrl+J   Insert a newline".to_string(),
-        "  Auto-save            .claw/sessions/<session-id>.jsonl".to_string(),
-        "  Resume latest        /resume latest".to_string(),
-        "  Browse sessions      /session list".to_string(),
-        "  Show prompt history  /history [count]".to_string(),
-        String::new(),
-        render_slash_command_help_filtered(STUB_COMMANDS),
-    ]
-    .join(
-        "
-",
-    )
-}
-
 fn print_status_snapshot(
     model: &str,
     model_flag_raw: Option<&str>,
@@ -5440,7 +4575,13 @@ fn print_status_snapshot(
     match output_format {
         CliOutputFormat::Text => println!(
             "{}",
-            format_status_report(&provenance.resolved, usage, permission_mode.as_str(), &context, Some(&provenance))
+            format_status_report(
+                &provenance.resolved,
+                usage,
+                permission_mode.as_str(),
+                &context,
+                Some(&provenance)
+            )
         ),
         CliOutputFormat::Json => println!(
             "{}",
@@ -5454,287 +4595,6 @@ fn print_status_snapshot(
         ),
     }
     Ok(())
-}
-
-fn status_json_value(
-    model: Option<&str>,
-    usage: StatusUsage,
-    permission_mode: &str,
-    context: &StatusContext,
-    // #148: optional provenance for `model` field. Surfaces `model_source`
-    // ("flag" | "env" | "config" | "default") and `model_raw` (user input
-    // before alias resolution, or null when source is "default"). Callers
-    // that don't have provenance (legacy resume paths) pass None, in which
-    // case both new fields are omitted.
-    provenance: Option<&ModelProvenance>,
-) -> serde_json::Value {
-    // #143: top-level `status` marker so claws can distinguish
-    // a clean run from a degraded run (config parse failed but other fields
-    // are still populated). `config_load_error` carries the parse-error string
-    // when present; it's a string rather than a typed object in Phase 1 and
-    // will join the typed-error taxonomy in Phase 2 (ROADMAP §4.44).
-    let degraded = context.config_load_error.is_some();
-    let model_source = provenance.map(|p| p.source.as_str());
-    let model_raw = provenance.and_then(|p| p.raw.clone());
-    json!({
-        "kind": "status",
-        "status": if degraded { "degraded" } else { "ok" },
-        "config_load_error": context.config_load_error,
-        "model": model,
-        "model_source": model_source,
-        "model_raw": model_raw,
-        "permission_mode": permission_mode,
-        "usage": {
-            "messages": usage.message_count,
-            "turns": usage.turns,
-            "latest_total": usage.latest.total_tokens(),
-            "cumulative_input": usage.cumulative.input_tokens,
-            "cumulative_output": usage.cumulative.output_tokens,
-            "cumulative_total": usage.cumulative.total_tokens(),
-            "estimated_tokens": usage.estimated_tokens,
-        },
-        "workspace": {
-            "cwd": context.cwd,
-            "project_root": context.project_root,
-            "git_branch": context.git_branch,
-            "git_state": context.git_summary.headline(),
-            "changed_files": context.git_summary.changed_files,
-            "staged_files": context.git_summary.staged_files,
-            "unstaged_files": context.git_summary.unstaged_files,
-            "untracked_files": context.git_summary.untracked_files,
-            "session": context.session_path.as_ref().map_or_else(|| "live-repl".to_string(), |path| path.display().to_string()),
-            "session_id": context.session_path.as_ref().and_then(|path| {
-                // Session files are named <session-id>.jsonl directly under
-                // .claw/sessions/. Extract the stem (drop the .jsonl extension).
-                path.file_stem().map(|n| n.to_string_lossy().into_owned())
-            }),
-            "loaded_config_files": context.loaded_config_files,
-            "discovered_config_files": context.discovered_config_files,
-            "memory_file_count": context.memory_file_count,
-        },
-        "sandbox": {
-            "enabled": context.sandbox_status.enabled,
-            "active": context.sandbox_status.active,
-            "supported": context.sandbox_status.supported,
-            "in_container": context.sandbox_status.in_container,
-            "requested_namespace": context.sandbox_status.requested.namespace_restrictions,
-            "active_namespace": context.sandbox_status.namespace_active,
-            "requested_network": context.sandbox_status.requested.network_isolation,
-            "active_network": context.sandbox_status.network_active,
-            "filesystem_mode": context.sandbox_status.filesystem_mode.as_str(),
-            "filesystem_active": context.sandbox_status.filesystem_active,
-            "allowed_mounts": context.sandbox_status.allowed_mounts,
-            "markers": context.sandbox_status.container_markers,
-            "fallback_reason": context.sandbox_status.fallback_reason,
-        }
-    })
-}
-
-fn status_context(
-    session_path: Option<&Path>,
-) -> Result<StatusContext, Box<dyn std::error::Error>> {
-    let cwd = env::current_dir()?;
-    let loader = ConfigLoader::default_for(&cwd);
-    let discovered_config_files = loader.discover().len();
-    // #143: degrade gracefully on config parse failure rather than hard-fail.
-    // `claw doctor` already does this; `claw status` now matches that contract
-    // so that one malformed `mcpServers.*` entry doesn't take down the whole
-    // health surface (workspace, git, model, permission, sandbox can still be
-    // reported independently).
-    let (loaded_config_files, sandbox_status, config_load_error) = match loader.load() {
-        Ok(runtime_config) => (
-            runtime_config.loaded_entries().len(),
-            resolve_sandbox_status(runtime_config.sandbox(), &cwd),
-            None,
-        ),
-        Err(err) => (
-            0,
-            // Fall back to defaults for sandbox resolution so claws still see
-            // a populated sandbox section instead of a missing field. Defaults
-            // produce the same output as a runtime config with no sandbox
-            // overrides, which is the right degraded-mode shape: we cannot
-            // report what the user *intended*, only what is actually in effect.
-            resolve_sandbox_status(&runtime::SandboxConfig::default(), &cwd),
-            Some(err.to_string()),
-        ),
-    };
-    let project_context = ProjectContext::discover_with_git(&cwd, DEFAULT_DATE)?;
-    let (project_root, git_branch) =
-        parse_git_status_metadata(project_context.git_status.as_deref());
-    let git_summary = parse_git_workspace_summary(project_context.git_status.as_deref());
-    Ok(StatusContext {
-        cwd,
-        session_path: session_path.map(Path::to_path_buf),
-        loaded_config_files,
-        discovered_config_files,
-        memory_file_count: project_context.instruction_files.len(),
-        project_root,
-        git_branch,
-        git_summary,
-        sandbox_status,
-        config_load_error,
-    })
-}
-
-fn format_status_report(
-    model: &str,
-    usage: StatusUsage,
-    permission_mode: &str,
-    context: &StatusContext,
-    // #148: optional model provenance to surface in a `Model source` line.
-    // Callers without provenance (legacy resume paths) pass None and the
-    // source line is omitted for backward compat.
-    provenance: Option<&ModelProvenance>,
-) -> String {
-    // #143: if config failed to parse, surface a degraded banner at the top
-    // of the text report so humans see the parse error before the body, while
-    // the body below still reports everything that could be resolved without
-    // config (workspace, git, sandbox defaults, etc.).
-    let status_line = if context.config_load_error.is_some() {
-        "Status (degraded)"
-    } else {
-        "Status"
-    };
-    let mut blocks: Vec<String> = Vec::new();
-    if let Some(err) = context.config_load_error.as_deref() {
-        blocks.push(format!(
-            "Config load error\n  Status           fail\n  Summary          runtime config failed to load; reporting partial status\n  Details          {err}\n  Hint             `claw doctor` classifies config parse errors; fix the listed field and rerun"
-        ));
-    }
-    // #148: render Model source line after Model, showing where the string
-    // came from (flag / env / config / default) and the raw input if any.
-    let model_source_line = provenance
-        .map(|p| match &p.raw {
-            Some(raw) if raw != model => {
-                format!("\n  Model source     {} (raw: {raw})", p.source.as_str())
-            }
-            Some(_) => format!("\n  Model source     {}", p.source.as_str()),
-            None => format!("\n  Model source     {}", p.source.as_str()),
-        })
-        .unwrap_or_default();
-    blocks.extend([
-        format!(
-            "{status_line}
-  Model            {model}{model_source_line}
-  Permission mode  {permission_mode}
-  Messages         {}
-  Turns            {}
-  Estimated tokens {}",
-            usage.message_count, usage.turns, usage.estimated_tokens,
-        ),
-        format!(
-            "Usage
-  Latest total     {}
-  Cumulative input {}
-  Cumulative output {}
-  Cumulative total {}",
-            usage.latest.total_tokens(),
-            usage.cumulative.input_tokens,
-            usage.cumulative.output_tokens,
-            usage.cumulative.total_tokens(),
-        ),
-        format!(
-            "Workspace
-  Cwd              {}
-  Project root     {}
-  Git branch       {}
-  Git state        {}
-  Changed files    {}
-  Staged           {}
-  Unstaged         {}
-  Untracked        {}
-  Session          {}
-  Config files     loaded {}/{}
-  Memory files     {}
-  Suggested flow   /status → /diff → /commit",
-            context.cwd.display(),
-            context
-                .project_root
-                .as_ref()
-                .map_or_else(|| "unknown".to_string(), |path| path.display().to_string()),
-            context.git_branch.as_deref().unwrap_or("unknown"),
-            context.git_summary.headline(),
-            context.git_summary.changed_files,
-            context.git_summary.staged_files,
-            context.git_summary.unstaged_files,
-            context.git_summary.untracked_files,
-            context.session_path.as_ref().map_or_else(
-                || "live-repl".to_string(),
-                |path| path.display().to_string()
-            ),
-            context.loaded_config_files,
-            context.discovered_config_files,
-            context.memory_file_count,
-        ),
-        format_sandbox_report(&context.sandbox_status),
-    ]);
-    blocks.join("\n\n")
-}
-
-fn format_sandbox_report(status: &runtime::SandboxStatus) -> String {
-    format!(
-        "Sandbox
-  Enabled           {}
-  Active            {}
-  Supported         {}
-  In container      {}
-  Requested ns      {}
-  Active ns         {}
-  Requested net     {}
-  Active net        {}
-  Filesystem mode   {}
-  Filesystem active {}
-  Allowed mounts    {}
-  Markers           {}
-  Fallback reason   {}",
-        status.enabled,
-        status.active,
-        status.supported,
-        status.in_container,
-        status.requested.namespace_restrictions,
-        status.namespace_active,
-        status.requested.network_isolation,
-        status.network_active,
-        status.filesystem_mode.as_str(),
-        status.filesystem_active,
-        if status.allowed_mounts.is_empty() {
-            "<none>".to_string()
-        } else {
-            status.allowed_mounts.join(", ")
-        },
-        if status.container_markers.is_empty() {
-            "<none>".to_string()
-        } else {
-            status.container_markers.join(", ")
-        },
-        status
-            .fallback_reason
-            .clone()
-            .unwrap_or_else(|| "<none>".to_string()),
-    )
-}
-
-fn format_commit_preflight_report(branch: Option<&str>, summary: GitWorkspaceSummary) -> String {
-    format!(
-        "Commit
-  Result           ready
-  Branch           {}
-  Workspace        {}
-  Changed files    {}
-  Action           create a git commit from the current workspace changes",
-        branch.unwrap_or("unknown"),
-        summary.headline(),
-        summary.changed_files,
-    )
-}
-
-fn format_commit_skipped_report() -> String {
-    "Commit
-  Result           skipped
-  Reason           no workspace changes
-  Action           create a git commit from the current workspace changes
-  Next             /status to inspect context · /diff to inspect repo changes"
-        .to_string()
 }
 
 fn print_sandbox_status_snapshot(
@@ -5754,25 +4614,6 @@ fn print_sandbox_status_snapshot(
         ),
     }
     Ok(())
-}
-
-fn sandbox_json_value(status: &runtime::SandboxStatus) -> serde_json::Value {
-    json!({
-        "kind": "sandbox",
-        "enabled": status.enabled,
-        "active": status.active,
-        "supported": status.supported,
-        "in_container": status.in_container,
-        "requested_namespace": status.requested.namespace_restrictions,
-        "active_namespace": status.namespace_active,
-        "requested_network": status.requested.network_isolation,
-        "active_network": status.network_active,
-        "filesystem_mode": status.filesystem_mode.as_str(),
-        "filesystem_active": status.filesystem_active,
-        "allowed_mounts": status.allowed_mounts,
-        "markers": status.container_markers,
-        "fallback_reason": status.fallback_reason,
-    })
 }
 
 fn render_help_topic(topic: LocalHelpTopic) -> String {
@@ -5859,10 +4700,6 @@ fn render_help_topic(topic: LocalHelpTopic) -> String {
   Related          claw doctor · claw status"
             .to_string(),
     }
-}
-
-fn print_help_topic(topic: LocalHelpTopic) {
-    println!("{}", render_help_topic(topic));
 }
 
 fn print_acp_status(output_format: CliOutputFormat) -> Result<(), Box<dyn std::error::Error>> {
@@ -6114,15 +4951,6 @@ fn init_json_value(report: &crate::init::InitReport, message: &str) -> serde_jso
         "next_step": crate::init::InitReport::NEXT_STEP,
         "message": message,
     })
-}
-
-fn normalize_permission_mode(mode: &str) -> Option<&'static str> {
-    match mode.trim() {
-        "read-only" => Some("read-only"),
-        "workspace-write" => Some("workspace-write"),
-        "danger-full-access" => Some("danger-full-access"),
-        _ => None,
-    }
 }
 
 fn render_diff_report() -> Result<String, Box<dyn std::error::Error>> {
@@ -6414,32 +5242,6 @@ fn write_temp_text_file(
 
 const DEFAULT_HISTORY_LIMIT: usize = 20;
 
-fn parse_history_count(raw: Option<&str>) -> Result<usize, String> {
-    let Some(raw) = raw else {
-        return Ok(DEFAULT_HISTORY_LIMIT);
-    };
-    let parsed: usize = raw
-        .parse()
-        .map_err(|_| format!("history: invalid count '{raw}'. Expected a positive integer."))?;
-    if parsed == 0 {
-        return Err("history: count must be greater than 0.".to_string());
-    }
-    Ok(parsed)
-}
-
-fn format_history_timestamp(timestamp_ms: u64) -> String {
-    let secs = timestamp_ms / 1_000;
-    let subsec_ms = timestamp_ms % 1_000;
-    let days_since_epoch = secs / 86_400;
-    let seconds_of_day = secs % 86_400;
-    let hours = seconds_of_day / 3_600;
-    let minutes = (seconds_of_day % 3_600) / 60;
-    let seconds = seconds_of_day % 60;
-
-    let (year, month, day) = civil_from_days(i64::try_from(days_since_epoch).unwrap_or(0));
-    format!("{year:04}-{month:02}-{day:02}T{hours:02}:{minutes:02}:{seconds:02}.{subsec_ms:03}Z")
-}
-
 // Computes civil (Gregorian) year/month/day from days since the Unix epoch
 // (1970-01-01) using Howard Hinnant's `civil_from_days` algorithm.
 #[allow(
@@ -6447,82 +5249,6 @@ fn format_history_timestamp(timestamp_ms: u64) -> String {
     clippy::cast_possible_wrap,
     clippy::cast_possible_truncation
 )]
-fn civil_from_days(days: i64) -> (i32, u32, u32) {
-    let z = days + 719_468;
-    let era = if z >= 0 {
-        z / 146_097
-    } else {
-        (z - 146_096) / 146_097
-    };
-    let doe = (z - era * 146_097) as u64; // [0, 146_096]
-    let yoe = (doe - doe / 1_460 + doe / 36_524 - doe / 146_096) / 365; // [0, 399]
-    let y = yoe as i64 + era * 400;
-    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100); // [0, 365]
-    let mp = (5 * doy + 2) / 153; // [0, 11]
-    let d = doy - (153 * mp + 2) / 5 + 1; // [1, 31]
-    let m = if mp < 10 { mp + 3 } else { mp - 9 }; // [1, 12]
-    let y = y + i64::from(m <= 2);
-    (y as i32, m as u32, d as u32)
-}
-
-fn render_prompt_history_report(entries: &[PromptHistoryEntry], limit: usize) -> String {
-    if entries.is_empty() {
-        return "Prompt history\n  Result           no prompts recorded yet".to_string();
-    }
-
-    let total = entries.len();
-    let start = total.saturating_sub(limit);
-    let shown = &entries[start..];
-    let mut lines = vec![
-        "Prompt history".to_string(),
-        format!("  Total            {total}"),
-        format!("  Showing          {} most recent", shown.len()),
-        format!("  Reverse search   Ctrl-R in the REPL"),
-        String::new(),
-    ];
-    for (offset, entry) in shown.iter().enumerate() {
-        let absolute_index = start + offset + 1;
-        let timestamp = format_history_timestamp(entry.timestamp_ms);
-        let first_line = entry.text.lines().next().unwrap_or("").trim();
-        let display = if first_line.chars().count() > 80 {
-            let truncated: String = first_line.chars().take(77).collect();
-            format!("{truncated}...")
-        } else {
-            first_line.to_string()
-        };
-        lines.push(format!("  {absolute_index:>3}. [{timestamp}] {display}"));
-    }
-    lines.join("\n")
-}
-
-fn collect_session_prompt_history(session: &Session) -> Vec<PromptHistoryEntry> {
-    if !session.prompt_history.is_empty() {
-        return session
-            .prompt_history
-            .iter()
-            .map(|entry| PromptHistoryEntry {
-                timestamp_ms: entry.timestamp_ms,
-                text: entry.text.clone(),
-            })
-            .collect();
-    }
-    let timestamp_ms = session.updated_at_ms;
-    session
-        .messages
-        .iter()
-        .filter(|message| message.role == MessageRole::User)
-        .filter_map(|message| {
-            message.blocks.iter().find_map(|block| match block {
-                ContentBlock::Text { text } => Some(PromptHistoryEntry {
-                    timestamp_ms,
-                    text: text.clone(),
-                }),
-                _ => None,
-            })
-        })
-        .collect()
-}
-
 fn recent_user_context(session: &Session, limit: usize) -> String {
     let requests = session
         .messages
@@ -6670,17 +5396,6 @@ fn resolve_export_path(
 }
 
 const SESSION_MARKDOWN_TOOL_SUMMARY_LIMIT: usize = 280;
-
-fn summarize_tool_payload_for_markdown(payload: &str) -> String {
-    let compact = match serde_json::from_str::<serde_json::Value>(payload) {
-        Ok(value) => value.to_string(),
-        Err(_) => payload.split_whitespace().collect::<Vec<_>>().join(" "),
-    };
-    if compact.is_empty() {
-        return String::new();
-    }
-    truncate_for_summary(&compact, SESSION_MARKDOWN_TOOL_SUMMARY_LIMIT)
-}
 
 fn run_export(
     session_reference: &str,
@@ -7738,97 +6453,6 @@ fn request_ends_with_tool_result(request: &ApiRequest) -> bool {
         .is_some_and(|message| message.role == MessageRole::Tool)
 }
 
-fn format_user_visible_api_error(session_id: &str, error: &api::ApiError) -> String {
-    if error.is_context_window_failure() {
-        format_context_window_blocked_error(session_id, error)
-    } else if error.is_generic_fatal_wrapper() {
-        let mut qualifiers = vec![format!("session {session_id}")];
-        if let Some(request_id) = error.request_id() {
-            qualifiers.push(format!("trace {request_id}"));
-        }
-        format!(
-            "{} ({}): {}",
-            error.safe_failure_class(),
-            qualifiers.join(", "),
-            error
-        )
-    } else {
-        error.to_string()
-    }
-}
-
-fn format_context_window_blocked_error(session_id: &str, error: &api::ApiError) -> String {
-    let mut lines = vec![
-        "Context window blocked".to_string(),
-        "  Failure class    context_window_blocked".to_string(),
-        format!("  Session          {session_id}"),
-    ];
-
-    if let Some(request_id) = error.request_id() {
-        lines.push(format!("  Trace            {request_id}"));
-    }
-
-    match error {
-        api::ApiError::ContextWindowExceeded {
-            model,
-            estimated_input_tokens,
-            requested_output_tokens,
-            estimated_total_tokens,
-            context_window_tokens,
-        } => {
-            lines.push(format!("  Model            {model}"));
-            lines.push(format!(
-                "  Input estimate   ~{estimated_input_tokens} tokens (heuristic)"
-            ));
-            lines.push(format!(
-                "  Requested output {requested_output_tokens} tokens"
-            ));
-            lines.push(format!(
-                "  Total estimate   ~{estimated_total_tokens} tokens (heuristic)"
-            ));
-            lines.push(format!("  Context window   {context_window_tokens} tokens"));
-        }
-        api::ApiError::Api { message, body, .. } => {
-            let detail = message.as_deref().unwrap_or(body).trim();
-            if !detail.is_empty() {
-                lines.push(format!(
-                    "  Detail           {}",
-                    truncate_for_summary(detail, 120)
-                ));
-            }
-        }
-        api::ApiError::RetriesExhausted { last_error, .. } => {
-            let detail = match last_error.as_ref() {
-                api::ApiError::Api { message, body, .. } => message.as_deref().unwrap_or(body),
-                other => return format_context_window_blocked_error(session_id, other),
-            }
-            .trim();
-            if !detail.is_empty() {
-                lines.push(format!(
-                    "  Detail           {}",
-                    truncate_for_summary(detail, 120)
-                ));
-            }
-        }
-        _ => {}
-    }
-
-    lines.push(String::new());
-    lines.push("Recovery".to_string());
-    lines.push("  Compact          /compact".to_string());
-    lines.push(format!(
-        "  Resume compact   claw --resume {session_id} /compact"
-    ));
-    lines.push("  Fresh session    /clear --confirm".to_string());
-    lines.push(
-        "  Reduce scope     remove large pasted context/files or ask for a smaller slice"
-            .to_string(),
-    );
-    lines.push("  Retry            rerun after compacting or reducing the request".to_string());
-
-    lines.join("\n")
-}
-
 fn final_assistant_text(summary: &runtime::TurnSummary) -> String {
     summary
         .assistant_messages
@@ -8017,521 +6641,12 @@ const STUB_COMMANDS: &[&str] = &[
     "agent",
 ];
 
-fn slash_command_completion_candidates_with_sessions(
-    model: &str,
-    active_session_id: Option<&str>,
-    recent_session_ids: Vec<String>,
-) -> Vec<String> {
-    let mut completions = BTreeSet::new();
-
-    for spec in slash_command_specs() {
-        if STUB_COMMANDS.contains(&spec.name) {
-            continue;
-        }
-        completions.insert(format!("/{}", spec.name));
-        for alias in spec.aliases {
-            if !STUB_COMMANDS.contains(alias) {
-                completions.insert(format!("/{alias}"));
-            }
-        }
-    }
-
-    for candidate in [
-        "/bughunter ",
-        "/clear --confirm",
-        "/config ",
-        "/config env",
-        "/config hooks",
-        "/config model",
-        "/config plugins",
-        "/mcp ",
-        "/mcp list",
-        "/mcp show ",
-        "/export ",
-        "/issue ",
-        "/model ",
-        "/model opus",
-        "/model sonnet",
-        "/model haiku",
-        "/permissions ",
-        "/permissions read-only",
-        "/permissions workspace-write",
-        "/permissions danger-full-access",
-        "/plugin list",
-        "/plugin install ",
-        "/plugin enable ",
-        "/plugin disable ",
-        "/plugin uninstall ",
-        "/plugin update ",
-        "/plugins list",
-        "/pr ",
-        "/resume ",
-        "/session list",
-        "/session switch ",
-        "/session fork ",
-        "/teleport ",
-        "/ultraplan ",
-        "/agents help",
-        "/mcp help",
-        "/skills help",
-    ] {
-        completions.insert(candidate.to_string());
-    }
-
-    if !model.trim().is_empty() {
-        completions.insert(format!("/model {}", resolve_model_alias(model)));
-        completions.insert(format!("/model {model}"));
-    }
-
-    if let Some(active_session_id) = active_session_id.filter(|value| !value.trim().is_empty()) {
-        completions.insert(format!("/resume {active_session_id}"));
-        completions.insert(format!("/session switch {active_session_id}"));
-    }
-
-    for session_id in recent_session_ids
-        .into_iter()
-        .filter(|value| !value.trim().is_empty())
-        .take(10)
-    {
-        completions.insert(format!("/resume {session_id}"));
-        completions.insert(format!("/session switch {session_id}"));
-    }
-
-    completions.into_iter().collect()
-}
-
-fn format_tool_call_start(name: &str, input: &str) -> String {
-    let parsed: serde_json::Value =
-        serde_json::from_str(input).unwrap_or(serde_json::Value::String(input.to_string()));
-
-    let detail = match name {
-        "bash" | "Bash" => format_bash_call(&parsed),
-        "read_file" | "Read" => {
-            let path = extract_tool_path(&parsed);
-            format!("\x1b[2m📄 Reading {path}…\x1b[0m")
-        }
-        "write_file" | "Write" => {
-            let path = extract_tool_path(&parsed);
-            let lines = parsed
-                .get("content")
-                .and_then(|value| value.as_str())
-                .map_or(0, |content| content.lines().count());
-            format!("\x1b[1;32m✏️ Writing {path}\x1b[0m \x1b[2m({lines} lines)\x1b[0m")
-        }
-        "edit_file" | "Edit" => {
-            let path = extract_tool_path(&parsed);
-            let old_value = parsed
-                .get("old_string")
-                .or_else(|| parsed.get("oldString"))
-                .and_then(|value| value.as_str())
-                .unwrap_or_default();
-            let new_value = parsed
-                .get("new_string")
-                .or_else(|| parsed.get("newString"))
-                .and_then(|value| value.as_str())
-                .unwrap_or_default();
-            format!(
-                "\x1b[1;33m📝 Editing {path}\x1b[0m{}",
-                format_patch_preview(old_value, new_value)
-                    .map(|preview| format!("\n{preview}"))
-                    .unwrap_or_default()
-            )
-        }
-        "glob_search" | "Glob" => format_search_start("🔎 Glob", &parsed),
-        "grep_search" | "Grep" => format_search_start("🔎 Grep", &parsed),
-        "web_search" | "WebSearch" => parsed
-            .get("query")
-            .and_then(|value| value.as_str())
-            .unwrap_or("?")
-            .to_string(),
-        _ => summarize_tool_payload(input),
-    };
-
-    let border = "─".repeat(name.len() + 8);
-    format!(
-        "\x1b[38;5;245m╭─ \x1b[1;36m{name}\x1b[0;38;5;245m ─╮\x1b[0m\n\x1b[38;5;245m│\x1b[0m {detail}\n\x1b[38;5;245m╰{border}╯\x1b[0m"
-    )
-}
-
-fn format_tool_result(name: &str, output: &str, is_error: bool) -> String {
-    let icon = if is_error {
-        "\x1b[1;31m✗\x1b[0m"
-    } else {
-        "\x1b[1;32m✓\x1b[0m"
-    };
-    if is_error {
-        let summary = truncate_for_summary(output.trim(), 160);
-        return if summary.is_empty() {
-            format!("{icon} \x1b[38;5;245m{name}\x1b[0m")
-        } else {
-            format!("{icon} \x1b[38;5;245m{name}\x1b[0m\n\x1b[38;5;203m{summary}\x1b[0m")
-        };
-    }
-
-    let parsed: serde_json::Value =
-        serde_json::from_str(output).unwrap_or(serde_json::Value::String(output.to_string()));
-    match name {
-        "bash" | "Bash" => format_bash_result(icon, &parsed),
-        "read_file" | "Read" => format_read_result(icon, &parsed),
-        "write_file" | "Write" => format_write_result(icon, &parsed),
-        "edit_file" | "Edit" => format_edit_result(icon, &parsed),
-        "glob_search" | "Glob" => format_glob_result(icon, &parsed),
-        "grep_search" | "Grep" => format_grep_result(icon, &parsed),
-        _ => format_generic_tool_result(icon, name, &parsed),
-    }
-}
-
 const DISPLAY_TRUNCATION_NOTICE: &str =
     "\x1b[2m… output truncated for display; full result preserved in session.\x1b[0m";
 const READ_DISPLAY_MAX_LINES: usize = 80;
 const READ_DISPLAY_MAX_CHARS: usize = 6_000;
 const TOOL_OUTPUT_DISPLAY_MAX_LINES: usize = 60;
 const TOOL_OUTPUT_DISPLAY_MAX_CHARS: usize = 4_000;
-
-fn extract_tool_path(parsed: &serde_json::Value) -> String {
-    parsed
-        .get("file_path")
-        .or_else(|| parsed.get("filePath"))
-        .or_else(|| parsed.get("path"))
-        .and_then(|value| value.as_str())
-        .unwrap_or("?")
-        .to_string()
-}
-
-fn format_search_start(label: &str, parsed: &serde_json::Value) -> String {
-    let pattern = parsed
-        .get("pattern")
-        .and_then(|value| value.as_str())
-        .unwrap_or("?");
-    let scope = parsed
-        .get("path")
-        .and_then(|value| value.as_str())
-        .unwrap_or(".");
-    format!("{label} {pattern}\n\x1b[2min {scope}\x1b[0m")
-}
-
-fn format_patch_preview(old_value: &str, new_value: &str) -> Option<String> {
-    if old_value.is_empty() && new_value.is_empty() {
-        return None;
-    }
-    Some(format!(
-        "\x1b[38;5;203m- {}\x1b[0m\n\x1b[38;5;70m+ {}\x1b[0m",
-        truncate_for_summary(first_visible_line(old_value), 72),
-        truncate_for_summary(first_visible_line(new_value), 72)
-    ))
-}
-
-fn format_bash_call(parsed: &serde_json::Value) -> String {
-    let command = parsed
-        .get("command")
-        .and_then(|value| value.as_str())
-        .unwrap_or_default();
-    if command.is_empty() {
-        String::new()
-    } else {
-        format!(
-            "\x1b[48;5;236;38;5;255m $ {} \x1b[0m",
-            truncate_for_summary(command, 160)
-        )
-    }
-}
-
-fn first_visible_line(text: &str) -> &str {
-    text.lines()
-        .find(|line| !line.trim().is_empty())
-        .unwrap_or(text)
-}
-
-fn format_bash_result(icon: &str, parsed: &serde_json::Value) -> String {
-    use std::fmt::Write as _;
-
-    let mut lines = vec![format!("{icon} \x1b[38;5;245mbash\x1b[0m")];
-    if let Some(task_id) = parsed
-        .get("backgroundTaskId")
-        .and_then(|value| value.as_str())
-    {
-        write!(&mut lines[0], " backgrounded ({task_id})").expect("write to string");
-    } else if let Some(status) = parsed
-        .get("returnCodeInterpretation")
-        .and_then(|value| value.as_str())
-        .filter(|status| !status.is_empty())
-    {
-        write!(&mut lines[0], " {status}").expect("write to string");
-    }
-
-    if let Some(stdout) = parsed.get("stdout").and_then(|value| value.as_str()) {
-        if !stdout.trim().is_empty() {
-            lines.push(truncate_output_for_display(
-                stdout,
-                TOOL_OUTPUT_DISPLAY_MAX_LINES,
-                TOOL_OUTPUT_DISPLAY_MAX_CHARS,
-            ));
-        }
-    }
-    if let Some(stderr) = parsed.get("stderr").and_then(|value| value.as_str()) {
-        if !stderr.trim().is_empty() {
-            lines.push(format!(
-                "\x1b[38;5;203m{}\x1b[0m",
-                truncate_output_for_display(
-                    stderr,
-                    TOOL_OUTPUT_DISPLAY_MAX_LINES,
-                    TOOL_OUTPUT_DISPLAY_MAX_CHARS,
-                )
-            ));
-        }
-    }
-
-    lines.join("\n\n")
-}
-
-fn format_read_result(icon: &str, parsed: &serde_json::Value) -> String {
-    let file = parsed.get("file").unwrap_or(parsed);
-    let path = extract_tool_path(file);
-    let start_line = file
-        .get("startLine")
-        .and_then(serde_json::Value::as_u64)
-        .unwrap_or(1);
-    let num_lines = file
-        .get("numLines")
-        .and_then(serde_json::Value::as_u64)
-        .unwrap_or(0);
-    let total_lines = file
-        .get("totalLines")
-        .and_then(serde_json::Value::as_u64)
-        .unwrap_or(num_lines);
-    let content = file
-        .get("content")
-        .and_then(|value| value.as_str())
-        .unwrap_or_default();
-    let end_line = start_line.saturating_add(num_lines.saturating_sub(1));
-
-    format!(
-        "{icon} \x1b[2m📄 Read {path} (lines {}-{} of {})\x1b[0m\n{}",
-        start_line,
-        end_line.max(start_line),
-        total_lines,
-        truncate_output_for_display(content, READ_DISPLAY_MAX_LINES, READ_DISPLAY_MAX_CHARS)
-    )
-}
-
-fn format_write_result(icon: &str, parsed: &serde_json::Value) -> String {
-    let path = extract_tool_path(parsed);
-    let kind = parsed
-        .get("type")
-        .and_then(|value| value.as_str())
-        .unwrap_or("write");
-    let line_count = parsed
-        .get("content")
-        .and_then(|value| value.as_str())
-        .map_or(0, |content| content.lines().count());
-    format!(
-        "{icon} \x1b[1;32m✏️ {} {path}\x1b[0m \x1b[2m({line_count} lines)\x1b[0m",
-        if kind == "create" { "Wrote" } else { "Updated" },
-    )
-}
-
-fn format_structured_patch_preview(parsed: &serde_json::Value) -> Option<String> {
-    let hunks = parsed.get("structuredPatch")?.as_array()?;
-    let mut preview = Vec::new();
-    for hunk in hunks.iter().take(2) {
-        let lines = hunk.get("lines")?.as_array()?;
-        for line in lines.iter().filter_map(|value| value.as_str()).take(6) {
-            match line.chars().next() {
-                Some('+') => preview.push(format!("\x1b[38;5;70m{line}\x1b[0m")),
-                Some('-') => preview.push(format!("\x1b[38;5;203m{line}\x1b[0m")),
-                _ => preview.push(line.to_string()),
-            }
-        }
-    }
-    if preview.is_empty() {
-        None
-    } else {
-        Some(preview.join("\n"))
-    }
-}
-
-fn format_edit_result(icon: &str, parsed: &serde_json::Value) -> String {
-    let path = extract_tool_path(parsed);
-    let suffix = if parsed
-        .get("replaceAll")
-        .and_then(serde_json::Value::as_bool)
-        .unwrap_or(false)
-    {
-        " (replace all)"
-    } else {
-        ""
-    };
-    let preview = format_structured_patch_preview(parsed).or_else(|| {
-        let old_value = parsed
-            .get("oldString")
-            .and_then(|value| value.as_str())
-            .unwrap_or_default();
-        let new_value = parsed
-            .get("newString")
-            .and_then(|value| value.as_str())
-            .unwrap_or_default();
-        format_patch_preview(old_value, new_value)
-    });
-
-    match preview {
-        Some(preview) => format!("{icon} \x1b[1;33m📝 Edited {path}{suffix}\x1b[0m\n{preview}"),
-        None => format!("{icon} \x1b[1;33m📝 Edited {path}{suffix}\x1b[0m"),
-    }
-}
-
-fn format_glob_result(icon: &str, parsed: &serde_json::Value) -> String {
-    let num_files = parsed
-        .get("numFiles")
-        .and_then(serde_json::Value::as_u64)
-        .unwrap_or(0);
-    let filenames = parsed
-        .get("filenames")
-        .and_then(|value| value.as_array())
-        .map(|files| {
-            files
-                .iter()
-                .filter_map(|value| value.as_str())
-                .take(8)
-                .collect::<Vec<_>>()
-                .join("\n")
-        })
-        .unwrap_or_default();
-    if filenames.is_empty() {
-        format!("{icon} \x1b[38;5;245mglob_search\x1b[0m matched {num_files} files")
-    } else {
-        format!("{icon} \x1b[38;5;245mglob_search\x1b[0m matched {num_files} files\n{filenames}")
-    }
-}
-
-fn format_grep_result(icon: &str, parsed: &serde_json::Value) -> String {
-    let num_matches = parsed
-        .get("numMatches")
-        .and_then(serde_json::Value::as_u64)
-        .unwrap_or(0);
-    let num_files = parsed
-        .get("numFiles")
-        .and_then(serde_json::Value::as_u64)
-        .unwrap_or(0);
-    let content = parsed
-        .get("content")
-        .and_then(|value| value.as_str())
-        .unwrap_or_default();
-    let filenames = parsed
-        .get("filenames")
-        .and_then(|value| value.as_array())
-        .map(|files| {
-            files
-                .iter()
-                .filter_map(|value| value.as_str())
-                .take(8)
-                .collect::<Vec<_>>()
-                .join("\n")
-        })
-        .unwrap_or_default();
-    let summary = format!(
-        "{icon} \x1b[38;5;245mgrep_search\x1b[0m {num_matches} matches across {num_files} files"
-    );
-    if !content.trim().is_empty() {
-        format!(
-            "{summary}\n{}",
-            truncate_output_for_display(
-                content,
-                TOOL_OUTPUT_DISPLAY_MAX_LINES,
-                TOOL_OUTPUT_DISPLAY_MAX_CHARS,
-            )
-        )
-    } else if !filenames.is_empty() {
-        format!("{summary}\n{filenames}")
-    } else {
-        summary
-    }
-}
-
-fn format_generic_tool_result(icon: &str, name: &str, parsed: &serde_json::Value) -> String {
-    let rendered_output = match parsed {
-        serde_json::Value::String(text) => text.clone(),
-        serde_json::Value::Null => String::new(),
-        serde_json::Value::Object(_) | serde_json::Value::Array(_) => {
-            serde_json::to_string_pretty(parsed).unwrap_or_else(|_| parsed.to_string())
-        }
-        _ => parsed.to_string(),
-    };
-    let preview = truncate_output_for_display(
-        &rendered_output,
-        TOOL_OUTPUT_DISPLAY_MAX_LINES,
-        TOOL_OUTPUT_DISPLAY_MAX_CHARS,
-    );
-
-    if preview.is_empty() {
-        format!("{icon} \x1b[38;5;245m{name}\x1b[0m")
-    } else if preview.contains('\n') {
-        format!("{icon} \x1b[38;5;245m{name}\x1b[0m\n{preview}")
-    } else {
-        format!("{icon} \x1b[38;5;245m{name}:\x1b[0m {preview}")
-    }
-}
-
-fn summarize_tool_payload(payload: &str) -> String {
-    let compact = match serde_json::from_str::<serde_json::Value>(payload) {
-        Ok(value) => value.to_string(),
-        Err(_) => payload.trim().to_string(),
-    };
-    truncate_for_summary(&compact, 96)
-}
-
-fn truncate_for_summary(value: &str, limit: usize) -> String {
-    let mut chars = value.chars();
-    let truncated = chars.by_ref().take(limit).collect::<String>();
-    if chars.next().is_some() {
-        format!("{truncated}…")
-    } else {
-        truncated
-    }
-}
-
-fn truncate_output_for_display(content: &str, max_lines: usize, max_chars: usize) -> String {
-    let original = content.trim_end_matches('\n');
-    if original.is_empty() {
-        return String::new();
-    }
-
-    let mut preview_lines = Vec::new();
-    let mut used_chars = 0usize;
-    let mut truncated = false;
-
-    for (index, line) in original.lines().enumerate() {
-        if index >= max_lines {
-            truncated = true;
-            break;
-        }
-
-        let newline_cost = usize::from(!preview_lines.is_empty());
-        let available = max_chars.saturating_sub(used_chars + newline_cost);
-        if available == 0 {
-            truncated = true;
-            break;
-        }
-
-        let line_chars = line.chars().count();
-        if line_chars > available {
-            preview_lines.push(line.chars().take(available).collect::<String>());
-            truncated = true;
-            break;
-        }
-
-        preview_lines.push(line.to_string());
-        used_chars += newline_cost + line_chars;
-    }
-
-    let mut preview = preview_lines.join("\n");
-    if truncated {
-        if !preview.is_empty() {
-            preview.push('\n');
-        }
-        preview.push_str(DISPLAY_TRUNCATION_NOTICE);
-    }
-    preview
-}
 
 fn render_thinking_block_summary(
     out: &mut (impl Write + ?Sized),
@@ -8831,160 +6946,6 @@ fn convert_messages(messages: &[ConversationMessage]) -> Vec<InputMessage> {
         .collect()
 }
 
-#[allow(clippy::too_many_lines)]
-fn print_help_to(out: &mut impl Write) -> io::Result<()> {
-    writeln!(out, "claw v{VERSION}")?;
-    writeln!(out)?;
-    writeln!(out, "Usage:")?;
-    writeln!(
-        out,
-        "  claw [--model MODEL] [--allowedTools TOOL[,TOOL...]]"
-    )?;
-    writeln!(out, "      Start the interactive REPL")?;
-    writeln!(
-        out,
-        "  claw [--model MODEL] [--output-format text|json] prompt TEXT"
-    )?;
-    writeln!(out, "      Send one prompt and exit")?;
-    writeln!(
-        out,
-        "  claw [--model MODEL] [--output-format text|json] TEXT"
-    )?;
-    writeln!(out, "      Shorthand non-interactive prompt mode")?;
-    writeln!(
-        out,
-        "  claw --resume [SESSION.jsonl|session-id|latest] [/status] [/compact] [...]"
-    )?;
-    writeln!(
-        out,
-        "      Inspect or maintain a saved session without entering the REPL"
-    )?;
-    writeln!(out, "  claw help")?;
-    writeln!(out, "      Alias for --help")?;
-    writeln!(out, "  claw version")?;
-    writeln!(out, "      Alias for --version")?;
-    writeln!(out, "  claw status")?;
-    writeln!(
-        out,
-        "      Show the current local workspace status snapshot"
-    )?;
-    writeln!(out, "  claw sandbox")?;
-    writeln!(out, "      Show the current sandbox isolation snapshot")?;
-    writeln!(out, "  claw doctor")?;
-    writeln!(
-        out,
-        "      Diagnose local auth, config, workspace, and sandbox health"
-    )?;
-    writeln!(out, "  claw acp [serve]")?;
-    writeln!(
-        out,
-        "      Show ACP/Zed editor integration status (currently unsupported; aliases: --acp, -acp)"
-    )?;
-    writeln!(out, "      Source of truth: {OFFICIAL_REPO_SLUG}")?;
-    writeln!(
-        out,
-        "      Warning: do not `{DEPRECATED_INSTALL_COMMAND}` (deprecated stub)"
-    )?;
-    writeln!(out, "  claw dump-manifests [--manifests-dir PATH]")?;
-    writeln!(out, "  claw bootstrap-plan")?;
-    writeln!(out, "  claw agents")?;
-    writeln!(out, "  claw mcp")?;
-    writeln!(out, "  claw skills")?;
-    writeln!(out, "  claw system-prompt [--cwd PATH] [--date YYYY-MM-DD]")?;
-    writeln!(out, "  claw init")?;
-    writeln!(
-        out,
-        "  claw export [PATH] [--session SESSION] [--output PATH]"
-    )?;
-    writeln!(
-        out,
-        "      Dump the latest (or named) session as markdown; writes to PATH or stdout"
-    )?;
-    writeln!(out)?;
-    writeln!(out, "Flags:")?;
-    writeln!(
-        out,
-        "  --model MODEL              Override the active model"
-    )?;
-    writeln!(
-        out,
-        "  --output-format FORMAT     Non-interactive output format: text or json"
-    )?;
-    writeln!(
-        out,
-        "  --compact                  Strip tool call details; print only the final assistant text (text mode only; useful for piping)"
-    )?;
-    writeln!(
-        out,
-        "  --permission-mode MODE     Set read-only, workspace-write, or danger-full-access"
-    )?;
-    writeln!(
-        out,
-        "  --dangerously-skip-permissions  Skip all permission checks"
-    )?;
-    writeln!(out, "  --allowedTools TOOLS       Restrict enabled tools (repeatable; comma-separated aliases supported)")?;
-    writeln!(
-        out,
-        "  --version, -V              Print version and build information locally"
-    )?;
-    writeln!(out)?;
-    writeln!(out, "Interactive slash commands:")?;
-    writeln!(out, "{}", render_slash_command_help_filtered(STUB_COMMANDS))?;
-    writeln!(out)?;
-    let resume_commands = resume_supported_slash_commands()
-        .into_iter()
-        .map(|spec| match spec.argument_hint {
-            Some(argument_hint) => format!("/{} {}", spec.name, argument_hint),
-            None => format!("/{}", spec.name),
-        })
-        .collect::<Vec<_>>()
-        .join(", ");
-    writeln!(out, "Resume-safe commands: {resume_commands}")?;
-    writeln!(out)?;
-    writeln!(out, "Session shortcuts:")?;
-    writeln!(
-        out,
-        "  REPL turns auto-save to .claw/sessions/<session-id>.{PRIMARY_SESSION_EXTENSION}"
-    )?;
-    writeln!(
-        out,
-        "  Use `{LATEST_SESSION_REFERENCE}` with --resume, /resume, or /session switch to target the newest saved session"
-    )?;
-    writeln!(
-        out,
-        "  Use /session list in the REPL to browse managed sessions"
-    )?;
-    writeln!(out, "Examples:")?;
-    writeln!(out, "  claw --model claude-opus \"summarize this repo\"")?;
-    writeln!(
-        out,
-        "  claw --output-format json prompt \"explain src/main.rs\""
-    )?;
-    writeln!(out, "  claw --compact \"summarize Cargo.toml\" | wc -l")?;
-    writeln!(
-        out,
-        "  claw --allowedTools read,glob \"summarize Cargo.toml\""
-    )?;
-    writeln!(out, "  claw --resume {LATEST_SESSION_REFERENCE}")?;
-    writeln!(
-        out,
-        "  claw --resume {LATEST_SESSION_REFERENCE} /status /diff /export notes.txt"
-    )?;
-    writeln!(out, "  claw agents")?;
-    writeln!(out, "  claw mcp show my-server")?;
-    writeln!(out, "  claw /skills")?;
-    writeln!(out, "  claw doctor")?;
-    writeln!(out, "  source of truth: {OFFICIAL_REPO_URL}")?;
-    writeln!(
-        out,
-        "  do not run `{DEPRECATED_INSTALL_COMMAND}` — it installs a deprecated stub"
-    )?;
-    writeln!(out, "  claw init")?;
-    writeln!(out, "  claw export")?;
-    writeln!(out, "  claw export conversation.md")?;
-    Ok(())
-}
-
 fn print_help(output_format: CliOutputFormat) -> Result<(), Box<dyn std::error::Error>> {
     let mut buffer = Vec::new();
     print_help_to(&mut buffer)?;
@@ -9006,26 +6967,24 @@ fn print_help(output_format: CliOutputFormat) -> Result<(), Box<dyn std::error::
 mod tests {
     use super::{
         build_runtime_plugin_state_with_loader, build_runtime_with_plugin_state,
-        collect_session_prompt_history, create_managed_session_handle, describe_tool_progress,
-        filter_tool_specs, format_bughunter_report, format_commit_preflight_report,
-        format_commit_skipped_report, format_compact_report, format_connected_line,
-        format_cost_report, format_history_timestamp, format_internal_prompt_progress_line,
-        format_issue_report, format_model_report, format_model_switch_report,
-        format_permissions_report, format_permissions_switch_report, format_pr_report,
-        format_resume_report, format_status_report, format_tool_call_start, format_tool_result,
-        format_ultraplan_report, format_unknown_slash_command,
+        classify_error_kind, collect_session_prompt_history, create_managed_session_handle,
+        describe_tool_progress, filter_tool_specs, format_bughunter_report,
+        format_commit_preflight_report, format_commit_skipped_report, format_compact_report,
+        format_connected_line, format_cost_report, format_history_timestamp,
+        format_internal_prompt_progress_line, format_issue_report, format_model_report,
+        format_model_switch_report, format_permissions_report, format_permissions_switch_report,
+        format_pr_report, format_resume_report, format_status_report, format_tool_call_start,
+        format_tool_result, format_ultraplan_report, format_unknown_slash_command,
         format_unknown_slash_command_message, format_user_visible_api_error,
-        classify_error_kind,
         merge_prompt_with_stdin, normalize_permission_mode, parse_args, parse_export_args,
         parse_git_status_branch, parse_git_status_metadata_for, parse_git_workspace_summary,
         parse_history_count, permission_policy, print_help_to, push_output_block,
-        render_config_report, render_diff_report, render_diff_report_for, render_memory_report,
-        split_error_hint,
-        render_help_topic, render_prompt_history_report, render_repl_help, render_resume_usage,
+        render_config_report, render_diff_report, render_diff_report_for, render_help_topic,
+        render_memory_report, render_prompt_history_report, render_repl_help, render_resume_usage,
         render_session_markdown, resolve_model_alias, resolve_model_alias_with_config,
         resolve_repl_model, resolve_session_reference, response_to_events,
         resume_supported_slash_commands, run_resume_command, short_tool_id,
-        slash_command_completion_candidates_with_sessions, status_context,
+        slash_command_completion_candidates_with_sessions, split_error_hint, status_context,
         summarize_tool_payload_for_markdown, try_resolve_bare_skill_prompt, validate_no_args,
         write_mcp_server_fixture, CliAction, CliOutputFormat, CliToolExecutor, GitWorkspaceSummary,
         InternalPromptProgressEvent, InternalPromptProgressState, LiveCli, LocalHelpTopic,
@@ -10006,8 +7965,8 @@ mod tests {
         // with a specific error instead of falling through to the prompt
         // path (where they surface a misleading "missing Anthropic
         // credentials" error or burn API tokens on an empty prompt).
-        let empty_err = parse_args(&["".to_string()])
-            .expect_err("empty positional arg should be rejected");
+        let empty_err =
+            parse_args(&["".to_string()]).expect_err("empty positional arg should be rejected");
         assert!(
             empty_err.starts_with("empty prompt:"),
             "empty-arg error should be specific, got: {empty_err}"
@@ -10224,7 +8183,8 @@ mod tests {
         .expect("write malformed .claw.json");
 
         let context = with_current_dir(&cwd, || {
-            super::status_context(None).expect("status_context should not hard-fail on config parse errors (#143)")
+            super::status_context(None)
+                .expect("status_context should not hard-fail on config parse errors (#143)")
         });
 
         // Phase 1 contract: config_load_error is populated with the parse error.
@@ -10261,7 +8221,8 @@ mod tests {
             cumulative: runtime::TokenUsage::default(),
             estimated_tokens: 0,
         };
-        let json = super::status_json_value(Some("test-model"), usage, "workspace-write", &context, None);
+        let json =
+            super::status_json_value(Some("test-model"), usage, "workspace-write", &context, None);
         assert_eq!(
             json.get("status").and_then(|v| v.as_str()),
             Some("degraded"),
@@ -10278,8 +8239,14 @@ mod tests {
             json.get("model").and_then(|v| v.as_str()),
             Some("test-model")
         );
-        assert!(json.get("workspace").is_some(), "workspace field still reported");
-        assert!(json.get("sandbox").is_some(), "sandbox field still reported");
+        assert!(
+            json.get("workspace").is_some(),
+            "workspace field still reported"
+        );
+        assert!(
+            json.get("sandbox").is_some(),
+            "sandbox field still reported"
+        );
 
         // Clean path: no config error → status: "ok", config_load_error: null.
         let clean_cwd = root.join("project-with-clean-config");
@@ -10288,8 +8255,13 @@ mod tests {
             super::status_context(None).expect("clean status_context should succeed")
         });
         assert!(clean_context.config_load_error.is_none());
-        let clean_json =
-            super::status_json_value(Some("test-model"), usage, "workspace-write", &clean_context, None);
+        let clean_json = super::status_json_value(
+            Some("test-model"),
+            usage,
+            "workspace-write",
+            &clean_context,
+            None,
+        );
         assert_eq!(
             clean_json.get("status").and_then(|v| v.as_str()),
             Some("ok"),
@@ -10388,11 +8360,18 @@ mod tests {
         // Other unrecognized args should NOT trigger the --json hint.
         let err_other = parse_args(&["doctor".to_string(), "garbage".to_string()])
             .expect_err("`doctor garbage` should fail without --json hint");
-        assert!(!err_other.contains("--output-format json"),
-            "unrelated args should not trigger --json hint: {err_other}");
+        assert!(
+            !err_other.contains("--output-format json"),
+            "unrelated args should not trigger --json hint: {err_other}"
+        );
         // #154: model syntax error should hint at provider prefix when applicable
-        let err_gpt = parse_args(&["prompt".to_string(), "test".to_string(), "--model".to_string(), "gpt-4".to_string()])
-            .expect_err("`--model gpt-4` should fail with OpenAI hint");
+        let err_gpt = parse_args(&[
+            "prompt".to_string(),
+            "test".to_string(),
+            "--model".to_string(),
+            "gpt-4".to_string(),
+        ])
+        .expect_err("`--model gpt-4` should fail with OpenAI hint");
         assert!(
             err_gpt.contains("Did you mean `openai/gpt-4`?"),
             "GPT model error should hint openai/ prefix: {err_gpt}"
@@ -10401,8 +8380,13 @@ mod tests {
             err_gpt.contains("OPENAI_API_KEY"),
             "GPT model error should mention env var: {err_gpt}"
         );
-        let err_qwen = parse_args(&["prompt".to_string(), "test".to_string(), "--model".to_string(), "qwen-plus".to_string()])
-            .expect_err("`--model qwen-plus` should fail with DashScope hint");
+        let err_qwen = parse_args(&[
+            "prompt".to_string(),
+            "test".to_string(),
+            "--model".to_string(),
+            "qwen-plus".to_string(),
+        ])
+        .expect_err("`--model qwen-plus` should fail with DashScope hint");
         assert!(
             err_qwen.contains("Did you mean `qwen/qwen-plus`?"),
             "Qwen model error should hint qwen/ prefix: {err_qwen}"
@@ -10412,8 +8396,13 @@ mod tests {
             "Qwen model error should mention env var: {err_qwen}"
         );
         // Unrelated invalid model should NOT get a hint
-        let err_garbage = parse_args(&["prompt".to_string(), "test".to_string(), "--model".to_string(), "asdfgh".to_string()])
-            .expect_err("`--model asdfgh` should fail");
+        let err_garbage = parse_args(&[
+            "prompt".to_string(),
+            "test".to_string(),
+            "--model".to_string(),
+            "asdfgh".to_string(),
+        ])
+        .expect_err("`--model asdfgh` should fail");
         assert!(
             !err_garbage.contains("Did you mean"),
             "Unrelated model errors should not get a hint: {err_garbage}"
@@ -10423,15 +8412,42 @@ mod tests {
     #[test]
     fn classify_error_kind_returns_correct_discriminants() {
         // #77: error kind classification for JSON error payloads
-        assert_eq!(classify_error_kind("missing Anthropic credentials; export ..."), "missing_credentials");
-        assert_eq!(classify_error_kind("no worker state file found at /tmp/..."), "missing_worker_state");
-        assert_eq!(classify_error_kind("session not found: abc123"), "session_not_found");
-        assert_eq!(classify_error_kind("failed to restore session: no managed sessions found"), "session_load_failed");
-        assert_eq!(classify_error_kind("unrecognized argument `--foo` for subcommand `doctor`"), "cli_parse");
-        assert_eq!(classify_error_kind("invalid model syntax: 'gpt-4'. Expected ..."), "invalid_model_syntax");
-        assert_eq!(classify_error_kind("unsupported resumed command: /blargh"), "unsupported_resumed_command");
-        assert_eq!(classify_error_kind("api failed after 3 attempts: ..."), "api_http_error");
-        assert_eq!(classify_error_kind("something completely unknown"), "unknown");
+        assert_eq!(
+            classify_error_kind("missing Anthropic credentials; export ..."),
+            "missing_credentials"
+        );
+        assert_eq!(
+            classify_error_kind("no worker state file found at /tmp/..."),
+            "missing_worker_state"
+        );
+        assert_eq!(
+            classify_error_kind("session not found: abc123"),
+            "session_not_found"
+        );
+        assert_eq!(
+            classify_error_kind("failed to restore session: no managed sessions found"),
+            "session_load_failed"
+        );
+        assert_eq!(
+            classify_error_kind("unrecognized argument `--foo` for subcommand `doctor`"),
+            "cli_parse"
+        );
+        assert_eq!(
+            classify_error_kind("invalid model syntax: 'gpt-4'. Expected ..."),
+            "invalid_model_syntax"
+        );
+        assert_eq!(
+            classify_error_kind("unsupported resumed command: /blargh"),
+            "unsupported_resumed_command"
+        );
+        assert_eq!(
+            classify_error_kind("api failed after 3 attempts: ..."),
+            "api_http_error"
+        );
+        assert_eq!(
+            classify_error_kind("something completely unknown"),
+            "unknown"
+        );
     }
 
     #[test]
@@ -10902,7 +8918,6 @@ mod tests {
         assert!(report.contains("Use /help"));
     }
 
-
     #[test]
     fn typoed_doctor_subcommand_returns_did_you_mean_error() {
         let error = parse_args(&["doctorr".to_string()]).expect_err("doctorr should error");
@@ -10984,7 +8999,6 @@ mod tests {
             }
         );
     }
-
 
     #[test]
     fn punctuation_bearing_single_token_still_dispatches_to_prompt() {
