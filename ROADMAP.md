@@ -12876,3 +12876,182 @@ assert!(translated[0].get("is_error").is_none());    // signal vanished on the w
 **Status:** Open. No code changed. Filed 2026-04-25 19:00 KST. Branch: feat/jobdori-168c-emission-routing. HEAD: ba3a34d. Sibling chain: #201/#202/#203/#204/#206/#207. Closes the OpenAI-compat boundary audit started at #201 (inbound silent fallback) and locked at #207 (inbound silent drop) — #208 covers the outbound silent strip side.
 
 🪨
+
+## Pinpoint #209 — `pricing_for_model` substring-matches haiku/opus/sonnet only; every other model silently falls back to a `default_sonnet_tier` constant that is itself populated with **Opus pricing values**, producing 5x-wrong cost estimates with no fallback signal in the event stream (Jobdori, cycle #361 / extends #204 + #207 cost-parity cluster to the runtime/pricing layer / anomalyco/opencode `models.dev` parity gap)
+
+**Observed:** `rust/crates/runtime/src/usage.rs` carries a model-pricing lookup that:
+
+1. Knows only three model families by ASCII-lowercase substring match: `haiku`, `opus`, `sonnet`
+2. Has a `default_sonnet_tier` constructor whose constants are actually Anthropic **Opus** pricing (15.0/75.0/18.75/1.5 per million tokens), not Sonnet (3.0/15.0/3.75/0.30)
+3. Returns `None` from `pricing_for_model` for every non-Anthropic model (gpt-*, o1*, o3*, o4*, kimi-*, qwen-*, qwq-*, grok-*, dashscope/*) which then falls through to `default_sonnet_tier` — i.e. Opus pricing under a Sonnet-named function
+4. Provides exactly one consumer-visible signal that fallback occurred: a literal string `" pricing=estimated-default"` appended to one summary line — no `StreamEvent` variant, no log field, no `claw doctor` surface, no JSON envelope key
+
+**Source sites:**
+
+```rust
+// rust/crates/runtime/src/usage.rs:3-6
+const DEFAULT_INPUT_COST_PER_MILLION: f64 = 15.0;        // Opus pricing
+const DEFAULT_OUTPUT_COST_PER_MILLION: f64 = 75.0;       // Opus pricing
+const DEFAULT_CACHE_CREATION_COST_PER_MILLION: f64 = 18.75;  // Opus pricing
+const DEFAULT_CACHE_READ_COST_PER_MILLION: f64 = 1.5;    // Opus pricing
+
+// rust/crates/runtime/src/usage.rs:19-26 — function name says "sonnet" but values are Opus
+impl ModelPricing {
+    pub const fn default_sonnet_tier() -> Self {
+        Self {
+            input_cost_per_million: DEFAULT_INPUT_COST_PER_MILLION,    // 15.0 — Opus
+            output_cost_per_million: DEFAULT_OUTPUT_COST_PER_MILLION,  // 75.0 — Opus
+            cache_creation_cost_per_million: DEFAULT_CACHE_CREATION_COST_PER_MILLION,
+            cache_read_cost_per_million: DEFAULT_CACHE_READ_COST_PER_MILLION,
+        }
+    }
+}
+
+// rust/crates/runtime/src/usage.rs:59-81 — three substring matches, then None
+pub fn pricing_for_model(model: &str) -> Option<ModelPricing> {
+    let normalized = model.to_ascii_lowercase();
+    if normalized.contains("haiku") { return Some(/* haiku pricing */); }
+    if normalized.contains("opus")  { return Some(/* opus pricing */); }
+    if normalized.contains("sonnet") { return Some(ModelPricing::default_sonnet_tier()); }
+    None    // every other model: gpt-*, o1*, kimi-*, qwen-*, grok-*, ...
+}
+
+// rust/crates/runtime/src/usage.rs:93-96 — fallback path
+pub fn estimate_cost_usd(self) -> UsageCostEstimate {
+    self.estimate_cost_usd_with_pricing(ModelPricing::default_sonnet_tier())
+}
+```
+
+Real Anthropic published pricing (2026 list price): Sonnet 4 is **$3 / $15** per million input/output, Opus is **$15 / $75** per million. The `default_sonnet_tier` constructor returns `15.0 / 75.0` — that is **Opus pricing labeled as Sonnet**, a 5x discrepancy on input and output, 5x on cache write, 5x on cache read. The function name is a lie about what the function returns.
+
+**Blast radius (verified by `grep -rn "pricing_for_model\|estimate_cost_usd\|default_sonnet_tier" --include="*.rs"`):**
+
+- `api/src/types.rs:201-204` — `Usage::estimated_cost_usd(model)` calls `pricing_for_model(model)` and falls back to `usage.estimate_cost_usd()` (sonnet-name/opus-values default) when the model is unknown
+- `api/src/providers/anthropic.rs:326-333` — telemetry events emit `estimated_cost_usd` as a `format_usd(...)` string by calling `response.usage.estimated_cost_usd(&response.model).total_cost_usd()`. Telemetry consumers see a properly-formatted dollar amount that is *wrong by 5x* for any non-haiku/opus/sonnet model with no flag indicating the fallback
+- `rusty-claude-cli/src/main.rs:4717-4722` — session-summary JSON output emits `"estimated_cost": format_usd(...)` using `pricing_for_model(...).unwrap_or_else(runtime::ModelPricing::default_sonnet_tier)`. The JSON key is `estimated_cost` with no sibling `pricing_source` field, no `is_estimated` flag, no `model_known_to_pricing_table` boolean
+- `runtime/src/usage.rs:118-145` — `summary_lines_for_model` is the *only* call site that surfaces fallback at all, and it does so via a magic-string suffix (`" pricing=estimated-default"`) on a single human-readable line. JSON-shaped consumers never see it
+
+**Gap:**
+
+1. **Silent 5x cost mis-estimation for every non-Anthropic model.** The fallback path's `default_sonnet_tier` constants are Anthropic Opus pricing (15.0/75.0/18.75/1.5). For a kimi-k2.5 session (real list ~$0.15/$2.50 per million on Moonshot), claw-code reports cost using $15/$75 — **a ~10x to ~100x overstatement** depending on which tokens dominated. For a gpt-4o session ($2.50/$10), reports overstate by ~6x to ~7.5x. For an o1 reasoning session ($15/$60), reports are off by a smaller but still misleading factor and miss the reasoning-token premium entirely (sibling #204 not yet wired here).
+
+2. **Function name lies.** `default_sonnet_tier` returns Opus pricing constants. The word "Sonnet" appears in the function name, the call sites that fall through to it, and the test (`pricing_for_model("claude-haiku-4-5-20251001").expect("haiku pricing")` at line 273), but the values returned are Opus. This is a self-documenting bug: the source claims one thing while doing another. Pinpoint #200 already locked the principle that declarative claims must derive from source — this is a same-shape violation but at the runtime/pricing layer rather than the schema/comment layer.
+
+3. **No event signal that fallback occurred.** `grep -rn "pricing_fallback\|cost_estimated\|pricing_unknown\|pricing_source" rust/crates/` returns zero hits. The `StreamEvent` enum (`api/src/types.rs:259`) has six content variants and no diagnostic variants. A claw consuming the SSE stream cannot distinguish "cost is correct" from "cost is a default-tier guess based on Opus prices." Same anti-pattern as the silent-strip cluster (#201/#202/#203/#206/#207/#208) — wrong layer, same shape.
+
+4. **Magic-string-only fallback signal in the summary path.** The lone fallback signal is a string suffix appended to a summary line: `" pricing=estimated-default"` (`runtime/src/usage.rs:128-134`). It is:
+   - **String-shaped, not enum-shaped** — consumers must regex over a human-readable line
+   - **Lossy** — the fallback distinction ("sonnet substring matched" vs "completely unknown model") collapses into one suffix token
+   - **Absent from JSON paths** — `rusty-claude-cli` JSON output and `anthropic.rs` telemetry events have no equivalent field
+   - **Inconsistent with itself** — the suffix appears only when `model.is_some()`; calling `usage.estimate_cost_usd()` directly (no model) silently uses the same Opus values with no signal whatsoever
+
+5. **Substring matching swallows model-family ambiguity.** `"contains(\"sonnet\")"` matches `"claude-3-5-sonnet"`, `"claude-sonnet-4-6"`, `"my-fine-tuned-sonnet-clone"`, and any third-party model that happens to include the token. The pricing table has no version awareness — Sonnet 3, Sonnet 3.5, Sonnet 4, Sonnet 4.5, Sonnet 4.6 all return the same constants. Sonnet 4 is $3/$15; if Anthropic raises Sonnet 5 to $4/$20 tomorrow, the table still returns $3/$15 for `"sonnet"`-containing model strings with no diagnostic.
+
+6. **No pricing data source.** Anomalyco/opencode (parity reference) uses an external pricing data file (`models.dev`) that updates as providers publish new prices, with explicit fallback metadata when a model id isn't found (`{ provider: "unknown", reason: "not_in_pricing_table" }`). claw-code embeds four `f64` constants and three string-substring matches in source. There is no path to add gpt-5.2, o3, kimi-k2.5, qwen3-max, grok-3, or any future model without source modifications, and no path to mark a session's pricing data as stale or estimated.
+
+7. **Tests assert numeric equality, not pricing-source visibility.** `usage_with_known_model_uses_specific_pricing` (line 273) asserts that `haiku_cost.input_cost_usd != opus_cost.input_cost_usd`. No test asserts that an unknown-model session emits a `pricing_unknown` or `pricing_estimated` event. No test catches the `default_sonnet_tier` constants being Opus values — the test for default fallback would *correctly* assert that an unknown model produces 15.0-rate pricing, baking the bug into the contract.
+
+**Repro:**
+
+```rust
+use runtime::{pricing_for_model, ModelPricing, TokenUsage};
+
+// 1. The function name lies about what it returns
+let sonnet_tier = ModelPricing::default_sonnet_tier();
+assert_eq!(sonnet_tier.input_cost_per_million, 15.0);    // <- this is Opus, not Sonnet
+assert_eq!(sonnet_tier.output_cost_per_million, 75.0);   // <- this is Opus, not Sonnet
+// Real Anthropic Sonnet 4 list: $3 / $15. The constants are wrong by 5x.
+
+// 2. Every non-Anthropic model silently falls back
+assert!(pricing_for_model("gpt-4o").is_none());
+assert!(pricing_for_model("gpt-5.2").is_none());
+assert!(pricing_for_model("o1-mini").is_none());
+assert!(pricing_for_model("o3").is_none());
+assert!(pricing_for_model("kimi-k2.5").is_none());
+assert!(pricing_for_model("qwen3-max").is_none());
+assert!(pricing_for_model("qwen-qwq-32b").is_none());
+assert!(pricing_for_model("grok-3-mini").is_none());
+assert!(pricing_for_model("moonshot/kimi-k2.5").is_none());
+assert!(pricing_for_model("dashscope/qwen3-max").is_none());
+
+// 3. The fallback produces wrong-by-5x costs with no flag
+let usage = TokenUsage { input_tokens: 1_000_000, output_tokens: 1_000_000,
+                          cache_creation_input_tokens: 0, cache_read_input_tokens: 0 };
+let cost = usage.estimate_cost_usd();   // model not passed in; uses default_sonnet_tier
+assert_eq!(cost.input_cost_usd, 15.0);  // Opus values, not Sonnet
+assert_eq!(cost.output_cost_usd, 75.0);
+assert_eq!(cost.total_cost_usd(), 90.0);
+// Real Sonnet would be $18 total. Real GPT-4o would be $12.50. Real Kimi K2.5
+// would be ~$2.65. Real Qwen3 would be ~$1-3. claw-code reports $90.
+// No event. No flag. No diagnostic. Just a wrong number, formatted nicely.
+
+// 4. Telemetry / JSON consumers see only the wrong number
+// rusty-claude-cli/src/main.rs:4717-4722 emits this for a kimi-k2.5 session:
+//   { "estimated_cost": "$90.0000", "usage": { ... } }
+// Real cost was ~$2.65. No `pricing_source` or `is_estimated` field tells the
+// consumer the number is a default-tier guess.
+```
+
+**Verification check:**
+
+- `grep -n "DEFAULT_INPUT_COST_PER_MILLION" rust/crates/runtime/src/usage.rs` returns line 3 — value is 15.0 (Opus list price), not 3.0 (Sonnet list price)
+- `grep -n "default_sonnet_tier" rust/crates/runtime/src/usage.rs` returns line 19 — function name claims Sonnet, body assigns Opus constants
+- `grep -n "contains(\"" rust/crates/runtime/src/usage.rs` returns lines 62/68/76 — only three string-substring branches: haiku/opus/sonnet
+- `grep -rn "pricing_for_model\|estimate_cost_usd\|default_sonnet_tier" --include="*.rs" rust/crates/` enumerates 4 production call sites that all silently fall through to the Opus-constants default
+- `grep -rn "pricing_fallback\|pricing_unknown\|pricing_source\|is_estimated\|cost_estimated" --include="*.rs" rust/crates/` returns zero hits — no diagnostic taxonomy exists
+- `grep -nE "models\.dev\|pricing_table\.json\|external_pricing" rust/crates/` returns zero hits — no external pricing data source
+- Real published prices for cross-check (verified 2026-04-25 via Anthropic / OpenAI / Moonshot / Alibaba pricing pages):
+  - Anthropic Sonnet 4: $3 / $15 per million → claw-code returns $15 / $75 (5x over)
+  - GPT-4o: $2.50 / $10 → claw-code falls back to $15 / $75 (6x / 7.5x over)
+  - Kimi K2.5: ~$0.15 / $2.50 → claw-code falls back to $15 / $75 (100x / 30x over)
+  - o1: $15 / $60 → claw-code falls back to $15 / $75 (correct input by coincidence, output 1.25x over, reasoning tokens lost via #204)
+
+**Expected:**
+
+- The constant misnomer is fixed: either rename `default_sonnet_tier` to `default_opus_tier` (matches values) or change the constants to actual Sonnet pricing (3.0/15.0/3.75/0.30) and rename appropriately. Pick one based on what the design *should* fall back to.
+- A `PricingSource` enum is introduced: `Known { provider, family }`, `EstimatedFallback { reason }`, `Unknown { model }`. Every cost-emitting path carries a `PricingSource` alongside the `UsageCostEstimate`.
+- `pricing_for_model` returns `(ModelPricing, PricingSource)` instead of `Option<ModelPricing>` so the source is never lost on the way to the consumer.
+- An external pricing data file (`pricing_table.json` or analog of `models.dev`) lists known models with full pricing tuples. Source modification is not required to add a new model. Stale-table detection (`generated_at` + claw doctor warning) is stretch.
+- A `StreamEvent::PricingFallback` (or sibling diagnostic event) variant emits when a session resolves to `EstimatedFallback` or `Unknown`. Schema: `{ model: String, pricing_source: PricingSource, fallback_constants: ModelPricing }`.
+- All JSON-shaped consumers (`rusty-claude-cli` session output, `anthropic.rs` telemetry) gain an `"is_estimated_pricing": bool` and `"pricing_source": "..."` sibling alongside `estimated_cost_usd`.
+- `claw doctor --json` reports the active session's model, the matched pricing entry (or fallback), and a list of unknown models seen in recent sessions so operators can prioritize pricing-table updates.
+- SCHEMAS.md gains a "Cost-estimation truthfulness" section enumerating the pricing table, the fallback policy, and the diagnostic event taxonomy.
+- Tests assert source visibility, not just numeric equality: `unknown_model_emits_pricing_fallback_event`, `kimi_session_reports_pricing_source_estimated`, `default_tier_constants_match_function_name`.
+- The misnomer test is the most important: a single assertion that the function whose name contains "sonnet" returns Sonnet pricing — currently impossible to add without exposing the bug.
+
+**Fix sketch:**
+
+1. Decide which way to fix the misnomer. Recommended: rename `default_sonnet_tier` → `default_unknown_tier` and document that it is a deliberate "don't underestimate cost" guard (Opus values picked so that operators see *bigger* numbers than reality, not smaller — failing safe). Then the constants stay at 15/75/18.75/1.5 but the name no longer lies. ~10 LOC.
+2. Introduce `PricingSource { Known { family: &'static str }, Fallback { reason: FallbackReason } }` in `runtime/src/usage.rs`. ~30 LOC.
+3. Change `pricing_for_model` to return `(ModelPricing, PricingSource)`; update the four call sites to plumb the source through. ~40 LOC across four files.
+4. Add `StreamEvent::PricingResolved(PricingResolvedEvent)` (or sibling diagnostic) emitting `{ model, pricing_source }` once per session at first cost calculation. ~50 LOC including SCHEMAS.md.
+5. Add `pricing_source` and `is_estimated_pricing` fields to all JSON-shaped consumers (`rusty-claude-cli` session output, `anthropic.rs` telemetry events). ~25 LOC.
+6. Stretch: factor pricing constants out of source into `runtime/src/pricing_table.toml` (or `.json`), embed at build time via `include_str!`, with `pricing_for_model` reading the parsed table. ~120 LOC; opens the door to runtime override and external table updates.
+7. Stretch: `claw doctor --pricing` subcommand reports table coverage, recent unknown-model encounters, and pricing-source distribution across active sessions. ~60 LOC.
+8. Tests: add three regressions — `default_unknown_tier_constants_match_real_opus_list`, `non_anthropic_model_returns_fallback_pricing_source`, `pricing_resolved_event_emitted_once_per_session`. The first test would have caught the misnomer if it had existed. ~70 LOC test additions.
+
+**Why this matters for clawability:**
+
+- **Cost-parity cluster extension.** #204 documented that reasoning_tokens are silently merged into output_tokens (token visibility gap). #207 documented that `OpenAiUsage::cached_tokens` and `reasoning_tokens` are deserialized then thrown away (cache visibility gap). #209 documents that even the tokens that *do* survive get costed through a pricing function that lies about its own name and silently falls back to the wrong tier for every non-Anthropic model. Together, the three cover the full cost-truthfulness pipeline: token emission → token preservation → cost estimation. Any one of them un-fixed leaves the dashboard wrong.
+- **Principle #2 ("Truth is split across layers").** Cost truth is currently split between `runtime/src/usage.rs` (constants), `api/src/providers/anthropic.rs` (telemetry emission), `rusty-claude-cli/src/main.rs` (JSON envelope), and the magic-string suffix in `summary_lines_for_model`. None of those layers carries a `pricing_source` field. A consumer trying to compose a true cost view has to inspect every layer and guess.
+- **Principle #3 ("Events are too log-shaped").** The lone fallback signal (`" pricing=estimated-default"` suffix) is the *most* log-shaped possible: a substring of a human-readable string. A claw cannot reliably condition on this without regex parsing. The fix is to lift it into an enum at the source.
+- **Principle #4 ("Recovery loops are too manual").** When cost overruns, the operator's first question is "is this real or is it a default-tier estimate?" Today the only way to answer is to read source. With `pricing_source` plumbed through, recovery loops can branch automatically: if `pricing_source == Fallback`, treat the cost number as advisory and pull real pricing from the provider's reconciliation report.
+- **anomalyco/opencode parity.** The reference implementation pulls from `models.dev` with explicit fallback metadata. claw-code's three-substring-match-with-Opus-fallback approach is a clear parity gap. The cluster extends: #204 is parity with anomalyco/opencode #24233 (reasoning tokens); #207 is parity sibling (cache details); #209 is parity at the pricing-data-source layer.
+- **Misnomer is the kind of bug that compounds.** A future contributor reading `default_sonnet_tier` reasonably assumes the values are Sonnet. They use it as the fallback for, say, a new "unknown openai model" path, expecting Sonnet-like pricing. The values are Opus. Every downstream estimate is now off by 5x in the same direction. Locking the rename via test + pinpoint prevents the next person from inheriting the trap.
+- **The misnomer test is the simplest possible regression.** One assertion (`assert_eq!(default_sonnet_tier().input_cost_per_million, real_published_sonnet_price)`) would have caught this on day zero. Adding it now both fixes the bug and prevents recurrence with ~3 LOC. The contract test is cheaper than the bug it would have prevented.
+
+**Acceptance criteria:**
+
+- The function whose name contains "sonnet" either returns Sonnet pricing (3.0/15.0/3.75/0.30) or is renamed (e.g. `default_unknown_tier`)
+- A test asserts the function name and the values agree (e.g. `default_X_tier` returns the published list price for model family X)
+- `pricing_for_model` returns enough information for the consumer to know whether the result is a known match, a substring match, a family default, or a complete fallback
+- All JSON-shaped consumers (rusty-claude-cli session JSON, anthropic.rs telemetry events) carry a `pricing_source` or `is_estimated_pricing` sibling alongside `estimated_cost`
+- A `StreamEvent::PricingResolved` (or sibling diagnostic) variant is emitted at least once per session with the resolved `pricing_source`
+- `claw doctor --json` exposes per-session pricing source for active sessions
+- SCHEMAS.md documents the pricing table, fallback policy, and the diagnostic event taxonomy
+- Regression test asserts: a `gpt-4o` (or any non-haiku/opus/sonnet model) session's JSON output contains both an `estimated_cost` field and a `pricing_source: "fallback"` (or equivalent) field
+- (Stretch) Pricing data lives in an external table that can be updated without source changes; `claw doctor --pricing` reports table coverage and recent unknown-model encounters
+
+**Status:** Open. No code changed. Filed 2026-04-25 19:30 KST. Branch: feat/jobdori-168c-emission-routing. HEAD: c20d033. Cost-parity cluster: #204 (token emission) + #207 (token preservation) + #209 (cost estimation). Sibling-shape cluster (silent-fallback / silent-drop / silent-strip / silent-misnomer at provider boundary): #201/#202/#203/#206/#207/#208/#209 — eight pinpoints, one diagnostic-event refactor closes them all.
+
+🪨
