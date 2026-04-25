@@ -5,14 +5,13 @@
 
 use std::collections::HashMap;
 use std::io::{self, BufRead, Write};
-use std::sync::Arc;
 
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
-use crate::event_bus::AgentSessionEvent;
 use crate::session::AgentSession;
 use crate::tool_registry::ToolRegistry;
+use crate::EventBus;
 use crate::SessionTree;
 
 // ---------------------------------------------------------------------------
@@ -54,68 +53,13 @@ struct JsonRpcNotification {
 }
 
 // ---------------------------------------------------------------------------
-// RPC method params
-// ---------------------------------------------------------------------------
-
-#[derive(Debug, Deserialize)]
-#[serde(tag = "method")]
-#[serde(rename_all = "snake_case")]
-enum RpcMethod {
-    #[serde(rename = "session.create")]
-    SessionCreate {
-        #[serde(default = "default_model")]
-        model: String,
-        #[serde(default)]
-        system_prompt: Vec<String>,
-    },
-    #[serde(rename = "session.turn")]
-    SessionTurn {
-        session_id: String,
-        input: String,
-    },
-    #[serde(rename = "session.list")]
-    SessionList,
-    #[serde(rename = "session.destroy")]
-    SessionDestroy {
-        session_id: String,
-    },
-    #[serde(rename = "session.tree.fork")]
-    SessionTreeFork {
-        session_id: String,
-        node_id: String,
-        new_branch_id: String,
-    },
-    #[serde(rename = "session.tree.navigate")]
-    SessionTreeNavigate {
-        session_id: String,
-        node_id: String,
-    },
-    #[serde(rename = "session.tree.path")]
-    SessionTreePath {
-        session_id: String,
-    },
-    #[serde(rename = "events.subscribe")]
-    EventsSubscribe {
-        #[serde(default)]
-        session_id: Option<String>,
-    },
-    #[serde(rename = "ping")]
-    Ping,
-    #[serde(rename = "shutdown")]
-    Shutdown,
-}
-
-fn default_model() -> String {
-    "claude-sonnet-4-6".to_string()
-}
-
-// ---------------------------------------------------------------------------
 // Session state managed by the RPC server
 // ---------------------------------------------------------------------------
 
 struct ManagedSession {
     session: AgentSession,
     tree: SessionTree,
+    event_bus: EventBus,
 }
 
 // ---------------------------------------------------------------------------
@@ -231,7 +175,7 @@ impl<R: BufRead, W: Write> RpcServer<R, W> {
             })
             .unwrap_or_default();
 
-        let (session, _event_bus) = AgentSession::new(
+        let (session, event_bus) = AgentSession::new(
             model,
             system_prompt,
             ToolRegistry::new(),
@@ -244,7 +188,7 @@ impl<R: BufRead, W: Write> RpcServer<R, W> {
         let mut tree = SessionTree::new();
         tree.set_root(&session_id, "system", None);
 
-        let managed = ManagedSession { session, tree };
+        let managed = ManagedSession { session, tree, event_bus };
         self.sessions.insert(session_id.clone(), managed);
 
         Ok(serde_json::json!({
@@ -268,25 +212,16 @@ impl<R: BufRead, W: Write> RpcServer<R, W> {
             .get_mut(session_id)
             .ok_or_else(|| format!("session not found: {session_id}"))?;
 
-        // Add user turn to tree
-        let turn_id = format!("turn-{}", managed.tree.active().map_or(0, |n| {
-            // Count existing children of active node
-            n.children.len()
-        }));
-        if let Some(active_id) = managed.tree.active().map(|n| n.id.clone()) {
-            let _ = managed.tree.add_child(&turn_id, &active_id, "user", Some(input.to_string()));
-        }
-
         match managed.session.run_turn(input) {
             Ok(summary) => {
-                // Add assistant turn to tree
-                let assistant_id = format!("{turn_id}-response");
-                let _ = managed.tree.add_child(
-                    &assistant_id,
-                    &turn_id,
-                    "assistant",
-                    None,
-                );
+                // Add user + assistant turns to tree atomically on success
+                if let Some(active_id) = managed.tree.active().map(|n| n.id.clone()) {
+                    let turn_id = format!("turn-{}", active_id);
+                    if managed.tree.add_child(&turn_id, &active_id, "user", None).is_ok() {
+                        let assistant_id = format!("{turn_id}-response");
+                        let _ = managed.tree.add_child(&assistant_id, &turn_id, "assistant", None);
+                    }
+                }
 
                 Ok(serde_json::json!({
                     "sessionId": session_id,
@@ -294,11 +229,14 @@ impl<R: BufRead, W: Write> RpcServer<R, W> {
                     "tokensUsed": summary.usage.input_tokens + summary.usage.output_tokens,
                 }))
             }
-            Err(e) => Ok(serde_json::json!({
-                "sessionId": session_id,
-                "status": "error",
-                "error": e.to_string(),
-            })),
+            Err(e) => {
+                // Don't modify the tree on failure — active_id stays at the last good node
+                Ok(serde_json::json!({
+                    "sessionId": session_id,
+                    "status": "error",
+                    "error": e.to_string(),
+                }))
+            }
         }
     }
 
@@ -418,43 +356,30 @@ impl<R: BufRead, W: Write> RpcServer<R, W> {
     }
 
     fn handle_events_subscribe(&mut self, params: &Value) -> Result<Value, String> {
-        // In RPC mode, events are streamed as notifications.
-        // For now, we drain any pending events from existing sessions.
+        // In RPC mode, events are drained from the session's event bus
+        // and streamed as JSON-RPC notifications.
         let session_id = params.get("session_id").and_then(|v| v.as_str());
 
-        let mut events = Vec::new();
-
         if let Some(sid) = session_id {
-            // Drain events from specific session
-            if let Some(_managed) = self.sessions.get(sid) {
-                // Note: AgentSession.subscribe() requires &mut self, but we
-                // can't borrow mutably here while sessions are borrowed.
-                // Instead, we report the subscription status.
-                events.push(serde_json::json!({
-                    "event": "subscribed",
-                    "sessionId": sid,
-                }));
+            if let Some(managed) = self.sessions.get_mut(sid) {
+                // Subscribe and drain pending events
+                let sub = managed.event_bus.subscribe();
+                while let Some(event) = sub.try_recv() {
+                    let notification = JsonRpcNotification {
+                        jsonrpc: "2.0".to_string(),
+                        method: "events.stream".to_string(),
+                        params: serde_json::json!({
+                            "event": format!("{event:?}"),
+                            "sessionId": sid,
+                        }),
+                    };
+                    let line = serde_json::to_string(&notification).map_err(|e| e.to_string())?;
+                    writeln!(self.writer, "{line}").map_err(|e| e.to_string())?;
+                }
             }
-        } else {
-            // Subscribe to all sessions
-            events.push(serde_json::json!({
-                "event": "subscribed",
-                "sessionId": null,
-            }));
         }
 
-        // Write events as notifications
-        for event in events {
-            let notification = JsonRpcNotification {
-                jsonrpc: "2.0".to_string(),
-                method: "events.stream".to_string(),
-                params: event,
-            };
-            let line = serde_json::to_string(&notification).map_err(|e| e.to_string())?;
-            writeln!(self.writer, "{line}").map_err(|e| e.to_string())?;
-            self.writer.flush().map_err(|e| e.to_string())?;
-        }
-
+        self.writer.flush().map_err(|e| e.to_string())?;
         Ok(serde_json::json!({"status": "subscribed"}))
     }
 
