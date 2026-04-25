@@ -208,3 +208,14 @@ Claw Code is built in the open alongside the broader UltraWorkers toolchain:
 
 - This repository does **not** claim ownership of the original Claude Code source material.
 - This repository is **not affiliated with, endorsed by, or maintained by Anthropic**.
+
+---
+
+### ☕ Support This Project
+
+Help keep this project going — use a referral link below and both of us get credits!
+
+| Service | Your Bonus | Details |
+|---------|-----------|---------|
+| [**Neuralwatt**](https://portal.neuralwatt.com/auth/register?ref=NW-ROGER-ET3Y) | $10 in credits | Spend $10+ → you get $10, we get $20 |
+| [**Synthetic**](https://synthetic.new/?referral=UAWqkKQQLFkzMkY) | $10 in credits | Subscribe → both get $10 credit (135 req/5hr, 500 tool calls/day) |
