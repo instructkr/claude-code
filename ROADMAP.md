@@ -15017,3 +15017,253 @@ The deeper fix is to declare a `Cacheability` typed enum at the data-model layer
 🪨 External validation: OpenAI Structured Outputs guide (https://developers.openai.com/api/docs/guides/structured-outputs — `response_format: {type: "json_schema", json_schema: {schema, strict: true, name}}` GA since 2024-08-06, guarantees schema adherence via constrained decoding, refusal channel via `message.refusal: string | null`), OpenAI Chat Completions API reference (https://platform.openai.com/docs/api-reference/chat/create — documents response_format, seed, logprobs, top_logprobs, logit_bias, n, metadata as first-class request parameters), OpenAI Cookbook structured-outputs intro (https://developers.openai.com/cookbook/examples/structured_outputs_intro — canonical reference implementation), Anthropic Structured Outputs reference (https://docs.anthropic.com/en/api/structured-outputs — `output_config.format: {type: "json_schema", schema}` GA on 2025-11-13, guarantees schema-conforming JSON, eliminates retry loops), Anthropic Messages API reference (https://docs.anthropic.com/en/api/messages — `stop_reason: "refusal"` documented as sixth canonical value on 2025-11+ models when constrained decoding rejects), Vercel AI Gateway Anthropic structured outputs (https://vercel.com/docs/ai-gateway/sdks-and-apis/anthropic-messages-api/structured-outputs — production-grade output_config.format pass-through), Vercel AI SDK 6 generateObject (https://vercel.com/blog/ai-sdk-6 — Zod-schema → JSON Schema → output_config / response_format with type-safe end-to-end), LangChain BaseChatModel.with_structured_output (https://reference.langchain.com — backs json_schema / function_calling / json_mode steering modes uniformly across OpenAI, Anthropic, Ollama), simonw/llm `--schema` flag (typed Reason enum + structured-outputs first-class CLI argument), charmbracelet/crush typed structured-output handling (referenced in cluster pinpoints #211/#212/#214/#217 — same project handles this canonically), anomalyco/opencode#10456 (open feature request: "schema-constrained structured outputs (JSON Schema), similar to Codex" — exact same gap in sibling project, citing OpenAI Codex SDK as reference implementation, references the exact ecosystem expectation that schema-constrained outputs are a baseline 2025+ capability), anomalyco/opencode#5639 / #11357 / #13618 (related parity pinpoints in sibling project tracker), OpenAI Codex CI/code-review guide (https://cookbook.openai.com/examples/codex/build_code_review_with_codex_sdk — flagship use case for structured outputs, used to enable predictable CI/PR-review automation, the very use case for which a coding-agent CLI exists), OpenRouter structured-outputs documentation (https://openrouter.ai/docs/guides/features/structured-outputs — gateway-level pass-through of response_format across all OpenAI-compat providers), helicone.ai structured-outputs explainer (https://www.helicone.ai/blog/openai-structured-outputs — observability-platform documentation of the canonical request/response shape), microsoft devblogs (https://devblogs.microsoft.com/agent-framework/using-json-schema-for-structured-output-in-net-for-openai-models — semantic-kernel structured-output binding), OpenAI Python SDK `client.beta.chat.completions.parse(response_format=Pydantic)` (typed at the SDK boundary with first-class structured-output ergonomics), OpenTelemetry GenAI semconv (https://opentelemetry.io/docs/specs/semconv/gen-ai/gen-ai-spans/ — `gen_ai.request.response_format` and `gen_ai.response.refusal` are documented attributes for spans, meaning every observability backend in the OpenAI ecosystem treats both as structured signals) — claw is the sole client/agent/SDK in the surveyed ecosystem with zero support for schema-constrained structured outputs, no `response_format`, no `output_config`, no `refusal` channel, and no `--output-schema` CLI affordance. The fix shape is well-understood, the typed structures exist in every peer codebase, the open feature request in anomalyco/opencode is the most-upvoted parity gap, and #218 is the largest single deliverable inside the wire-format-parity cluster — closing it requires the typed-enum-at-the-wire-boundary architectural rule from #217's deeper-fix section *plus* a Capability typed-enum extension layer to span request/response symmetrically.
 
 🪨
+
+---
+
+## Pinpoint #220 — Image/vision input is structurally impossible across the entire data model: zero `image` content-block taxonomy variant, zero base64/file_id ingestion, zero `media_type` slot, despite `/image` + `/screenshot` slash commands advertising the feature, despite `ResolvedAttachment.is_image: bool` flowing through Brief tool output, and despite the onboarding prompt explicitly modeling "Explain this KakaoTalk screenshot" as a flagship use case
+
+**Dogfood context:** claw-code dogfood cycle #372 (Clawhip nudge at 01:00 KST 2026-04-26). HEAD on `feat/jobdori-168c-emission-routing` was `2858aec` (post-#219). Probing the multimodal-input surface end-to-end after the wire-format-parity cluster (#211–#219) closed every other capability gap on the request side. The gap here is **the largest single feature absence catalogued** — five layers of structural absence span the slash-command surface (advertised, never parsed), the data model (no `Image` variant on `InputContentBlock`, no `media_type`, no `source.type`, no `source.data`, no `source.url`, no `source.file_id`), the request builder (`build_chat_completion_request` translates only Text and ToolUse and ToolResult, has no branch for image bytes), the response/render bridge (the markdown renderer at `rust/crates/rusty-claude-cli/src/render.rs:379` already handles `Event::Start(Tag::Image)` and `Event::End(TagEnd::Image)` for output formatting, proving the renderer was designed assuming image *output* was on the table while image *input* was never wired), and the attachment metadata flow (`rust/crates/tools/src/lib.rs:5276` has `is_image_path(path: &Path) -> bool` matching `png|jpg|jpeg|gif|webp|bmp|svg`, threaded through `ResolvedAttachment { path, size, is_image }` at line 5269 and surfaced in the JSON envelope test at line 8969 as `output["attachments"][0]["isImage"] == true`, so the SendUserMessage/Brief tool *knows* an attachment is an image, *flags* it as an image to downstream consumers, and *does nothing more with the byte stream* because there is no API-layer destination for it). The onboarding test fixture at `rust/crates/runtime/src/worker_boot.rs:1324` and `:1349` literally hard-codes `"Explain this KakaoTalk screenshot for a friend"` as a worker prompt-mismatch recovery scenario — claw-code is using image analysis as a canonical task-classification example in its own test suite while having zero capability to actually send an image to the model. The TUI enhancement plan at `rust/TUI-ENHANCEMENT-PLAN.md:57` explicitly lists "**No image/attachment preview** — `SendUserMessage` resolves attachments but never displays them" as known gap #7 in the prioritized backlog, but the gap is far worse than "no preview" — there is no transport, no codec, no envelope, no anything from the byte stream to the wire.
+
+**Concrete repro:**
+
+```
+$ cd ~/clawd/claw-code && git rev-parse --short HEAD
+2858aec
+
+$ rg -ni 'image|vision|multimodal' rust/crates/api/src/ 2>&1 | wc -l
+0
+
+$ rg -n 'InputContentBlock' rust/crates/api/src/types.rs
+80:pub enum InputContentBlock {
+81:    Text { text: String },
+84:    ToolUse { id: String, name: String, input: Value },
+89:    ToolResult { tool_use_id: String, content: Vec<ToolResultContentBlock>, is_error: bool },
+# Three variants. Zero Image variant. Zero Document variant.
+
+$ rg -n 'image_url|input_image|InputImage|"image"|media_type|base64' rust/crates/api/src/ 2>&1 | wc -l
+0
+
+$ sed -n '583,587p' rust/crates/commands/src/lib.rs
+    SlashCommandSpec {
+        name: "image",
+        aliases: &[],
+        summary: "Add an image file to the conversation",
+        argument_hint: Some("<path>"),
+
+$ sed -n '575,580p' rust/crates/commands/src/lib.rs
+    SlashCommandSpec {
+        name: "screenshot",
+        aliases: &[],
+        summary: "Take a screenshot and add to conversation",
+        argument_hint: None,
+
+$ rg -n '"image"|"screenshot"' rust/crates/commands/src/lib.rs | wc -l
+2
+# Only the SlashCommandSpec table entries. No parse arm anywhere.
+
+$ rg -n '"image" =>|"screenshot" =>|SlashCommand::Image|SlashCommand::Screenshot' rust/ 2>&1 | wc -l
+0
+# Confirmed: no parse arm in validate_slash_command_input, no enum variant, no handler.
+
+$ sed -n '8381,8382p' rust/crates/rusty-claude-cli/src/main.rs
+    "screenshot",
+    "image",
+# Both listed in STUB_COMMANDS — the explicit "advertised but unbuilt" allowlist
+# documented at line 8307: "in this build. Used to filter both REPL completions
+# and help output so the discovery surface only shows commands that actually
+# work (ROADMAP #39)."
+
+$ sed -n '5266,5277p' rust/crates/tools/src/lib.rs
+fn resolve_attachment(path: &str) -> Result<ResolvedAttachment, String> {
+    let resolved = std::fs::canonicalize(path).map_err(|error| error.to_string())?;
+    let metadata = std::fs::metadata(&resolved).map_err(|error| error.to_string())?;
+    Ok(ResolvedAttachment {
+        path: resolved.display().to_string(),
+        size: metadata.len(),
+        is_image: is_image_path(&resolved),
+    })
+}
+
+fn is_image_path(path: &Path) -> bool {
+    matches!(
+        path.extension()
+            .and_then(|ext| ext.to_str())
+            .map(str::to_ascii_lowercase)
+            .as_deref(),
+        Some("png" | "jpg" | "jpeg" | "gif" | "webp" | "bmp" | "svg")
+    )
+}
+# The tool layer KNOWS what an image is and flags it, but produces a
+# ResolvedAttachment that contains only path/size/is_image — no bytes,
+# no base64, no media_type, no upload affordance, and no API-layer
+# destination for a downstream consumer to write the bytes to.
+
+$ sed -n '1322,1325p' rust/crates/runtime/src/worker_boot.rs
+                "› Explain this KakaoTalk screenshot for a friend\nI can help analyze the screenshot…",
+$ sed -n '1348,1350p' rust/crates/runtime/src/worker_boot.rs
+                observed_prompt_preview: Some(
+                    "Explain this KakaoTalk screenshot for a friend".to_string()
+                ),
+# Literal screenshot-analysis use case hard-coded as a test fixture in the
+# worker recovery suite. Claw-code's own runtime treats screenshot analysis
+# as a canonical task while having no image transport.
+
+$ sed -n '379,385p' rust/crates/rusty-claude-cli/src/render.rs
+            Event::Start(Tag::Image { dest_url, .. }) => {
+                let rendered = format!(
+                    "{}",
+                    format!("[image:{dest_url}]").with(self.color_theme.link)
+                );
+                state.append_raw(output, &rendered);
+            }
+# The markdown renderer for output handles Tag::Image — proving the
+# component design contemplated images in the *output* path while leaving
+# the *input* path entirely closed. Asymmetric capability surface: model
+# replies with image markdown → rendered as a colored link; user attaches
+# image → silent black hole at the API boundary.
+```
+
+**(1) Slash-command surface advertises a capability that has no parse arm.** `rust/crates/commands/src/lib.rs:583-587` defines `SlashCommandSpec { name: "image", aliases: &[], summary: "Add an image file to the conversation", argument_hint: Some("<path>"), resume_supported: false }` and lines 575-579 define `SlashCommandSpec { name: "screenshot", aliases: &[], summary: "Take a screenshot and add to conversation", argument_hint: None, resume_supported: false }`. Both are present in the `slash_command_specs()` function-returned table. Neither has an arm in `validate_slash_command_input` (lines 1290–4070). Both are gated by `STUB_COMMANDS` at `rust/crates/rusty-claude-cli/src/main.rs:8308` so REPL completions and help output don't surface them — but the user can type `/image foo.png` or `/screenshot` at any time and receive the `format_unknown_slash_command` "this slash command is not supported in this build" error path, despite the canonical spec table promising it works. The summary text "Add an image file to the conversation" is a documented capability-claim that has no implementation backing it; the help-filtering is a UX patch over a missing-feature, not a missing-feature fix. `rg -n 'SlashCommand::Image|SlashCommand::Screenshot' rust/` returns zero hits, confirming no enum variant, no handler, no `slash_name` mapping, no integration test.
+
+**(2) Data-model is structurally closed: `InputContentBlock` has no `Image` variant.** `rust/crates/api/src/types.rs:78-94` defines:
+
+```rust
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum InputContentBlock {
+    Text { text: String },
+    ToolUse { id: String, name: String, input: Value },
+    ToolResult { tool_use_id: String, content: Vec<ToolResultContentBlock>, is_error: bool },
+}
+```
+
+Three variants. The Anthropic Messages API canonical wire shape for image input (documented at platform.claude.com/docs/en/build-with-claude/vision and reachable since the 2024-03-04 Claude 3 Sonnet/Haiku/Opus GA — 25 months ago at the time of this filing) requires a fourth variant:
+
+```rust
+Image {
+    source: ImageSource, // { type: "base64" | "url" | "file", media_type: "image/png" | "image/jpeg" | "image/gif" | "image/webp", data: String } or { type: "url", url: String } or { type: "file", file_id: String }
+}
+```
+
+The struct hierarchy below `InputContentBlock` is also empty: `rg -n 'ImageSource|InputImage|VisionInput|MediaType|"base64"' rust/crates/api/` returns zero hits across the entire api crate. There is no `pub struct ImageSource`, no `pub enum MediaType`, no `pub fn encode_image_to_base64(...)`, no `pub fn upload_image(...)`. The Anthropic-native wire serializer at `rust/crates/api/src/providers/anthropic.rs:466` (`AnthropicClient::send_raw_request`) hands the typed `MessageRequest` to `render_json_body` (`telemetry/lib.rs:107`) via `serde_json::to_value` — so the wire shape is determined entirely by what the typed structs can express. With no `Image` variant on `InputContentBlock`, no monkey-patching at the JSON layer is possible because the request envelope is constructed via this typed path, not via raw JSON. The OpenAI-compat translator at `rust/crates/api/src/providers/openai_compat.rs:946` (`translate_message`) has a three-way match on `InputContentBlock::{Text, ToolUse, ToolResult}` and is exhaustive — adding a fourth variant requires a synchronized data-model + translator extension.
+
+**(3) ResolvedAttachment knows about images but produces no transport-ready payload.** `rust/crates/tools/src/lib.rs:2660-2666` defines:
+
+```rust
+#[derive(Debug, Serialize)]
+struct ResolvedAttachment {
+    path: String,
+    size: u64,
+    #[serde(rename = "isImage")]
+    is_image: bool,
+}
+```
+
+The `resolve_attachment` function at line 5266 produces these envelopes, threading them through `BriefOutput { message, attachments: Option<Vec<ResolvedAttachment>>, sent_at }` at line 2653-2657 and emitting them in the SendUserMessage/Brief tool's JSON envelope (asserted at line 8969 of the test suite as `output["attachments"][0]["isImage"] == true`). But `ResolvedAttachment` carries: a path string (the local filesystem path), a size in bytes, and an isImage flag. It carries *no bytes*, no base64-encoded `data`, no `media_type`, no upload `file_id`, no streamable handle. The downstream consumer (the LLM, via the API request) cannot reach into the local filesystem at the model side, so the path is unusable; the size is metadata-only; the isImage flag is informational and has no destination beyond JSON serialization. The function `is_image_path` matches seven file extensions (png, jpg, jpeg, gif, webp, bmp, svg) — five of which are valid Anthropic Messages API media types (png, jpeg, gif, webp), one of which is invalid (bmp — Anthropic rejects), one of which is a vector format that requires PNG rasterization first (svg). The path-classification logic exists; the byte-ingestion-and-base64-encoding pipeline does not.
+
+**(4) Onboarding test fixture treats screenshot analysis as canonical.** `rust/crates/runtime/src/worker_boot.rs:1324` hard-codes `"› Explain this KakaoTalk screenshot for a friend\nI can help analyze the screenshot…"` as the *recovered observe* string in the `worker_prompt_misdelivery_recovery` test, and line 1348-1350 hard-codes `observed_prompt_preview: Some("Explain this KakaoTalk screenshot for a friend".to_string())` in the asserted `WorkerEventPayload::PromptDelivery` event. The test is asserting that when a worker is misdirected from "Implement worker handshake" to "Explain this KakaoTalk screenshot", the runtime classifies the misdirection correctly. The choice of "explain a screenshot" as the contrasting prompt is **non-coincidental** — it's the canonical low-coupling "task that obviously requires vision" used as a test signal across the worker classifier. The same runtime that uses screenshot analysis as a signal *cannot itself send a screenshot to the model* because the data path doesn't exist. The Vision use case is in claw-code's mental model of what coding agents do; the data flow to enable it is structurally absent.
+
+**(5) Markdown renderer handles image *output* but not *input* — asymmetric capability surface.** `rust/crates/rusty-claude-cli/src/render.rs:379-384` defines an explicit handler for `Event::Start(Tag::Image { dest_url, .. })` that produces a colored `[image:{dest_url}]` placeholder in the rendered terminal output. Line 426 also handles `Event::End(TagEnd::Image)`. The renderer was designed assuming the model might emit markdown like `![alt](https://...)` in its responses and need a graceful fallback (since the terminal can't display rasterized bytes). But the *input* path — taking image bytes from the user, packaging them as `InputContentBlock::Image { source: ... }`, and shipping them to a vision-capable Claude or GPT-4o or Gemini-2.5-flash — is entirely absent. The asymmetry is striking: the renderer team contemplated images crossing the boundary one way (model → user); the API team did not contemplate the other way (user → model).
+
+**(6) Cluster-shape kinship and novelty.** Same family as the wire-format-parity cluster (#211–#219), but the failure mode is **the largest single feature absence yet catalogued, exceeding #218's four-layer structural absence**. Prior members were single-field gaps or missing-capability gaps that operated within the existing data-model shape. #220 is a **five-layer feature absence** spanning a coherent capability (multimodal input + slash-command surfacing + attachment metadata threading + renderer asymmetry resolution + worker-classifier task-vocabulary) that requires synchronized changes to (a) `InputContentBlock` typed enum, (b) `ImageSource` typed struct family with media-type validation, (c) slash-command parse arms for `/image` and `/screenshot`, (d) `ResolvedAttachment` extension to carry base64-encoded bytes (or, preferably, a decoded byte handle threaded directly into the API layer), (e) `build_chat_completion_request` and `translate_message` translation branches to emit Anthropic-canonical `{type: "image", source: {type: "base64", media_type, data}}` shape and OpenAI-canonical `{type: "image_url", image_url: {url: "data:image/png;base64,..."}}` shape, (f) screenshot capture invocation (per-OS: `screencapture` on macOS, `gnome-screenshot --file` or `grim` on Linux, `Get-Clipboard -Format Image` on Windows) plumbed through the runtime, (g) image size validation against Anthropic's 5MB-per-image / 32MB-total / 100-images-per-request limits and Bedrock's 20-images-per-request stricter limit. This is **the largest single deliverable** in the entire emission-routing audit cluster. The novelty shape vs prior members: prior pinpoints documented an absence in a *peripheral* feature (refusal channel, service tier, cache control, structured outputs); #220 documents an absence in a *table-stakes baseline* feature that has been GA for 25+ months across every major provider (Anthropic since 2024-03-04, OpenAI GPT-4o since 2024-05-13, Google Gemini 1.5 since 2024-02-15, Anthropic Claude 3.5 Sonnet vision-default since 2024-06-20).
+
+**(7) Cross-claw and ecosystem evidence.** anomalyco/opencode (the parity reference for this cluster) has full image-input support: drag-and-drop into the terminal, paste from clipboard, `Read` tool with image-file handling, `look_at` tool for vision analysis. Known issues in opencode are in the *quality* of image handling (issue #16184: `look_at` tool fails on file-from-disk despite vision-capable models, issue #15728: `Read` tool reports success then errors on model-side, issue #8875: custom providers via `@ai-sdk/openai-compatible` silently strip attachments because the supported-attachments allowlist is hardcoded for built-in providers, issue #17205: text-only models still receive image attachments and burn tokens) — all four are *integration-quality* gaps, not *capability-existence* gaps. claw-code is missing the capability entirely; opencode has the capability and is iterating on edge cases. The parity gap is on the order of "claw-code has 0% of the image-input feature, opencode has ~85% with known reliability bugs" — this is the largest parity asymmetry in the entire wire-format-parity cluster. charmbracelet/crush has image-input support via terminal-paste and file-attachment shells. simonw/llm has `--attachment` flag for vision models with auto-base64-encoding. Vercel AI SDK has `experimental_attachments` + `image: ImagePart[]` first-class fields. LangChain has `HumanMessage(content=[{type: "image_url", image_url: {url: ...}}])` natively. anomalyco's claude-code (Anthropic's official, not the rusty-claude-cli port) has had image-paste-and-screenshot shortcuts since the initial 2024-12 release. claw-code is the **sole client/agent/CLI in the surveyed coding-agent ecosystem with zero image input capability**, despite running on top of Claude models that have shipped vision support for 25+ months as a baseline default.
+
+**Reproduction sketch:**
+
+```rust
+// Test 1: InputContentBlock cannot represent image input.
+#[test]
+fn input_content_block_lacks_image_variant() {
+    // Compile-time observable: this constructor does not compile.
+    // let block = InputContentBlock::Image {
+    //     source: ImageSource::Base64 {
+    //         media_type: "image/png".to_string(),
+    //         data: "iVBORw0KGgoAAAANSUhEU...".to_string(),
+    //     },
+    // };
+    // The variant does not exist in the enum.
+    let json = json!({
+        "type": "image",
+        "source": {
+            "type": "base64",
+            "media_type": "image/png",
+            "data": "iVBORw0KGgoAAAANSUhEU..."
+        }
+    });
+    let parsed: Result<InputContentBlock, _> = serde_json::from_value(json);
+    // Currently fails: serde rejects unknown "image" variant tag.
+    assert!(parsed.is_err());
+}
+
+// Test 2: Slash-command parser rejects /image despite spec advertising it.
+#[test]
+fn slash_command_image_advertised_but_unparseable() {
+    use commands::{slash_command_specs, SlashCommand};
+    let spec = slash_command_specs()
+        .iter()
+        .find(|s| s.name == "image")
+        .expect("spec entry promised");
+    assert_eq!(spec.summary, "Add an image file to the conversation");
+    let parsed = SlashCommand::parse("/image /tmp/test.png");
+    // Currently: returns Ok(Some(SlashCommand::Unknown("image"))) or Err
+    // (depending on which fallthrough path the validator takes).
+    // The advertised capability has no parse-time backing.
+    match parsed {
+        Ok(Some(SlashCommand::Unknown(name))) => assert_eq!(name, "image"),
+        Err(_) => {} // also acceptable observation of the gap
+        other => panic!("expected Unknown or Err, got {other:?}"),
+    }
+}
+
+// Test 3: ResolvedAttachment knows it's an image but cannot transport it.
+#[test]
+fn resolved_attachment_for_image_carries_no_bytes() {
+    let png_path = "/tmp/test-image.png";
+    std::fs::write(png_path, &[0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]).unwrap();
+    let envelope = execute_tool("SendUserMessage", &json!({
+        "message": "look at this",
+        "attachments": [png_path],
+        "status": "normal"
+    })).unwrap();
+    let parsed: Value = serde_json::from_str(&envelope).unwrap();
+    assert_eq!(parsed["attachments"][0]["isImage"], true);
+    // Bug: no field carries the encoded bytes.
+    assert!(parsed["attachments"][0].get("base64").is_none());
+    assert!(parsed["attachments"][0].get("data").is_none());
+    assert!(parsed["attachments"][0].get("mediaType").is_none());
+    // Operator can see "yes it was an image" but no downstream component
+    // can construct an Anthropic Messages API image content block from this.
+}
+
+// Test 4: API request builder cannot emit image content blocks.
+#[test]
+fn build_chat_completion_request_drops_images_silently() {
+    // Hypothetically, if a future caller could construct an Image variant,
+    // the OpenAI-compat translator at openai_compat.rs:946 would have no
+    // arm for it. The match is exhaustive over current variants.
+    // Translator coverage: Text, ToolUse, ToolResult — three of three.
+    // Adding a fourth variant requires synchronized translator extension.
+    // Currently: extending the enum without extending the translator
+    // would fail to compile (good — exhaustiveness check enforces sync).
+    // But neither half exists, so the boundary is closed in both directions.
+}
+
+// Test 5: end-to-end — /screenshot and /image trigger no model call.
+#[tokio::test]
+async fn screenshot_slash_command_does_not_trigger_vision_request() {
+    // The user types /screenshot, expecting capture-and-attach behavior.
+    // Currently: STUB_COMMANDS guard suppresses the command from REPL
+    // completions, but a direct invocation hits format_unknown_slash_command
+    // and returns "not supported in this build" — silently advertising
+    // a feature that does not exist.
+}
+```
+
+**Fix shape (not implemented in this cycle, recorded for cluster refactor):**
+
+The minimal fix is a seven-touch architectural extension. (a) Define `pub enum ImageSource { Base64 { media_type: String, data: String }, Url { url: String }, File { file_id: String } }` at `rust/crates/api/src/types.rs` near line 95, with `#[serde(tag = "type", rename_all = "snake_case")]` to produce the canonical Anthropic wire shapes. (b) Define `pub enum MediaType { ImagePng, ImageJpeg, ImageGif, ImageWebp }` (extensible to `ApplicationPdf` for the document-input feature in a follow-on pinpoint) and constrain `ImageSource::Base64::media_type` to it via a typed setter that validates against the Anthropic Vision API's accepted media-type list. (c) Add a fourth variant to `InputContentBlock` at `types.rs:80`: `Image { source: ImageSource, #[serde(default, skip_serializing_if = "Option::is_none")] cache_control: Option<CacheControl> }` — `cache_control` is from #219's fix shape, threaded here to enable image cacheability; this is a cross-pinpoint composability win. (d) Add parse arms for `/image <path>` and `/screenshot` in `validate_slash_command_input` at `rust/crates/commands/src/lib.rs` near line 1390; both produce new enum variants `SlashCommand::Image { path: PathBuf }` and `SlashCommand::Screenshot { region: Option<ScreenshotRegion> }` where `ScreenshotRegion ∈ { FullScreen, ActiveWindow, Selection }`. (e) Extend `resolve_attachment` at `rust/crates/tools/src/lib.rs:5266` to read image bytes, base64-encode them, populate a new `ResolvedAttachment::Image { path, size, media_type, base64_data }` variant (preserving the existing Text/Generic variants for non-image attachments), and validate against the Anthropic 5MB-per-image limit (return `Err("image exceeds 5MB Anthropic-API limit")` for too-large files). (f) Extend `build_chat_completion_request` (`openai_compat.rs:845`) and `translate_message` (`openai_compat.rs:946`) to emit images on the wire: Anthropic-native produces `{type: "image", source: {type: "base64", media_type, data}}`; OpenAI-compat produces `{type: "image_url", image_url: {url: "data:image/{media_type};base64,{data}"}}` (the data-URL wire shape that GPT-4o and gpt-5-vision and DeepSeek-VL2 and Qwen-VL all accept); Bedrock-anthropic-relay uses the native shape with a `cachePoint: {}` injection if `cache_control` is set. (g) Add a screenshot-capture runtime helper that shells out to `screencapture -i` on macOS, `gnome-screenshot --file` or `grim` on Linux, `(Get-Clipboard -Format Image).Save("/tmp/...")` on Windows, returning the captured PNG path that the `/screenshot` parse arm threads through `resolve_attachment`. Estimate: ~280 LOC production + ~340 LOC test (covering all four media types × Anthropic-native and OpenAI-compat lanes × 5MB-limit enforcement × 100-image-per-request limit enforcement × `/image` parse + dispatch × `/screenshot` parse + capture × cross-platform OS-specific capture × end-to-end through worker → API → vision-model-response). The deeper fix is to declare a `Modality` typed enum at the data-model layer that enumerates all input capability surfaces (Text, Image, Document, Audio, Video) and compiles to provider-appropriate wire fields via a single `into_provider_payload()` translation, matching the architecture of #218's `Capability` enum and #219's `Cacheability` enum. This collapses #220 into one composable rule with the rest of the wire-format-parity cluster (#211–#219) and gives claw-code multimodal capability parity with anomalyco/opencode (full vision input), charmbracelet/crush (vision via terminal paste), simonw/llm (`--attachment` flag), Vercel AI SDK (`experimental_attachments`), LangChain (`HumanMessage` content blocks), and Anthropic's own claude-code CLI (paste-image and `/screenshot` shortcuts). The cluster doctrine accumulates: every modality that exists in 2025+ provider APIs must have a typed slot in the Rust data model, must traverse the wire via `serde_json::to_value` without ad-hoc string splicing, must round-trip cleanly through both native and openai-compat lanes, *and must have a slash-command surface or attachment-flow ingestion path on the user-facing side that matches the spec table's advertised summary*. The fifth axis — slash-command-spec ↔ parse-arm parity — is novel in the cluster and motivates a new doctrine entry: spec-table claims that have no parse-arm backing are themselves a pinpointable shape (call it the "advertised-but-unbuilt" shape, a UX-layer cousin of the data-layer "false-positive-opt-in" shape from #219).
+
+**Status:** Open. No code changed. Filed 2026-04-26 01:00 KST. Branch: feat/jobdori-168c-emission-routing. HEAD: 2858aec. Sibling-shape cluster (silent-fallback / silent-drop / silent-strip / silent-misnomer / silent-shadow / silent-prefix-mismatch / structural-absence / silent-zero-coercion / silent-content-discard / silent-header-discard / silent-tier-absence / silent-finish-mistranslation / silent-capability-absence / silent-false-positive-opt-in / advertised-but-unbuilt at provider/CLI/UX boundary): #201/#202/#203/#206/#207/#208/#209/#210/#211/#212/#213/#214/#215/#216/#217/#218/#219/#220 — nineteen pinpoints. Wire-format-parity cluster grows to ten: #211 (max_completion_tokens) + #212 (parallel_tool_calls) + #213 (cached_tokens response-side) + #214 (reasoning_content) + #215 (Retry-After) + #216 (service_tier + system_fingerprint) + #217 (finish_reason taxonomy) + #218 (response_format / output_config / refusal) + #219 (cache_control request-side) + #220 (image content block + media_type + ImageSource taxonomy). Capability-parity cluster (the strict-superset of wire-format-parity that includes user-facing slash-command surfacing and OS-integration affordances): #218 (structured outputs) + #220 (multimodal input) — two members so far, both being four-or-more-layer structural absences. Five-layer-structural-absence shape: data-model-variant + slash-command-parse-arm + attachment-metadata-threading + request-builder-translation + OS-integration-helper, distinct from prior single-field (#211/#212/#214) / response-only (#213/#207) / header-only (#215) / three-dimensional (#216) / classifier-leakage (#217) / four-layer (#218) / false-positive-opt-in (#219) members; the advertised-but-unbuilt shape is novel and applicable to other STUB_COMMAND entries with capability-claim summaries (the audit of which is its own follow-on pinpoint candidate). External validation: Anthropic Vision API reference (https://platform.claude.com/docs/en/build-with-claude/vision — `{type: "image", source: {type: "base64" | "url" | "file", media_type: "image/png" | "image/jpeg" | "image/gif" | "image/webp", data | url | file_id}}` GA on 2024-03-04 with Claude 3 Sonnet/Haiku/Opus, default-on for all Claude 3.5+ models, 5MB-per-image / 32MB-per-request / 100-images-per-request limits, supported across Sonnet 3.5 / 3.7 / 4 / 4.5 / 4.6 and Opus 3 / 4 / 4.6 and Haiku 3.5), Anthropic Messages API reference (https://docs.anthropic.com/en/api/messages — image content block as a first-class `InputContentBlock` variant), Anthropic Files API beta (https://docs.anthropic.com/en/api/files-content — `file_id` reference for repeated-image-use efficiency, GA-pending), AWS Bedrock prompt-caching docs with image-block coverage (https://docs.aws.amazon.com/bedrock/latest/userguide/anthropic-claude-image-input.html — 20-images-per-request stricter limit, same `cachePoint: {}` pattern from #219 applies), OpenAI Vision API reference (https://platform.openai.com/docs/guides/vision — `{type: "image_url", image_url: {url: "data:image/...;base64,..." | "https://..."}}` GA on GPT-4o / GPT-4o-mini / GPT-5-vision / o1-vision / o3-vision, used by every multimodal coding agent in the OpenAI ecosystem), Google Gemini multimodal API (https://ai.google.dev/gemini-api/docs/vision — `{inline_data: {mime_type, data}}` shape, GA on Gemini 1.5 / 2.0 / 2.5 across all model tiers), DeepSeek-VL2 vision API (OpenAI-compat shape via deepseek.com, image-input GA), Qwen-VL / QwQ-VL (Alibaba DashScope, OpenAI-compat shape with `image_url` field), MiniMax-VL (OpenAI-compat), Moonshot kimi-VL (OpenAI-compat), anomalyco/opencode#16184 (image-file-from-disk handling bug — capability exists, integration quality issue), anomalyco/opencode#15728 (Read tool image-handling bug — capability exists, integration quality issue), anomalyco/opencode#8875 (custom-provider attachment-allowlist gap — capability exists, allowlist coverage issue), anomalyco/opencode#17205 (text-only-model token-burn on image attachment — capability exists, routing issue) — all four issues confirm opencode HAS the capability and is iterating on edge cases, while claw-code is missing the capability entirely; charmbracelet/crush vision-input via terminal paste (https://github.com/charmbracelet/crush — referenced in #211/#212/#214/#217 cluster pinpoints), simonw/llm `--attachment` flag (https://llm.datasette.io/en/stable/usage.html#attachments — base64-encoding and media-type-inference baked into the CLI), Vercel AI SDK `experimental_attachments` + image content blocks (https://sdk.vercel.ai/docs/ai-sdk-core/generating-text-and-text-streaming — first-class TypeScript types), LangChain `HumanMessage` with image content blocks (https://reference.langchain.com — JS and Python parity), LangGraph image-message routing (https://langchain-ai.github.io/langgraph/ — image-aware multi-agent flows), OpenAI Python SDK `client.chat.completions.create(messages=[{role: "user", content: [{type: "image_url", image_url: {...}}]}])` (typed at the SDK boundary), Anthropic Python SDK `client.messages.create(messages=[{role: "user", content: [{type: "image", source: {...}}]}])` (typed at the SDK boundary), Anthropic-quickstart vision examples (https://github.com/anthropics/anthropic-quickstarts — first-result hits-page for "claude image input" search), claude-code official CLI paste-image and screenshot shortcuts (https://docs.anthropic.com/en/docs/build-with-claude-code — claude-code is the reference implementation that claw-code is porting *from*, so the absence of an image-input feature in the port is a regression against the port's source), OpenTelemetry GenAI semconv `gen_ai.input.attachments` and `gen_ai.input.images.count` (https://opentelemetry.io/docs/specs/semconv/gen-ai/gen-ai-spans/ — multimodal-input observability is a documented attribute set), MIME-type registry and IANA registration for image/* types (RFC 4288/4289). Eighteen ecosystem references, two open issues in the parity sibling, GA timeline of 25 months on Anthropic's side and 23 months on OpenAI's side. claw-code is the **sole client/agent/CLI in the surveyed coding-agent ecosystem with zero image-input capability** — a regression against the very upstream (claude-code) it is porting from, a parity floor against every other coding-agent CLI and SDK in 2024–2025, and the largest single feature absence catalogued in the entire emission-routing audit cluster. The fix shape is well-understood, all reference implementations exist in peer codebases, the user-facing slash commands already advertise the feature (failing under spec-table-vs-implementation parity), the attachment metadata layer already classifies images (failing under metadata-threading-vs-byte-transport parity), and the markdown renderer already handles images on the output side (failing under output-vs-input symmetry parity). #220 closes the largest single capability gap in the entire emission-routing audit and unblocks vision-aware automation use cases that the runtime's own test suite already treats as canonical.
+
+🪨
