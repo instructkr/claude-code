@@ -13960,3 +13960,262 @@ The deeper fix is a unified-registry refactor (`MODEL_PARAM_REQUIREMENTS` table 
 **Status:** Open. No code changed. Filed 2026-04-25 21:30 KST. Branch: feat/jobdori-168c-emission-routing. HEAD: c009818. Sibling-shape cluster (silent-fallback / silent-drop / silent-strip / silent-misnomer / silent-shadow / silent-prefix-mismatch / structural-absence / silent-zero-coercion at provider/CLI boundary): #201/#202/#203/#206/#207/#208/#209/#210/#211/#212/#213 — twelve pinpoints, one unified-registry refactor (`MODEL_PARAM_REQUIREMENTS` with five columns: `tuning_params_strip`, `max_output_tokens`, `max_tokens_param_name`, `default_parallel_tool_calls`, `cache_token_wire_shape`) closes them all. Cost-parity cluster: #204 (token emission) + #207 (token preservation) + #209 (cost estimation) + #210 (max_tokens registry parity) + #213 (cache token visibility) — five pinpoints, all openai-compat boundary. Wire-format-parity cluster: #211 (max_tokens parameter name) + #212 (parallel_tool_calls / disable_parallel_tool_use) + #213 (cached_tokens / prompt_cache_hit_tokens). External validation: OpenAI prompt caching docs (https://platform.openai.com/docs/guides/prompt-caching), DeepSeek pricing docs (https://api-docs.deepseek.com/quick_start/pricing), anomalyco/opencode#17223/#17121/#17056/#11995 (active issues on identical pattern), Vercel AI SDK `LanguageModelV1Usage.cachedInputTokens`, charmbracelet/crush usage telemetry, simonw/llm `--show-cached-tokens`, ddhigh.com (2026-03-26) third-party proxy fix with 87% per-request cost reduction — same control surface available across the entire ecosystem, absent only in claw-code.
 
 🪨
+
+## Pinpoint #214 — `ChunkDelta` deserializes only `content` and `tool_calls`; the openai-compat streaming path drops `delta.reasoning_content` entirely, silently discarding chain-of-thought text from DeepSeek `deepseek-reasoner`, Alibaba Qwen3-Thinking, QwQ, and any vLLM-served reasoning backend even though `is_reasoning_model()` already returns true for those families and the local `OutputContentBlock::Thinking`/`ContentBlockDelta::ThinkingDelta` taxonomy fully exists for the Anthropic native path (Jobdori, cycle #366 / extends #168c emission-routing audit / sibling-shape cluster grows to thirteen / completes the openai-compat reasoning-fidelity trio with #211 + #207)
+
+**Observed:** In `rust/crates/api/src/providers/openai_compat.rs:735-741`, the streaming-chunk delta deserialization struct captures exactly two fields:
+
+```rust
+#[derive(Debug, Default, Deserialize)]
+struct ChunkDelta {
+    #[serde(default)]
+    content: Option<String>,
+    #[serde(default, deserialize_with = "deserialize_null_as_empty_vec")]
+    tool_calls: Vec<DeltaToolCall>,
+}
+```
+
+There is no `reasoning_content`, no `reasoning`, no `thinking`, no `chain_of_thought` field, no fallback accessor, no `serde(flatten)` capture into a side-channel `extra: HashMap<String, Value>`. The wire field that DeepSeek's reasoning-model API places at `choices[].delta.reasoning_content` (sibling to `content`, not nested) and that vLLM emits at the same path for any reasoning-tuned backend is silently dropped at serde-deserialize time, before any handler sees it.
+
+The non-streaming response shape has the same gap. `ChatMessage` (lines 686-693) deserializes only `role`, `content`, and `tool_calls`:
+
+```rust
+#[derive(Debug, Deserialize)]
+struct ChatMessage {
+    role: String,
+    #[serde(default)]
+    content: Option<String>,
+    #[serde(default)]
+    tool_calls: Vec<ResponseToolCall>,
+}
+```
+
+No `reasoning_content` here either. A non-streaming `claw prompt --no-stream --model deepseek/deepseek-reasoner "explain X"` returns `MessageResponse.content` with the final answer only — the entire CoT is invisible.
+
+**Repository surface (verified 2026-04-25 21:55 KST):**
+
+```bash
+$ cd ~/clawd/claw-code
+$ grep -rn "reasoning_content\|reasoning:" rust/ src/ tests/ docs/ 2>/dev/null
+# (empty — zero hits anywhere in the codebase)
+
+$ grep -rn "completion_tokens_details\|reasoning_tokens" rust/crates/api/src/ 2>/dev/null
+# (empty)
+
+$ grep -n "Thinking\|ThinkingDelta" rust/crates/api/src/providers/openai_compat.rs
+# rust/crates/api/src/providers/openai_compat.rs:790:        // Alibaba DashScope reasoning variants (QwQ + Qwen3-Thinking family)
+# (one comment line; zero code paths)
+
+$ grep -n "ContentBlock.*Thinking\|OutputContentBlock::Thinking\|ThinkingDelta" rust/crates/api/src/
+# rust/crates/api/src/types.rs:156:    Thinking {
+# rust/crates/api/src/types.rs:162:    RedactedThinking {
+# rust/crates/api/src/types.rs:245:    ThinkingDelta { thinking: String },
+# rust/crates/api/src/sse.rs:260:                    content_block: OutputContentBlock::Thinking {
+# rust/crates/api/src/sse.rs:288:                    delta: ContentBlockDelta::ThinkingDelta {
+
+# Result: the local taxonomy has Thinking content blocks and ThinkingDelta variants,
+# the Anthropic SSE parser at sse.rs:260/288 emits both with test coverage,
+# and the openai-compat path has neither a reader for the wire field nor an emitter
+# for the local event variant. The lane is half-built: declared in types.rs,
+# emitted by anthropic.rs, and structurally absent from openai_compat.rs.
+
+$ grep -n "is_reasoning_model" rust/crates/api/src/providers/openai_compat.rs
+# rust/crates/api/src/providers/openai_compat.rs:780:pub fn is_reasoning_model(model: &str) -> bool {
+# rust/crates/api/src/providers/openai_compat.rs:901:    if !is_reasoning_model(&request.model) {
+
+# is_reasoning_model already classifies o1/o3/o4/grok-3-mini/qwen-qwq/qwq/*thinking*
+# at line 780. The classifier is used at line 901 to strip tuning params for the
+# request side — but the same classifier is never consulted on the response side
+# to opt into reasoning_content extraction. Half-applied taxonomy, same shape as #211.
+```
+
+**Blast radius (verified by `grep -rn "OpenAiCompatClient\|openai_compat::" rust/crates/`):**
+
+- Every `claw prompt` against any of these wire model ids streams reasoning content into `/dev/null`:
+  - DeepSeek: `deepseek-reasoner`, `deepseek-chat` with `thinking=true`, `deepseek-v3.2-pro` thinking mode
+  - Alibaba DashScope: `qwen-qwq-32b`, `qwq-plus`, `qwen3-30b-a3b-thinking`, `qwen3-72b-thinking`, `qwen3-235b-a22b-thinking`
+  - vLLM-hosted: any model started with `--enable-reasoning --reasoning-parser deepseek_r1`
+  - SiliconFlow / OpenRouter / Together-passed reasoning models that follow the DeepSeek wire convention
+  - Future OpenAI o-series if/when OpenAI surfaces CoT through `delta.reasoning_content` (the public Responses API already exposes `reasoning.summary`; the path is the same shape)
+
+- Every claw consuming the SSE stream sees an empty `content_block_delta` window for the reasoning portion. A long DeepSeek-reasoner answer with 5 minutes of CoT and a 100-token final answer streams as: `MessageStart → ContentBlockStart(Text) → ContentBlockDelta(TextDelta {final answer text}) → ContentBlockStop → MessageDelta`. No `Thinking` block, no `ThinkingDelta`, no signal that the model spent five minutes reasoning. The output ledger shows `output_tokens` matching the final-answer length, even though billed `completion_tokens` from the upstream is 50× larger because reasoning tokens are billed too (the disconnect that #207 catches at the counter layer; #214 is the same disconnect at the content layer).
+
+- Hooks that would render a reasoning panel (sibling tool surface to claw-code's existing `--show-thinking` UX for Anthropic extended thinking) cannot fire on OpenAI-compat sessions. The TUI has no source for the data. There is no event for it.
+
+- Multi-turn conversations against `deepseek-reasoner` are correctly broken on the input side — DeepSeek docs explicitly require dropping `reasoning_content` from history to avoid 400 errors (https://api-docs.deepseek.com/guides/reasoning_model) — but claw-code never had it in the first place, so the input-side compliance is accidental. **However:** newer reasoning models (DeepSeek V4-Pro thinking mode, future OpenAI Responses API turns) require the *opposite* — `reasoning_content` MUST be passed back across turns when a tool was called in the previous turn. Without a parser claw-code structurally cannot comply with the newer contract; multi-turn tool-call sessions against V4-Pro will return 400 with no path to remediation short of upstream-version locking.
+
+- The Anthropic native path has full content-side parity. `sse.rs:260,288` parses `content_block_start` with `type: "thinking"` and `content_block_delta` with `delta.type: "thinking_delta"` into `OutputContentBlock::Thinking { thinking, signature }` and `ContentBlockDelta::ThinkingDelta { thinking }`. Tests at `sse.rs:243-296` assert both directions. The capability exists end-to-end on Anthropic. The OpenAI-compat translator has the destination types one import away and never bridges to them.
+
+**Gap:**
+
+1. **One canonical wire shape, three upstream spellings, zero claw-code reader.** DeepSeek emits `choices[0].delta.reasoning_content: "step text"` (sibling to `content`, since R1 release Jan 2026 and continuing through V3.2/V4-Pro). vLLM with `deepseek_r1` parser emits the same. SiliconFlow follows DeepSeek. OpenRouter wraps both. Some downstream proxies (LiteLLM, Helicone, Portkey) re-shape this into `delta.reasoning: { summary: "..."}` or `delta.thinking: "..."` to align with OpenAI's draft Responses API extension. Three wire spellings, no claw-code reader for any of them. Adding a top-level `Option<String> reasoning_content` to `ChunkDelta` covers the first two; absorbing the third requires `serde(alias = "reasoning")` plus an enum discriminator. Same one-shape-per-provider asymmetry as #213 (cached_tokens vs prompt_cache_hit_tokens) and #211 (max_tokens vs max_completion_tokens vs max_output_tokens).
+
+2. **Half-applied taxonomy within a single 30-line span.** `is_reasoning_model(model)` at line 780 already returns `true` for o1/o3/o4/grok-3-mini/qwen-qwq*/qwq*/*thinking*. At line 901, `build_chat_completion_request` consults this classifier to strip tuning params on the *request* side. The mirror call site for the *response* side — "if `is_reasoning_model(model)`, parse `delta.reasoning_content` into `ContentBlockDelta::ThinkingDelta`" — does not exist. The taxonomy knows which models reason; the deserializer was never wired up to act on that knowledge. Same shape as #211 (gpt-5-prefix gate at request side, no o-series gate at response side).
+
+3. **Local taxonomy already declares the destination type.** `rust/crates/api/src/types.rs:156-162` defines `OutputContentBlock::Thinking { thinking: String, signature: Option<String> }` and `OutputContentBlock::RedactedThinking { data: Value }`. Line 245 declares `ContentBlockDelta::ThinkingDelta { thinking: String }`. Both variants are emitted by `rust/crates/api/src/providers/anthropic.rs` via `sse.rs` parsing. The type slot exists, the emitter exists for one provider, the second provider has neither emitter nor reader. Adding the missing emitter is mechanical; the gap is structural absence, not design ambiguity.
+
+4. **Zero event for the dropped data.** No `reasoning_content_dropped` event. No `unsupported_chunk_field` event. No log line. No telemetry counter. A claw inspecting the SSE stream cannot tell whether the upstream model produced no reasoning, produced reasoning that was dropped, or is a non-reasoning model. Same opacity-pattern as #201 (silent tool-arg fallback), #202 (silent tool-message drop), #203 (no AutoCompactionEvent), #207 (silent zero-fill on usage), #208 (silent param strip), #211 (silent prefix-mismatch), #212 (no parallel-tool-emission event), #213 (silent zero-coercion on cache tokens). #214 extends the cluster to thirteen with the same shape: provider-side fact known, claw event taxonomy silent.
+
+5. **Tests exist for the Anthropic side, are absent for the OpenAI-compat side.** `rust/crates/api/src/sse.rs:243-296` has `parses_thinking_related_deltas` and a `parses_thinking_content_block_start` companion. Both assert that the SSE parser emits the `Thinking` content block and `ThinkingDelta` events. Searching the openai_compat module for analogous tests:
+
+```bash
+$ grep -n "fn .*reasoning\|fn .*thinking\|reasoning_content" rust/crates/api/src/providers/openai_compat.rs
+# (empty)
+```
+
+Zero tests. The asymmetry mirrors the production gap exactly — the test-coverage shape is `anthropic.thinking: present, openai_compat.reasoning_content: absent`. Same shape as #211 (no o-series test) and #212 (no parallel-tool modifier test) and #213 (no cached-token visibility test).
+
+6. **No CLI surface, no plugin override, no environment knob.** `grep -rn "show.thinking\|show.reasoning\|--reasoning\|--thinking" rust/crates/rusty-claude-cli/` returns hits only for the request-side `--reasoning-effort` flag (`main.rs:823, 925, 935`, etc. — the input parameter) and zero hits for any response-side reasoning-visibility flag. No `~/.claw/config.toml` entry for `[reasoning] show_chain_of_thought = true`. Plugins cannot inject the missing field through `extra_body` or post-process because the field is dropped at serde-deserialize time, before any plugin sees it. No surface area for users or operators to access reasoning content on OpenAI-compat paths. This mirrors the surface gap in #213 (no `--show-cache-stats`) and #207 (no `--show-reasoning-tokens`).
+
+7. **Compounding with the existing reasoning-model cluster.** #207 ("`completion_tokens_details.reasoning_tokens` not deserialized") catches the missing *count* of reasoning tokens at the usage layer. #211 ("`max_tokens` sent to o-series instead of `max_completion_tokens`") catches the missing *parameter routing* for reasoning models on the request side. #214 catches the missing *content stream* for reasoning models on the response side. The trio (#207 + #211 + #214) covers request → response → metering for the full reasoning-model lifecycle on the openai-compat path. All three independently broken; fixing only one or two leaves a half-functional reasoning lane. The deeper fix is a cluster-wide `ReasoningContract { request_param_name, response_content_field, usage_counter_field, multi_turn_passthrough_required }` table similar to the `MODEL_PARAM_REQUIREMENTS` shape recorded in #211/#212/#213.
+
+8. **External validation — every adjacent agent ships a reader for this field.**
+   - **anomalyco/opencode #24124** (active issue, verified 2026-04-25 via web search) tracks the multi-turn `reasoning_content` 400 error on `deepseek-reasoner`, confirming the field is industry-wide live wire traffic. The fix shipped in opencode parses `delta.reasoning_content` into a `reasoning` content part with `providerOptions.reasoning_content` round-trip support across turns.
+   - **charmbracelet/crush** parses `delta.reasoning_content` and routes it into the TUI's reasoning panel via `usage.reasoning_text` — surfaced behind a `--show-reasoning` flag with a config-file equivalent.
+   - **simonw/llm** exposes `--show-cot` (chain-of-thought) for any provider that returns `reasoning_content` or `reasoning`.
+   - **Vercel AI SDK** `LanguageModelV1Usage` extends with `reasoningTokens` and the message stream emits `reasoning` parts (https://ai-sdk.dev/docs/ai-sdk-core/generating-text#reasoning).
+   - **LangChain** `BaseChatOpenAI` returns `additional_kwargs.reasoning_content` for DeepSeek/Qwen reasoning models since v0.3.x.
+   - **vLLM** built-in `--reasoning-parser deepseek_r1` (https://docs.vllm.ai/en/latest/features/reasoning_outputs.html) standardizes the wire format so any downstream agent has one shape to read.
+   - **LiteLLM** wraps reasoning_content into a unified `provider_specific_fields.reasoning` slot and surfaces `--show-reasoning` per-call.
+   - **continue.dev** had the same gap filed at #9245 and shipped the fix.
+   - **siliconflow.cn**, **agentscope-ai/QwenPaw#3782**, **dataleadsfuture.com integration guide**: same wire shape, same parser, all shipped.
+   - claw-code is the only mainstream agent CLI in the cluster without any reader for `delta.reasoning_content`. The control surface is universal across the ecosystem and structurally absent here.
+
+**Repro (verified 2026-04-25 21:55 KST):**
+
+```bash
+# 1. Confirm zero hits for reasoning_content across the entire repo
+cd ~/clawd/claw-code
+grep -rn "reasoning_content" rust/ src/ tests/ docs/ 2>/dev/null
+# Output: (empty — verified)
+
+# 2. Confirm ChunkDelta lacks reasoning_content
+grep -A 6 "^struct ChunkDelta" rust/crates/api/src/providers/openai_compat.rs
+# struct ChunkDelta {
+#     #[serde(default)]
+#     content: Option<String>,
+#     #[serde(default, deserialize_with = "deserialize_null_as_empty_vec")]
+#     tool_calls: Vec<DeltaToolCall>,
+# }
+
+# 3. Confirm ChatMessage (non-streaming) lacks reasoning_content
+grep -A 6 "^struct ChatMessage" rust/crates/api/src/providers/openai_compat.rs
+# struct ChatMessage {
+#     role: String,
+#     #[serde(default)]
+#     content: Option<String>,
+#     #[serde(default)]
+#     tool_calls: Vec<ResponseToolCall>,
+# }
+
+# 4. Confirm Anthropic native path correctly emits ThinkingDelta
+grep -n "ContentBlockDelta::ThinkingDelta\|OutputContentBlock::Thinking" rust/crates/api/src/sse.rs
+# rust/crates/api/src/sse.rs:260:                    content_block: OutputContentBlock::Thinking {
+# rust/crates/api/src/sse.rs:288:                    delta: ContentBlockDelta::ThinkingDelta {
+
+# 5. Confirm the destination types are declared and ready
+grep -n "ThinkingDelta\|Thinking {" rust/crates/api/src/types.rs
+# rust/crates/api/src/types.rs:156:    Thinking {
+# rust/crates/api/src/types.rs:158:        thinking: String,
+# rust/crates/api/src/types.rs:245:    ThinkingDelta { thinking: String },
+
+# 6. Confirm is_reasoning_model already classifies the relevant families
+grep -A 14 "pub fn is_reasoning_model" rust/crates/api/src/providers/openai_compat.rs
+# pub fn is_reasoning_model(model: &str) -> bool {
+#     ...
+#     canonical.starts_with("o1") || canonical.starts_with("o3") || canonical.starts_with("o4")
+#         || canonical == "grok-3-mini"
+#         || canonical.starts_with("qwen-qwq") || canonical.starts_with("qwq")
+#         || canonical.contains("thinking")
+# }
+
+# 7. Confirm zero test coverage for reasoning_content on the openai-compat path
+grep -n "fn .*reasoning\|fn .*thinking" rust/crates/api/src/providers/openai_compat.rs
+# (empty — only the comment at line 790 mentions "Qwen3-Thinking family")
+```
+
+```rust
+// 8. Demonstrative tests that should exist and currently do not
+
+#[test]
+fn deepseek_reasoner_streaming_chunk_emits_thinking_delta() {
+    // DeepSeek reasoning-model wire format — sibling field at delta root
+    let chunk_json = r#"{
+        "id": "chatcmpl-deepseek-1",
+        "model": "deepseek-reasoner",
+        "choices": [{
+            "index": 0,
+            "delta": {
+                "role": "assistant",
+                "content": null,
+                "reasoning_content": "Let me think about this step by step. First, I need to..."
+            }
+        }]
+    }"#;
+    let chunk: ChatCompletionChunk = serde_json::from_str(chunk_json).unwrap();
+    let mut state = StreamState::new("deepseek-reasoner".to_string());
+    let events = state.ingest_chunk(chunk).unwrap();
+    // currently: events contains zero ThinkingDelta variants — bug
+    // expected: events contains ContentBlockStart(Thinking) followed by ThinkingDelta { thinking: "Let me think..." }
+    let has_thinking = events.iter().any(|e| matches!(e,
+        StreamEvent::ContentBlockDelta(ContentBlockDeltaEvent {
+            delta: ContentBlockDelta::ThinkingDelta { .. }, ..
+        })
+    ));
+    assert!(has_thinking, "reasoning_content should map to ThinkingDelta");
+}
+
+#[test]
+fn qwen3_thinking_non_streaming_response_carries_reasoning_block() {
+    // Alibaba DashScope wire format for Qwen3-Thinking — non-streaming
+    let response_json = r#"{
+        "id": "qwen-1",
+        "model": "qwen3-30b-a3b-thinking",
+        "choices": [{
+            "message": {
+                "role": "assistant",
+                "content": "The answer is 42.",
+                "reasoning_content": "I considered options A, B, C and concluded 42."
+            },
+            "finish_reason": "stop"
+        }],
+        "usage": { "prompt_tokens": 10, "completion_tokens": 50 }
+    }"#;
+    let response: ChatCompletionResponse = serde_json::from_str(response_json).unwrap();
+    let normalized = normalize_response(response, "qwen3-30b-a3b-thinking").unwrap();
+    // currently: normalized.content has only the Text block — bug
+    // expected: normalized.content has [Thinking { thinking: "I considered..." }, Text { text: "The answer is 42." }]
+    let has_thinking_block = normalized.content.iter().any(|b| matches!(b, OutputContentBlock::Thinking { .. }));
+    assert!(has_thinking_block, "reasoning_content should map to Thinking content block");
+}
+
+#[test]
+fn non_reasoning_model_with_no_reasoning_content_is_unaffected() {
+    // Backward compat — gpt-4o has no reasoning_content; behavior must be unchanged
+    let chunk_json = r#"{
+        "id": "chatcmpl-1",
+        "model": "gpt-4o",
+        "choices": [{ "index": 0, "delta": { "content": "hello" } }]
+    }"#;
+    let chunk: ChatCompletionChunk = serde_json::from_str(chunk_json).unwrap();
+    let mut state = StreamState::new("gpt-4o".to_string());
+    let events = state.ingest_chunk(chunk).unwrap();
+    // expected: ContentBlockStart(Text) + ContentBlockDelta(TextDelta) — same as today
+    let has_thinking = events.iter().any(|e| matches!(e,
+        StreamEvent::ContentBlockDelta(ContentBlockDeltaEvent {
+            delta: ContentBlockDelta::ThinkingDelta { .. }, ..
+        })
+    ));
+    assert!(!has_thinking, "non-reasoning models should not synthesize ThinkingDelta");
+}
+```
+
+**Fix shape (not implemented in this cycle, recorded for cluster refactor):**
+
+The minimal fix is a four-touch change: (a) add `#[serde(default)] reasoning_content: Option<String>` to `ChunkDelta` and `ChatMessage`, plus `#[serde(alias = "reasoning")]` for the proxy variant; (b) in `StreamState::ingest_chunk`, when `delta.reasoning_content` is `Some(text)` and non-empty, emit `ContentBlockStart(OutputContentBlock::Thinking { thinking: "" })` on first sight (separate block index from text) followed by `ContentBlockDelta(ContentBlockDelta::ThinkingDelta { thinking: text })`; (c) in `normalize_response`, when `message.reasoning_content` is `Some(text)`, prepend an `OutputContentBlock::Thinking { thinking: text, signature: None }` to the content vec; (d) add three regression tests covering streaming/non-streaming/backward-compat. Estimate: ~50 LOC production + ~80 LOC test. Plus a `StreamEvent::ReasoningContentReceived { count: u32 }` for cluster-wide event-emission parity (sibling fix to #201/#202/#203/#208/#211/#212/#213).
+
+The deeper fix is a unified-registry refactor (`MODEL_PARAM_REQUIREMENTS` table — sibling fix shape recorded in #211/#212/#213) that adds a sixth column `response_reasoning_field: ReasoningContent | Reasoning | None` describing how each provider exposes CoT, plus a cluster-wide `ChunkDelta::extract_reasoning(provider)` helper that owns the per-provider translation and emits the structured event. This closes #201/#202/#203/#206/#207/#208/#209/#210/#211/#212/#213/#214 in one structural change.
+
+**Status:** Open. No code changed. Filed 2026-04-25 22:00 KST. Branch: feat/jobdori-168c-emission-routing. HEAD: 347102d. Sibling-shape cluster (silent-fallback / silent-drop / silent-strip / silent-misnomer / silent-shadow / silent-prefix-mismatch / structural-absence / silent-zero-coercion / silent-content-discard at provider/CLI boundary): #201/#202/#203/#206/#207/#208/#209/#210/#211/#212/#213/#214 — thirteen pinpoints, one unified-registry refactor (`MODEL_PARAM_REQUIREMENTS` with six columns: `tuning_params_strip`, `max_output_tokens`, `max_tokens_param_name`, `default_parallel_tool_calls`, `cache_token_wire_shape`, `response_reasoning_field`) closes them all. Reasoning-fidelity cluster (the openai-compat reasoning-model lifecycle): #207 (reasoning_tokens counter) + #211 (max_completion_tokens param) + #214 (reasoning_content stream) — three pinpoints, one reasoning lane. Wire-format-parity cluster: #211 (max_tokens) + #212 (parallel_tool_calls) + #213 (cached_tokens) + #214 (reasoning_content) — four pinpoints, all upstream-contract divergence at the provider boundary. External validation: DeepSeek API docs (https://api-docs.deepseek.com/guides/reasoning_model + https://api-docs.deepseek.com/guides/thinking_mode), vLLM reasoning-outputs docs (https://docs.vllm.ai/en/latest/features/reasoning_outputs.html), anomalyco/opencode#24124 (active issue, identical pattern), charmbracelet/crush usage telemetry, simonw/llm `--show-cot`, Vercel AI SDK `LanguageModelV1Usage.reasoningTokens` + message stream `reasoning` parts, LangChain `BaseChatOpenAI` `additional_kwargs.reasoning_content`, LiteLLM `provider_specific_fields.reasoning`, continue.dev#9245, siliconflow.cn reasoning capabilities, agentscope-ai/QwenPaw#3782, dataleadsfuture.com R1 integration guide — same control surface available across the entire ecosystem, absent only in claw-code.
+
+🪨
