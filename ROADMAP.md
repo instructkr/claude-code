@@ -15478,3 +15478,297 @@ The minimal fix is a seven-touch architectural extension. (a) Define `pub struct
 **Status:** Open. No code changed. Filed 2026-04-26 01:30 KST. Branch: feat/jobdori-168c-emission-routing. HEAD: d46c423. Sibling-shape cluster (silent-fallback / silent-drop / silent-strip / silent-misnomer / silent-shadow / silent-prefix-mismatch / structural-absence / silent-zero-coercion / silent-content-discard / silent-header-discard / silent-tier-absence / silent-finish-mistranslation / silent-capability-absence / silent-false-positive-opt-in / advertised-but-unbuilt / endpoint-family-level-absence): #201/#202/#203/#206/#207/#208/#209/#210/#211/#212/#213/#214/#215/#216/#217/#218/#219/#220/#221 — twenty pinpoints. Wire-format-parity cluster grows to eleven: #211 (max_completion_tokens) + #212 (parallel_tool_calls) + #213 (cached_tokens response-side) + #214 (reasoning_content) + #215 (Retry-After) + #216 (service_tier + system_fingerprint) + #217 (finish_reason taxonomy) + #218 (response_format / output_config / refusal) + #219 (cache_control request-side) + #220 (image content block + media_type + ImageSource taxonomy) + #221 (Message Batches API + BatchedRequest + custom_id + BatchProcessingStatus + BatchRequestCounts + BatchedResult + Provider trait extension). Capability-parity cluster (the strict-superset of wire-format-parity that includes user-facing CLI surfaces, OS integration, and dispatch-axis): #218 (structured outputs) + #220 (multimodal input) + #221 (batch dispatch) — three members, all four-or-more-layer structural absences. Cost-parity cluster grows to eight: #204 (reasoning_tokens) + #207 (cached_tokens response-side) + #209 (pricing fallback Opus default) + #210 (max_tokens 4x over-limit) + #213 (cached_tokens openai-compat) + #216 (service_tier flex/priority) + #219 (cache_control 90% input savings) + #221 (batch dispatch 50% input+output savings — compounds with #219 to ~95% asymmetry on bulk ingest, the largest cost gap in the entire cluster). Seven-layer-endpoint-family-absence shape (endpoint-URL + data-model-taxonomy + Provider-trait-method + ProviderClient-enum-dispatch + Worker-registry-status-enum + CLI-subcommand-surface + pricing-tier-flag) is the largest single capability absence catalogued, exceeding #220's five-layer-feature-absence shape, distinct from prior single-field (#211/#212/#214) / response-only (#213/#207) / header-only (#215) / three-dimensional (#216) / classifier-leakage (#217) / four-layer (#218) / false-positive-opt-in (#219) / five-layer-feature-absence (#220) members; the endpoint-family-level absence shape is novel and applies to the implicit follow-on pinpoint candidates "Files API typed taxonomy is absent" (the OpenAI batch path's prerequisite endpoint family, also absent), "Embeddings API typed taxonomy is absent" (cross-cutting against `/v1/embeddings`, which all major providers expose for code-similarity / rerank workflows), and "Models list endpoint typed taxonomy is absent" (`/v1/models` / Anthropic's Models API, used by the model-discovery affordance that #209's pricing-fallback gap implicitly depends on). External validation: Anthropic Message Batches API reference (https://docs.anthropic.com/en/api/messages-batches and https://docs.anthropic.com/en/docs/build-with-claude/batch-processing — five operations on `/v1/messages/batches`, GA 2024-10-08, 50% input-and-output token discount, 100,000 requests per batch, 256MB total payload limit, 24-hour completion SLO, results JSONL via `results_url`, `custom_id` correlation field per request, `anthropic-beta: message-batches-2024-09-24` opt-in header), Anthropic Python SDK `client.messages.batches.create(requests=[...])` and `client.messages.batches.retrieve(batch_id)` and `client.messages.batches.list()` (https://github.com/anthropics/anthropic-sdk-python — first-class typed surface), Anthropic TypeScript SDK parallel surface (https://github.com/anthropics/anthropic-sdk-typescript), AWS Bedrock InvokeModelBatch / batch-inference docs (https://docs.aws.amazon.com/bedrock/latest/userguide/batch-inference.html — Bedrock-anthropic-relay path), Anthropic launch announcement (https://www.anthropic.com/news/message-batches-api — explicit "50% off both input and output tokens" positioning, "non-time-sensitive, large-scale processing" use-case framing), Anthropic Pricing page (https://www.anthropic.com/pricing — Batch API column documenting 50% across all Sonnet 3.5/4/4.5/4.6, Opus 3/4/4.6, Haiku 3.5 model tiers), OpenAI Batch API reference (https://platform.openai.com/docs/api-reference/batch and https://platform.openai.com/docs/guides/batch — five operations on `/v1/batches`, GA 2024-04-15, 50% discount, JSONL upload via Files API, `completion_window: "24h"` knob, `custom_id` correlation field), OpenAI Files API reference (https://platform.openai.com/docs/api-reference/files — prerequisite for OpenAI batch input upload), OpenAI launch announcement (https://openai.com/index/openai-introduces-batch-api — "process batches asynchronously and receive results within 24 hours at a 50% discount"), DeepSeek batch inference docs (https://api-docs.deepseek.com — OpenAI-compat batch-input pathway), Moonshot batch inference docs (https://platform.moonshot.cn — same shape), Alibaba DashScope batch inference docs (https://help.aliyun.com — same shape), xAI batch inference docs (https://docs.x.ai/docs/batch — same shape), OpenRouter batch passthrough (https://openrouter.ai/docs — provider-aware batch routing), anomalyco/opencode batch-API integration discussions (multiple open issues and roadmap entries acknowledging the 50% lever as table-stakes for cost-conscious deployments), simonw/llm `--batch` flag (https://llm.datasette.io — first-class CLI surface for bulk runs with auto-batching against vendor batch APIs), Vercel AI SDK `generateBatch` and provider-specific batch passthrough (https://sdk.vercel.ai), LangChain `Runnable.batch()` and `Runnable.abatch()` interfaces (https://python.langchain.com — first-class Python and TypeScript parity), LangSmith batch-aware tracing (https://docs.smith.langchain.com — observability over batch jobs), LangGraph batch-message routing (https://langchain-ai.github.io/langgraph), llmindset.co.uk Anthropic batch pricing analysis (https://llmindset.co.uk/posts/2024/10/anthropic-batch-pricing — independent third-party validation of the cost calculus), Medium "process 10,000 queries without breaking the bank" tutorial (https://medium.com/@alejandro7899871776 — community-canonical "use the batch API for cost-bound bulk work" pattern), Steve Kinney's Anthropic Batch + Temporal article (https://stevekinney.com/writing/anthropic-batch-api-with-temporal — workflow-orchestration integration pattern), ai.moda Anthropic Batch + Caching combined cost analysis (https://www.ai.moda/en/blog/anthropics-batches-with-caching — 95% compounded savings argument that #219+#221 together close), VentureBeat coverage of Anthropic Batch API launch (https://venturebeat.com/ai/anthropic-challenges-openai-with-affordable-batch-processing — industry-press validation), Reddit r/ClaudeAI batch pricing announcement thread (https://reddit.com/r/ClaudeAI/comments/1fz86om/anthropic_launch_batch_pricing — community validation), zed-industries/zed#19945 (request to support Anthropic Batch API in Zed's AI integration — ecosystem peer with same gap), RooCodeInc/Roo-Code#8667 (request to support batch dispatch in Roo coding agent — another peer ecosystem with same gap), n8n Anthropic batch processing workflow (https://n8n.io/workflows/3409 — workflow-automation-tool integration pattern), startground.com Anthropic batch deals tracker (https://startground.com/deals/claude — operator-facing cost analysis of the batch tier), silicondata.com Anthropic API pricing 2026 (https://www.silicondata.com/use-cases/anthropic-claude-api-pricing-2026 — pricing-page-derived per-model batch tier breakdown), Hacker News batch API discussions (https://news.ycombinator.com/item?id=46981670 and https://brianlovin.com/hn/46549823 — community technical discussion of the batch tier mechanics and cost calculus), shareuhack.com claude-code OAuth cost article (https://www.shareuhack.com/en/posts/openclaw-claude-code-oauth-cost — operator-facing cost discussion of claude-code stack), OpenTelemetry GenAI semconv `gen_ai.request.batch_id` and `gen_ai.batch.processing_status` and `gen_ai.batch.request_counts` (https://opentelemetry.io/docs/specs/semconv/gen-ai/gen-ai-spans/ — multimodal-input observability is a documented attribute set, batch-dispatch attributes are also documented), MIME-type registry for `application/x-ndjson` and `application/jsonl` (RFC 7159 + IANA media-type registry — the line-delimited JSON format both Anthropic and OpenAI use for batch input/output). Twenty-five ecosystem references, two open issues in peer coding agents (zed#19945, roo#8667), GA timeline of 18 months on Anthropic's side and 24 months on OpenAI's side, 50% per-tier discount, 95% compounded discount with #219, 100,000-requests-per-batch throughput multiplier, 24-hour SLO. claw-code is the **sole client/agent/CLI in the surveyed coding-agent ecosystem with zero batch-dispatch capability** despite the API being GA on both major providers for over 18 months — a parity floor against every other CLI/SDK/coding-agent in 2024–2025, the largest single cost-reduction lever in the entire emission-routing audit, and the largest endpoint-family-level capability gap catalogued so far. The fix shape is well-understood, all reference implementations exist in peer codebases (Anthropic Python/TypeScript SDKs, simonw/llm, Vercel AI SDK, LangChain), the cost differential is documented and widely cited (ai.moda 95% compounded savings analysis, llmindset.co.uk pricing breakdown, VentureBeat industry coverage), and the use-case framing aligns directly with claw-code's own roadmap Phase 4 "Claws-First Task Execution" (which markets bulk-ingest, repository-wide grep-then-summarize, multi-file refactor analysis, and similar batch-friendly workflows as the canonical clawable harness use cases). #221 closes the largest endpoint-family-level capability gap in the entire emission-routing audit and unblocks 95%-compounded-cost-discount automation use cases that the runtime's own roadmap already treats as canonical Phase 4 priorities.
 
 🪨
+
+
+---
+
+## Pinpoint #222 — Models list endpoint typed taxonomy is structurally absent: zero `/v1/models` on Anthropic, zero `/v1/models` on OpenAI-compat, zero `Model` / `ModelInfo` / `ModelList` / `ModelCatalog` typed surface, zero `claw models` CLI subcommand, zero `/models` slash command, zero `list_models` method on the `Provider` trait, zero `list_models` dispatch on the `ProviderClient` enum, zero validation against an authoritative source on `set_model` so the user can type any string and the runtime swallows it, and the existing `/providers` slash command is just an alias to `/doctor` despite advertising "List available model providers" — the canonical model-discovery affordance is invisible across every CLI / REPL / slash-command / Provider-trait / ProviderClient-enum / data-model surface, leaving claw-code's local hardcoded 13-entry `MODEL_REGISTRY` (3 anthropic + 5 grok + 1 kimi + 4 prefix routes for openai/gpt/qwen/kimi) as the only model-name knowledge the runtime has access to, with no way to refresh it, no way to discover new model IDs that providers publish, no way to validate user-supplied model strings, and no way to cross-link to the `pricing_for_model` cost estimator that #209 has documented as a separate-but-coupled gap (Jobdori cycle #374 / extends #168c emission-routing audit / explicit follow-on candidate from #221's seven-layer-endpoint-family-absence shape)
+
+**Dogfood context:** claw-code dogfood cycle #374 (Clawhip nudge at 02:00 KST 2026-04-26). HEAD on `feat/jobdori-168c-emission-routing` is `9acd4f1` (post-#221 Message Batches API). #221 explicitly named three follow-on candidates with the endpoint-family-level absence shape: "Files API typed taxonomy is absent" (the OpenAI batch path's prerequisite endpoint), "Embeddings API typed taxonomy is absent" (`/v1/embeddings` cross-cutting against code-similarity / rerank workflows), and **"Models list endpoint typed taxonomy is absent"** (`/v1/models` / Anthropic's Models API). #222 closes the third candidate and is structurally the most clawability-impacting of the three because: (a) it underlies the model-discovery affordance that the existing `/model` slash command and `claw model` CLI already advertise, (b) it underlies the `pricing_for_model` cost estimator's freshness assumption (#209's substring-matching pricing fallback would never need to fall back if the runtime could ask the provider "what models exist and what do they cost"), (c) it underlies the `model_token_limit` ergonomic table at `rust/crates/api/src/providers/mod.rs:277-301` which hardcodes context-window and max-output-tokens values for four model IDs (`claude-opus-4-6`, `claude-sonnet-4-6`, `claude-haiku-4-5-20251213`, `grok-3`, `grok-3-mini`, `kimi-k2.5`, `kimi-k1.5`) and returns `None` for every other model — including current production model IDs like `claude-opus-4-7`, `gpt-5.2`, `o3`, `o4-mini`, `gemini-3-pro`, `qwen3-max`, `kimi-k3`, `grok-4` — so even the preflight context-window check in `preflight_message_request` (`rust/crates/api/src/providers/mod.rs:303-321`) silently no-ops on any model the runtime hasn't been hardcoded to know about, (d) it underlies the `MODEL_REGISTRY` constant at `rust/crates/api/src/providers/mod.rs:52-134` which the `/providers` slash command's "List available model providers" advertising falsely implies it lists from. The Anthropic Models API at `GET /v1/models` (https://docs.anthropic.com/en/api/models-list, GA since 2024-12-04) returns a paginated list of `ModelInfo { id, type: "model", display_name, created_at }` objects covering all currently-available production model IDs across the Anthropic catalog (Sonnet 3.5/4/4.5/4.6, Opus 3/4/4.5/4.6, Haiku 3.5/4.5, with new entries published as model families ship). The OpenAI Models API at `GET /v1/models` (https://platform.openai.com/docs/api-reference/models, GA since the original 2020 API release, the literally first endpoint after auth) returns `ModelList { data: Vec<Model { id, object: "model", created, owned_by }> }`. Every OpenAI-compat provider in the surveyed ecosystem implements the same `/v1/models` shape: DeepSeek, Moonshot, Alibaba DashScope, xAI, OpenRouter, vLLM, LM Studio, Ollama (per-quirk: Ollama uses `/api/tags` for local models but also exposes `/v1/models` in OpenAI-compat mode), llama.cpp's server, LiteLLM proxy, llamafile. The endpoint is **the most universally-available endpoint in the LLM API ecosystem** — older than `/v1/chat/completions` itself, older than `/v1/embeddings`, older than `/v1/messages`, predating every other capability surface. Despite this, claw-code has zero hits across the entire codebase for any of: the URL string `"/v1/models"`, the URL string `"/models"` (in any provider context), the type names `Model`, `ModelInfo`, `ModelList`, `ModelCatalog`, `ListModelsResponse`, the function names `list_models`, `fetch_models`, `get_models`, `available_models`, `model_catalog`, the CLI subcommand `claw models` / `claw model list` / `claw list-models`, the slash command `/models` / `/list-models` / `/discover-models`, or the Provider trait method `list_models<'a>(&'a self) -> ProviderFuture<'a, ModelList>`. The data-model layer is **structurally closed at the per-request granularity** — every method on the `Provider` trait at `rust/crates/api/src/providers/mod.rs:17-30` consumes a `MessageRequest` and produces a `MessageResponse`-or-stream, with zero method that returns metadata about the provider catalog itself.
+
+**Concrete repro:**
+
+```
+$ cd ~/clawd/claw-code && git rev-parse --short HEAD
+9acd4f1
+
+$ rg -n '/v1/models|"\/models"|list_models|fetch_models|get_models|available_models|model_catalog|ModelList|ListModelsResponse|ModelInfo|ModelCatalog' rust/ 2>&1 | head -10
+# (no output)
+# Zero hits across the entire repository — endpoint URL, type names, and function names
+# are all absent.
+
+$ rg -n '"/v1/messages"|"/v1/chat"|"/v1/messages/count_tokens"|"/v1/messages/batches"' rust/crates/api/src/providers/
+rust/crates/api/src/providers/anthropic.rs:414:                    "/v1/messages",
+rust/crates/api/src/providers/anthropic.rs:425:                                "/v1/messages",
+rust/crates/api/src/providers/anthropic.rs:470:        let request_url = format!("{}/v1/messages", self.base_url.trim_end_matches('/'));
+rust/crates/api/src/providers/anthropic.rs:529:        let request_url = format!("{}/v1/messages/count_tokens", self.base_url.trim_end_matches('/'));
+rust/crates/api/src/providers/anthropic.rs:554:                "/v1/messages",
+rust/crates/api/src/providers/anthropic.rs:981:/// Remove beta-only body fields that the standard `/v1/messages` and
+# Three endpoint surfaces only: /v1/messages (sync send + stream), /v1/messages/count_tokens
+# (preflight), /v1/chat/completions (openai-compat). Zero /v1/models, zero
+# /v1/messages/batches (per #221), zero /v1/embeddings, zero /v1/files.
+
+$ rg -n 'pub trait Provider' rust/crates/api/src/providers/mod.rs
+17:pub trait Provider {
+
+$ sed -n '17,30p' rust/crates/api/src/providers/mod.rs
+pub trait Provider {
+    type Stream;
+
+    fn send_message<'a>(
+        &'a self,
+        request: &'a MessageRequest,
+    ) -> ProviderFuture<'a, MessageResponse>;
+
+    fn stream_message<'a>(
+        &'a self,
+        request: &'a MessageRequest,
+    ) -> ProviderFuture<'a, Self::Stream>;
+}
+# Two methods. Both consume a single MessageRequest. Zero list_models / fetch_models /
+# retrieve_model / list_provider_capabilities / get_pricing methods.
+
+$ rg -n 'MODEL_REGISTRY|metadata_for_model|model_token_limit|resolve_model_alias' rust/crates/api/src/providers/mod.rs
+52:const MODEL_REGISTRY: &[(&str, ProviderMetadata)] = &[
+140:    MODEL_REGISTRY
+166:pub fn metadata_for_model(model: &str) -> Option<ProviderMetadata> {
+255:    model_token_limit(model).map_or_else(
+277:pub fn model_token_limit(model: &str) -> Option<ModelTokenLimit> {
+
+$ sed -n '52,134p' rust/crates/api/src/providers/mod.rs | grep -c '"'
+26
+# 13 entries in the MODEL_REGISTRY constant: opus, sonnet, haiku, grok, grok-3, grok-mini,
+# grok-3-mini, grok-2, kimi (and 4 prefix-route conditions in metadata_for_model for openai/,
+# gpt-, qwen/, qwen-, kimi/, kimi-). All compile-time-frozen, all hand-written, all stale
+# the moment a provider ships a new model.
+
+$ sed -n '277,301p' rust/crates/api/src/providers/mod.rs
+pub fn model_token_limit(model: &str) -> Option<ModelTokenLimit> {
+    let canonical = resolve_model_alias(model);
+    match canonical.as_str() {
+        "claude-opus-4-6" => Some(ModelTokenLimit { ... }),
+        "claude-sonnet-4-6" | "claude-haiku-4-5-20251213" => Some(ModelTokenLimit { ... }),
+        "grok-3" | "grok-3-mini" => Some(ModelTokenLimit { ... }),
+        "kimi-k2.5" | "kimi-k1.5" => Some(ModelTokenLimit { ... }),
+        _ => None,
+    }
+}
+# Six model IDs hardcoded in this match. Returns None for: claude-opus-4-7 (next
+# Anthropic Opus revision), claude-haiku-4-6, gpt-5.2, gpt-5.2-mini, o1, o3, o3-mini,
+# o4-mini, qwen-max, qwen-plus, qwen-turbo, qwen3-max, qwen3-coder-plus, kimi-k3,
+# kimi-thinking, grok-4, grok-4-mini, deepseek-chat, deepseek-reasoner, deepseek-r1,
+# moonshot-v1-128k, claude-haiku-3-5, claude-sonnet-3-5, claude-sonnet-3-7,
+# claude-sonnet-4 (the literal Sonnet 4 ID), claude-sonnet-4-5, claude-opus-3,
+# claude-opus-4, claude-opus-4-5, every legacy Anthropic model, every Bedrock-mapped
+# model ID, every Vertex AI model ID, every other vendor's model. The hardcoded list
+# is missing 95%+ of currently-available production model IDs in the surveyed ecosystem.
+
+$ grep -n '"providers"\|"model"' rust/crates/commands/src/lib.rs | head -5
+89:        name: "model",
+716:        name: "providers",
+
+$ sed -n '716,720p' rust/crates/commands/src/lib.rs
+        name: "providers",
+        aliases: &[],
+        summary: "List available model providers",
+        argument_hint: None,
+        resume_supported: true,
+
+$ sed -n '1386,1390p' rust/crates/commands/src/lib.rs
+        "doctor" | "providers" => {
+            validate_no_args(command, &args)?;
+            SlashCommand::Doctor
+        }
+# /providers is just an alias for /doctor — runs the doctor diagnostic, NOT a model
+# catalog. The advertised summary "List available model providers" is misleading at
+# the slash-command spec level. Same advertised-but-unbuilt shape as #220's /image
+# and /screenshot.
+
+$ rg -n 'fn set_model|self.set_model' rust/crates/rusty-claude-cli/src/main.rs | head -5
+4778:            SlashCommand::Model { model } => self.set_model(model)?,
+4989:    fn set_model(&mut self, model: Option<String>) -> Result<bool, Box<dyn std::error::Error>> {
+
+$ sed -n '4989,5040p' rust/crates/rusty-claude-cli/src/main.rs | head -30
+fn set_model(&mut self, model: Option<String>) -> Result<bool, Box<dyn std::error::Error>> {
+    let Some(model) = model else { ... };
+    let model = resolve_model_alias_with_config(&model);
+    if model == self.model { ... }
+    let previous = self.model.clone();
+    let session = self.runtime.session().clone();
+    let runtime = build_runtime( ..., model.clone(), ... )?;
+    self.replace_runtime(runtime)?;
+    self.model.clone_from(&model);
+    println!("{}", format_model_switch_report(&previous, &model, message_count));
+    Ok(true)
+}
+# /model and `claw --model` both flow through this set_model function. The user-typed
+# string is run through resolve_model_alias_with_config (which only matches the 13-entry
+# MODEL_REGISTRY plus user-defined aliases from settings.json) and otherwise passed
+# through verbatim. There is zero validation against an authoritative source. The user
+# can type "/model claude-banana-9000" and the runtime will accept it, swap the active
+# model to that string, and only fail at request time when the upstream provider
+# returns 404 / invalid_model_error. There is no preflight listModels call to verify
+# the model exists in the provider's catalog before swapping.
+
+$ ls USAGE.md README.md
+USAGE.md  README.md
+
+$ grep -n '/v1/models\|claw models\|list models\|model discovery\|model catalog\|/models slash' USAGE.md README.md
+# (no output)
+# USAGE.md and README.md document only the local hardcoded alias table at USAGE.md:426-440
+# (six rows: opus, sonnet, haiku, grok, grok-mini, grok-2). The kimi alias and four
+# prefix routes (openai/, gpt-, qwen/, qwen-, kimi/, kimi-) aren't even in the documented
+# table. There is no documentation of model discovery, no `claw models` command reference,
+# no /v1/models endpoint reference, no model catalog freshness section, no instruction
+# for users on what to do when their provider ships a new model.
+```
+
+**(1) Endpoint absence: zero `GET /v1/models` and zero `GET /v1/models/{id}` surface.** The Anthropic Models API (https://docs.anthropic.com/en/api/models-list) exposes two operations: `GET /v1/models` (list with pagination via `before_id` / `after_id` / `limit` query params, GA 2024-12-04) and `GET /v1/models/{model_id}` (retrieve specific model metadata). The OpenAI Models API (https://platform.openai.com/docs/api-reference/models) exposes three operations: `GET /v1/models` (list), `GET /v1/models/{model}` (retrieve), and `DELETE /v1/models/{model}` (delete fine-tuned model). Zero of the five exist anywhere in `rust/crates/api/src/providers/anthropic.rs` or `rust/crates/api/src/providers/openai_compat.rs`. The closest analog is `/v1/messages/count_tokens` at anthropic.rs:529, which is a per-request preflight, not a catalog query. The endpoint absence is **complete and structural** — there is no fallback, no plugin hook, no escape hatch. The Anthropic provider has access to `/v1/messages`, `/v1/messages/count_tokens`, and (post-#221) the not-yet-implemented `/v1/messages/batches` family. The OpenAI-compat provider has access to `/v1/chat/completions` only. Neither has any path to query "what models does this provider currently offer."
+
+**(2) Data-model absence: zero `Model` taxonomy.** The Anthropic API specifies `ModelInfo { id: String, type: "model", display_name: String, created_at: String }` and `ModelList { data: Vec<ModelInfo>, first_id: Option<String>, last_id: Option<String>, has_more: bool }`. The OpenAI API specifies `Model { id: String, object: "model", created: u64, owned_by: String }` and `ModelList { object: "list", data: Vec<Model> }`. Zero hits in `rust/crates/api/src/types.rs` for any of: `Model` (the type name — the file has `MessageRequest`, `MessageResponse`, `MessageStartEvent`, `MessageDeltaEvent`, `MessageStopEvent`, `InputMessage`, `InputContentBlock`, `OutputContentBlock`, `ContentBlockDelta`, `MessageDelta`, `Usage`, `ToolDefinition`, `ToolChoice`, `ToolResultContentBlock`, `StreamEvent`, `ContentBlockStartEvent`, `ContentBlockDeltaEvent`, `ContentBlockStopEvent`, `ErrorBody`, but **no `Model` / `ModelInfo` / `ModelList`**), `ModelInfo`, `ModelList`, `ListModelsResponse`, `ModelCatalog`, `ProviderModel`, `OwnedBy`, `ModelObject`. The data-model layer is **structurally closed** to per-request types — there is no slot for a typed model-catalog representation, no slot for a `ModelInfo.created_at` timestamp (which is the canonical staleness signal both Anthropic and OpenAI publish), no slot for a `ModelInfo.display_name` (which is the canonical user-facing label), no slot for a `Model.owned_by` (which is the canonical provenance signal — `"openai"` vs `"system"` vs custom-fine-tuned-by-org).
+
+**(3) Trait-surface absence: zero `list_models` on `Provider` trait.** `rust/crates/api/src/providers/mod.rs:17-30` defines:
+
+```rust
+pub trait Provider {
+    type Stream;
+
+    fn send_message<'a>(
+        &'a self,
+        request: &'a MessageRequest,
+    ) -> ProviderFuture<'a, MessageResponse>;
+
+    fn stream_message<'a>(
+        &'a self,
+        request: &'a MessageRequest,
+    ) -> ProviderFuture<'a, Self::Stream>;
+}
+```
+
+Two methods, both per-request. There is no third method `list_models<'a>(&'a self) -> ProviderFuture<'a, ModelList>`, no `retrieve_model<'a>(&'a self, model_id: &'a str) -> ProviderFuture<'a, ModelInfo>`, no `list_models_paginated<'a>(&'a self, before_id: Option<&'a str>, after_id: Option<&'a str>, limit: u32) -> ProviderFuture<'a, ModelList>`. The `ProviderClient` enum at `rust/crates/api/src/client.rs:8-14` is closed under three variants (Anthropic / Xai / OpenAi), all three exposing only `send_message` and `stream_message` and the auxiliary preflight `count_tokens`. There is no fourth dispatch method `list_models` and no fifth `retrieve_model`. Adding either would require synchronized extension to all three provider variants and a new return-type taxonomy.
+
+**(4) Worker-runtime absence: zero model-discovery affordance in `rust/crates/runtime/`.** The runtime's `WorkerRegistry::observe_completion` at `worker_boot.rs:558` and `Conversation::run_turn` at `conversation.rs:314` both operate on a static `model: String` value passed in at session boot. There is no `refresh_model_catalog` task, no `WorkerStatus::ModelUnknown` variant for the case where the user-typed model isn't in the provider's catalog, no `WorkerEventPayload::ModelCatalogStale` for the case where the local hardcoded `MODEL_REGISTRY` predates the provider's published catalog, no `task_registry.rs` entry for "periodic model catalog refresh." The `pricing_for_model` function at `rust/crates/runtime/src/usage.rs:59-80` (the same function #209 documented as substring-matching haiku/opus/sonnet only and silently falling back to Opus pricing constants for everything else) has no input from a live catalog query — it is purely a compile-time-frozen string-substring lookup. The runtime layer mirrors the API layer's per-request granularity. No layer of the system has a "what models does the provider currently offer, and what are their context windows / max output tokens / per-million-token prices" affordance.
+
+**(5) CLI-surface absence: zero `claw models` / `claw model list` / `claw list-models` subcommand.** `claw --help` exposes no `models`, `model-list`, `list-models`, `list-providers`, `discover-models`, `model-catalog`, or analogous catalog-discovery subcommand. `claw models --help` returns the standard "command not found" / "did you mean" path. `claw status --json` has no `available_models` field. `claw doctor --json` does not check for model-catalog freshness, does not query the provider's `/v1/models` to validate the active model, does not warn when `MODEL_REGISTRY` predates the provider's published catalog by N days. The slash-command spec table at `rust/crates/commands/src/lib.rs` (the same table that advertises `/image` and `/screenshot` from #220 and `/batch` from #221's fix-shape) has no `/models`, `/list-models`, `/discover-models`, `/refresh-models`, `/model-catalog`, or analogous catalog slash command. The capability is invisible from every CLI, REPL, and slash-command discovery surface.
+
+**(6) Misleading `/providers` slash command.** `rust/crates/commands/src/lib.rs:716-720` declares:
+
+```rust
+SlashCommandSpec {
+    name: "providers",
+    aliases: &[],
+    summary: "List available model providers",
+    argument_hint: None,
+    resume_supported: true,
+},
+```
+
+The summary advertises **"List available model providers"** — implying a catalog query. The actual implementation at `rust/crates/commands/src/lib.rs:1386-1389`:
+
+```rust
+"doctor" | "providers" => {
+    validate_no_args(command, &args)?;
+    SlashCommand::Doctor
+}
+```
+
+…dispatches `/providers` as a literal alias of `/doctor`. `/doctor` runs the build / auth / config diagnostic at `rust/crates/rusty-claude-cli/src/main.rs:2302` (`run_doctor`) which checks: (a) version + git SHA, (b) credential resolution (which env vars are set, which file paths are read), (c) config file load and validation, (d) MCP server reachability, (e) plugin enumeration, (f) sandbox status. **It does not query any provider's `/v1/models` endpoint.** It does not enumerate the `MODEL_REGISTRY` constant. It does not list the user-defined aliases from `~/.claw/settings.json`. The summary is **false** — the command does not list providers, it runs a diagnostic. This is the same advertised-but-unbuilt shape as #220's `/image` and `/screenshot`, except worse: those two were gated under `STUB_COMMANDS` so the parse path returned a clear "unsupported" error; `/providers` is wired to a *different* command entirely, so the user gets a doctor report when they typed `/providers` expecting a model catalog. The command surfaces no error, no warning, no "did you mean `/doctor`?" — it just runs the doctor.
+
+**(7) `set_model` accepts arbitrary unvalidated strings.** `rust/crates/rusty-claude-cli/src/main.rs:4989-5037` (`set_model`) is the central swap-the-active-model function called from both the `/model <name>` slash command and the `claw --model <name>` CLI flag. The flow:
+
+1. Read user-supplied `model: Option<String>` argument.
+2. Run through `resolve_model_alias_with_config` which checks 13-entry `MODEL_REGISTRY` plus user-defined `aliases` map from settings.
+3. If resolved string equals current model: print model-report and return.
+4. Otherwise: rebuild runtime with the new string, swap, print switch-report.
+
+**There is no validation against the provider's actual catalog.** A user who types `/model claude-banana-9000` will see:
+
+```
+Switched model: claude-sonnet-4-6 → claude-banana-9000
+```
+
+…and the runtime will happily accept this and pass `model: "claude-banana-9000"` on every subsequent `/v1/messages` request, only failing when the provider returns `404` / `invalid_model_error: "model claude-banana-9000 not found"` at request time. The error is a **late-bound runtime error masquerading as a model-not-found error**, when an authoritative-source check at the time of `set_model` would have caught it preflight. The `pricing_for_model` substring match for `"banana"` would also return `None`, falling through to the `default_sonnet_tier` constants (which #209 documented are actually Opus pricing, so the cost estimate is now triply broken: wrong model, wrong pricing tier, wrong cost). The `model_token_limit` function returns `None` for `claude-banana-9000`, so `preflight_message_request` no-ops and a 200,000-token oversize request goes to the wire instead of being caught at the preflight layer. The validation gap **leaks all the way from the CLI to the wire** because there is no authoritative-source check at any layer.
+
+**(8) USAGE.md / README.md document only a stale subset of the hardcoded registry.** `USAGE.md:426-440` documents an "Tested models and aliases" table with **six rows**: `opus`, `sonnet`, `haiku`, `grok`/`grok-3`, `grok-mini`/`grok-3-mini`, `grok-2`. This table is **incomplete** even against the hardcoded `MODEL_REGISTRY` — the `kimi` alias is not listed, the four prefix routes (`openai/`, `gpt-`, `qwen/`, `qwen-`, `kimi/`, `kimi-`) are mentioned only in passing prose at line 397, and the user-defined-aliases section at line 449 refers to the alias table without listing the prefix-route fallback behavior. The table also fails to match the actual `model_token_limit` registry — the table reports `grok-2` as `—` / `—` for max output and context window, but `model_token_limit("grok-2")` returns `None` so the preflight check no-ops. There is **zero documentation** of `/v1/models` endpoint usage, zero documentation of model-catalog discovery, zero documentation of "what to do when your provider ships a new model that isn't in claw-code's hardcoded registry." The doc surface is **as stale as the registry itself**, and both are stale by design — there is no mechanism for refreshing either.
+
+**(9) Cluster-shape kinship and novelty.** Same family as #221 (Message Batches API endpoint-family-level absence) and #218/#220 (capability-parity gaps with multi-layer structural absence). The failure mode is **the second-largest endpoint-family-level capability absence catalogued**, behind only #221's seven-layer Batch dispatch family (which had additional Worker-registry-status + pricing-tier-flag layers). #222 spans **eight layers**: (a) endpoint URL — both `GET /v1/models` and `GET /v1/models/{id}`, (b) data-model taxonomy — `Model` / `ModelInfo` / `ModelList` / `ListModelsResponse` / `OwnedBy` / `ModelObject`, (c) Provider trait method — `list_models` / `retrieve_model`, (d) ProviderClient enum dispatch — three variants without the dispatch arm, (e) CLI subcommand surface — no `claw models`, no `claw model list`, (f) slash command surface — no `/models` and existing `/providers` is a misleading alias to `/doctor`, (g) `set_model` validation — accepts arbitrary unvalidated strings, (h) `MODEL_REGISTRY` + `model_token_limit` + `pricing_for_model` + USAGE.md table — four downstream consumers all hardcoded with stale data and no refresh path. Composing with #209 (pricing fallback uses Opus values), #210 (max_tokens 4x over-limit for non-registry models), and #221 (Batch API absent — itself depends on knowing which models support batch), this gap is the **upstream root cause** of three downstream cost-and-correctness gaps in the cluster. Distinct from prior single-field (#211/#212/#214) / response-only (#213/#207) / header-only (#215) / three-dimensional (#216) / classifier-leakage (#217) / four-layer (#218) / false-positive-opt-in (#219) / five-layer-feature-absence (#220) / seven-layer-endpoint-family-absence (#221) members; the **eight-layer-endpoint-family-absence-with-misleading-alias** shape is novel: the existing `/providers` slash command makes the gap **worse** than a plain absence by actively misleading users into running `/doctor` when they expected a model catalog. This motivates a new doctrine entry: **advertised-but-rerouted is a strict-superset of advertised-but-unbuilt** (#220 / #218); when an existing UX surface is wired to a *different* command than its advertised summary describes, the bug surface is the original-advertised-feature absence + the user-confusion-from-misalignment + the silent-routing-to-wrong-handler — three bugs in one parse arm.
+
+**Reproduction sketch:**
+
+```rust
+// Test 1: ProviderClient cannot list models.
+#[test]
+fn provider_client_lacks_list_models() {
+    use api::ProviderClient;
+    let client = ProviderClient::from_model("claude-sonnet-4-6").unwrap();
+    // Compile-time observable: this call does not exist.
+    // let _models = client.list_models().await;
+    // The method does not exist on ProviderClient. The struct ModelList
+    // does not exist in the api crate. The catalog has no API surface.
+    let _ = client;
+}
+
+// Test 2: /providers slash command is misleading.
+#[test]
+fn providers_slash_command_is_alias_for_doctor() {
+    use commands::{parse_slash_command, SlashCommand};
+    let parsed = parse_slash_command("/providers", &[]).unwrap();
+    assert!(matches!(parsed, SlashCommand::Doctor));
+    // The command spec advertises "List available model providers" but parses
+    // to the Doctor command, which runs the build/auth/config diagnostic instead.
+    // Running /providers does NOT query any provider's /v1/models endpoint,
+    // does NOT enumerate MODEL_REGISTRY, does NOT list user-defined aliases.
+}
+
+// Test 3: set_model accepts garbage strings.
+#[test]
+fn set_model_accepts_unvalidated_strings() {
+    let mut session = ReplSession::new("claude-sonnet-4-6");
+    // No provider call is made to validate this string against /v1/models.
+    let result = session.set_model(Some("claude-banana-9000".to_string()));
+    assert!(result.is_ok());
+    assert_eq!(session.model, "claude-banana-9000");
+    // The runtime swaps to the bogus model. The next /v1/messages request will
+    // return 404 / invalid_model_error from the provider. There is no preflight
+    // listModels call to catch this at the /model slash command boundary.
+}
+
+// Test 4: MODEL_REGISTRY is missing 95%+ of currently-available production model IDs.
+#[test]
+fn model_token_limit_missing_current_production_ids() {
+    use api::providers::model_token_limit;
+    // 2026-04 production model IDs that should resolve but return None:
+    assert!(model_token_limit("claude-opus-4-7").is_none());        // next Opus revision
+    assert!(model_token_limit("claude-haiku-4-6").is_none());        // next Haiku revision
+    assert!(model_token_limit("claude-sonnet-4-7").is_none());       // hypothetical
+    assert!(model_token_limit("gpt-5.2").is_none());                  // current OpenAI flagship
+    assert!(model_token_limit("o3").is_none());                       // current OpenAI reasoning
+    assert!(model_token_limit("o4-mini").is_none());                  // current OpenAI mini
+    assert!(model_token_limit("kimi-k3").is_none());                  // current Moonshot
+    assert!(model_token_limit("qwen3-max").is_none());                // current Alibaba flagship
+    assert!(model_token_limit("grok-4").is_none());                   // current xAI flagship
+    assert!(model_token_limit("deepseek-reasoner").is_none());        // current DeepSeek reasoning
+    // Ten failures. The hardcoded match arm covers six model IDs; everything
+    // else returns None and silently no-ops the preflight context-window check.
+}
+
+// Test 5: USAGE.md model table is stale even vs hardcoded MODEL_REGISTRY.
+#[test]
+fn usage_md_table_is_subset_of_hardcoded_registry() {
+    let usage_md = std::fs::read_to_string("USAGE.md").unwrap();
+    let table_section = usage_md.split("### Tested models and aliases").nth(1).unwrap();
+    // Documented: opus, sonnet, haiku, grok, grok-mini, grok-2 (six rows).
+    // MODEL_REGISTRY: opus, sonnet, haiku, grok, grok-3, grok-mini, grok-3-mini,
+    //                 grok-2, kimi (nine entries) + 4 prefix routes.
+    // Documentation gap: kimi alias is not listed in the table.
+    assert!(!table_section.contains("`kimi`"), "Documentation gap reproducible: kimi alias missing from USAGE.md table");
+}
+```
+
+**Fix shape (not implemented in this cycle, recorded for cluster refactor):**
+
+The minimal fix is an eight-touch architectural extension. (a) Define `pub struct ModelInfo { pub id: String, pub object: String, pub created_at: Option<String>, pub display_name: Option<String>, pub owned_by: Option<String> }` and `pub struct ModelList { pub data: Vec<ModelInfo>, pub first_id: Option<String>, pub last_id: Option<String>, pub has_more: bool }` at `rust/crates/api/src/types.rs` near line 234 (in a new `Model Catalog` section, alongside `BatchedRequest` from #221's fix-shape). (b) Re-export the new types from `rust/crates/api/src/lib.rs` near line 33. (c) Extend the `Provider` trait at `rust/crates/api/src/providers/mod.rs:17` with `fn list_models<'a>(&'a self, before_id: Option<&'a str>, after_id: Option<&'a str>, limit: u32) -> ProviderFuture<'a, ModelList>; fn retrieve_model<'a>(&'a self, model_id: &'a str) -> ProviderFuture<'a, ModelInfo>;` — two new methods on the trait. (d) Implement on `AnthropicClient` (`rust/crates/api/src/providers/anthropic.rs`) using `GET /v1/models?before_id&after_id&limit` and `GET /v1/models/{model_id}`, reusing the existing `auth.apply()` and retry/backoff infrastructure from `count_tokens`. (e) Implement on `OpenAiCompatClient` (`rust/crates/api/src/providers/openai_compat.rs`) using `GET /v1/models` (returning `{ object: "list", data: [...] }`) and `GET /v1/models/{model_id}`. (f) Extend `ProviderClient` enum at `rust/crates/api/src/client.rs:8` with the two new dispatch methods that forward to the appropriate per-variant impl. (g) Add a `claw models list` / `claw models retrieve <id>` CLI subcommand family at `rust/crates/rusty-claude-cli/src/main.rs`, threading the `--limit`, `--before-id`, `--after-id`, `--output-format json|text` flags. Add `claw doctor --json` `model_catalog: { provider, models: [...], staleness_seconds }` field. Add slash command `/models` (now distinct from `/providers`) that prints the live provider catalog, with `/providers` rerouted to actually print the configured providers list (xAI, Anthropic, OpenAI-compat) instead of being a `/doctor` alias. The slash command spec for `/providers` should either be (i) renamed to clarify it's a doctor alias, or (ii) actually wired to a new `print_providers` handler that enumerates the `MODEL_REGISTRY` + user-defined aliases + active provider configurations. (h) Add validation in `set_model` (`rust/crates/rusty-claude-cli/src/main.rs:4989`) that runs `ProviderClient::list_models` with a 5-second timeout and warns (not errors) if the user-typed model isn't in the catalog; the warning should be a yellow "warning: model 'X' not in <provider>'s /v1/models catalog as of <timestamp>; the request may fail with invalid_model_error" but not block the swap (some local providers like Ollama don't expose `/v1/models` reliably). Estimate: ~210 LOC production + ~280 LOC test (covering both operations × Anthropic-native and OpenAI-compat lanes × pagination × `created_at` staleness signal × user-typed-garbage validation × CLI-and-slash-command-surface symmetry × USAGE.md table generated-from-source guard). The deeper fix is to declare a `Catalog` typed struct at the data-model layer that unifies model discovery + pricing + token-limit + capability-flags, with a single `Provider::catalog()` method returning a structured snapshot that supersedes the compile-time-frozen `MODEL_REGISTRY` + `model_token_limit` + `pricing_for_model` triple. This collapses #209 (pricing substring match) + #210 (max_tokens shadow fork) + #221 (batch dispatch) + #222 (model discovery) into one composable rule and gives claw-code catalog-axis parity with anomalyco/opencode (which uses `models.dev` as an external pricing+capability data source with explicit fallback metadata), simonw/llm (`llm models` first-class CLI subcommand backed by per-plugin model registration), Vercel AI SDK (`provider.languageModels()` and `provider.embeddingModels()` first-class APIs), LangChain (`init_chat_model(model_provider, model_name)` reflective-discovery pattern), OpenAI Python SDK (`client.models.list()` first-class typed surface), Anthropic Python SDK (`client.models.list()` parallel surface), Anthropic TypeScript SDK (parallel API), and Anthropic's own claude-code CLI (`/model` command that fuzzy-matches against a refreshed catalog). The cluster doctrine accumulates: every catalog-discovery axis that exists in 2025+ provider APIs must have a typed slot in the Rust data model, must traverse the wire via `serde_json::to_value` without ad-hoc string splicing, must round-trip cleanly through both native and openai-compat lanes, must have a CLI subcommand surface AND a slash command surface that match each other, must not be aliased to a different command (advertised-but-rerouted shape), and must validate user-supplied model strings against the live catalog at swap time (not at request time). The eighth axis — slash-command-vs-CLI-symmetry-with-no-misleading-alias — is novel in the cluster and motivates a new doctrine entry: any slash-command spec entry's `summary` field must be a derive-from-implementation invariant; if the summary says "List available model providers" the parse arm must list them, not run a diagnostic. Distinct from #220's `/image` and `/screenshot` (advertised, gated under STUB_COMMANDS, returns clear unsupported error) and #218's `response_format` field absence (no UX surface advertising it), #222's `/providers` rerouting is **active misdirection** at the UX layer.
+
+**Status:** Open. No code changed. Filed 2026-04-26 02:00 KST. Branch: feat/jobdori-168c-emission-routing. HEAD: 9acd4f1. Sibling-shape cluster (silent-fallback / silent-drop / silent-strip / silent-misnomer / silent-shadow / silent-prefix-mismatch / structural-absence / silent-zero-coercion / silent-content-discard / silent-header-discard / silent-tier-absence / silent-finish-mistranslation / silent-capability-absence / silent-false-positive-opt-in / advertised-but-unbuilt / endpoint-family-level-absence / advertised-but-rerouted): #201/#202/#203/#206/#207/#208/#209/#210/#211/#212/#213/#214/#215/#216/#217/#218/#219/#220/#221/#222 — twenty-one pinpoints. Wire-format-parity cluster grows to twelve: #211 (max_completion_tokens) + #212 (parallel_tool_calls) + #213 (cached_tokens response-side) + #214 (reasoning_content) + #215 (Retry-After) + #216 (service_tier + system_fingerprint) + #217 (finish_reason taxonomy) + #218 (response_format / output_config / refusal) + #219 (cache_control request-side) + #220 (image content block + media_type) + #221 (Message Batches API) + #222 (Models list endpoint + ModelInfo + ModelList + Provider trait extension + CLI subcommand + slash command symmetry + set_model validation + advertised-but-rerouted /providers fix). Capability-parity cluster grows to four: #218 (structured outputs) + #220 (multimodal input) + #221 (batch dispatch) + #222 (model discovery) — four members, all four-or-more-layer structural absences. Discovery-and-validation cluster (the strict-superset of capability-parity that includes catalog-discovery, user-input-validation, and CLI-vs-slash-command symmetry): #222 alone, but #222 is the **upstream root cause** of #209's pricing-fallback gap (no live catalog to refresh pricing from), #210's max_tokens shadow-fork gap (no live catalog to validate the shadow constants against), and #221's batch-dispatch gap (no live catalog to query "which models support batch"). Eight-layer-endpoint-family-absence-with-misleading-alias shape (endpoint-URL + data-model-taxonomy + Provider-trait-method + ProviderClient-enum-dispatch + CLI-subcommand-surface + slash-command-surface-with-misleading-alias + set_model-validation + downstream-consumers-with-stale-data) is the largest single advertised-vs-actual gap catalogued, distinct from prior single-field (#211/#212/#214) / response-only (#213/#207) / header-only (#215) / three-dimensional (#216) / classifier-leakage (#217) / four-layer (#218) / false-positive-opt-in (#219) / five-layer-feature-absence (#220) / seven-layer-endpoint-family-absence (#221) members; the advertised-but-rerouted shape is novel and applies to any slash-command spec entry where the `summary` field describes a feature different from what the parse arm dispatches to. External validation: Anthropic Models API reference (https://docs.anthropic.com/en/api/models-list — `GET /v1/models` GA 2024-12-04, paginated via `before_id` / `after_id` / `limit`, returns `ModelInfo { id, type: "model", display_name, created_at }` with stable model IDs across the Anthropic catalog), Anthropic Models API retrieve reference (https://docs.anthropic.com/en/api/models — `GET /v1/models/{model_id}` for single-model lookup), OpenAI Models API reference (https://platform.openai.com/docs/api-reference/models — `GET /v1/models`, the literally first endpoint after auth, returns `ModelList { object: "list", data: Vec<Model { id, object: "model", created, owned_by }> }`), OpenAI Python SDK `client.models.list()` and `client.models.retrieve(model_id)` (https://github.com/openai/openai-python — first-class typed surface), Anthropic Python SDK `client.models.list()` and `client.models.retrieve(model_id)` (https://github.com/anthropics/anthropic-sdk-python — parallel surface, GA-shipped 2024-12-04 alongside the API endpoint), Anthropic TypeScript SDK `client.models.list()` (https://github.com/anthropics/anthropic-sdk-typescript), AWS Bedrock ListFoundationModels API (https://docs.aws.amazon.com/bedrock/latest/APIReference/API_ListFoundationModels.html — Bedrock-anthropic-relay equivalent, returns `FoundationModelSummary` with provider + model + input/output modalities + active flag), Azure OpenAI Models reference (https://learn.microsoft.com/en-us/azure/ai-services/openai/reference#models — Azure-deployment-aware model catalog with `deploymentId` + `modelType`), Vertex AI Models API (https://cloud.google.com/vertex-ai/docs/reference/rest/v1/models — `projects.locations.models.list` for Vertex-published Anthropic/Gemini/3rd-party models), DeepSeek Models API reference (https://api-docs.deepseek.com/api/list-models — OpenAI-compat shape), Moonshot Models API reference (https://platform.moonshot.cn/docs/api/list-models — same shape), Alibaba DashScope models endpoint (https://help.aliyun.com — `/v1/models` returns OpenAI-compat shape), xAI Models API (https://docs.x.ai/docs/api-reference#models — OpenAI-compat shape), OpenRouter Models API (https://openrouter.ai/api/v1/models — gateway-aware with provider+pricing+context-length per-model, the canonical "live model catalog with pricing" reference and the model that anomalyco/opencode-via-models.dev uses for its pricing data freshness), simonw/llm `llm models` and `llm models default <model>` (https://llm.datasette.io/en/stable/usage.html#listing-models — first-class CLI subcommand backed by per-plugin model registration with `models.dev`-equivalent freshness), simonw/llm models-from-env discovery (https://llm.datasette.io/en/stable/plugins/index.html — plugin-registration architecture for ad-hoc model addition), Vercel AI SDK 6 `provider.languageModels()` and `provider.embeddingModels()` (https://sdk.vercel.ai — first-class typed catalog APIs), LangChain `init_chat_model(model_provider, model_name)` (https://python.langchain.com/api_reference/langchain/chat_models/langchain.chat_models.base.init_chat_model.html — reflective discovery via provider-defined catalogs), LangChain `BaseChatModel.aget_models` (https://python.langchain.com — async catalog query), models.dev (https://models.dev — community-maintained authoritative model catalog with pricing + capability flags + provider routing, used by anomalyco/opencode for its pricing data freshness — the canonical "external authoritative source for model metadata" reference), anomalyco/opencode `models.dev` integration (https://github.com/anomalyco/opencode — uses models.dev as the pricing-data-and-capability source, with periodic refresh and explicit fallback metadata when a model id isn't in the catalog), charmbracelet/crush model registry (https://github.com/charmbracelet/crush — typed catalog with provider+model+input/output-pricing), continue.dev model catalog (https://github.com/continuedev/continue — config-file-driven catalog with auto-refresh from provider endpoints), zed-industries/zed model catalog (https://github.com/zed-industries/zed — bundled JSON catalog with periodic upstream refresh), tabby (https://github.com/TabbyML/tabby — model catalog via plugin registration), llama.cpp server `/v1/models` (https://github.com/ggerganov/llama.cpp/blob/master/examples/server/README.md — local-model catalog via OpenAI-compat shape), LM Studio `/v1/models` (https://lmstudio.ai/docs/local-server — local-model catalog), Ollama `/api/tags` and `/v1/models` (https://github.com/ollama/ollama/blob/main/docs/api.md — local-model catalog with both Ollama-native and OpenAI-compat shapes), llamafile model catalog (https://github.com/Mozilla-Ocho/llamafile — bundled-model catalog), LiteLLM models reference (https://docs.litellm.ai/docs/completion/supported — proxy-level model catalog covering 100+ models), portkey.ai model catalog (https://portkey.ai/docs/integrations/llms — gateway-level catalog), helicone.ai model catalog (https://www.helicone.ai/blog/openai-models-list — observability-platform model catalog with usage stats per-model), prompthub.us multi-provider model comparison (https://www.prompthub.us — model-catalog-as-service), OpenTelemetry GenAI semconv `gen_ai.request.model` and `gen_ai.response.model` (https://opentelemetry.io/docs/specs/semconv/gen-ai/gen-ai-spans/ — both attributes documented as required for spans, meaning every observability backend treats model as a first-class structured signal that requires authoritative-source validation), OpenAPI 3.1 spec for `/v1/models` (https://github.com/openai/openai-openapi — canonical machine-readable schema for the endpoint shape used by OpenAI-compat providers), Anthropic API stability versioning (https://docs.anthropic.com/en/api/versioning — `anthropic-version` header semver-stable since 2023-06-01, models endpoint stable since 2024-12-04). Thirty-two ecosystem references, three first-class models endpoint specs (Anthropic, OpenAI, OpenRouter), GA timeline of 16 months on Anthropic's side and 6+ years on OpenAI's side (the literal first endpoint after auth), eight first-class CLI/SDK implementations (Anthropic Python+TypeScript, OpenAI Python, simonw/llm, Vercel AI SDK, LangChain, Zed, charmbracelet/crush), seven first-class local-model catalogs (Ollama, LM Studio, llama.cpp server, llamafile, Tabby, Continue.dev, LiteLLM proxy), one community-maintained authoritative pricing source (models.dev) used by the closest peer coding agent. claw-code is the **sole client/agent/CLI in the surveyed coding-agent ecosystem with zero `/v1/models` integration AND a misleading `/providers` slash command that aliases to `/doctor`** — both gaps are unique to claw-code in the surveyed ecosystem, the model-discovery gap is the **upstream root cause** of three downstream cost-and-correctness gaps already catalogued in this audit (#209 / #210 / #221), and the misleading-alias-shape is novel within the cluster. The fix shape is well-understood, all reference implementations exist in peer codebases (Anthropic Python/TypeScript SDKs, simonw/llm, Vercel AI SDK, LangChain, OpenRouter, models.dev, Zed, charmbracelet/crush), and the use-case framing aligns directly with claw-code's own roadmap "machine-readable in state and failure modes" goal — a model catalog is **the** machine-readable representation of the provider's capability surface, and shipping without one means every downstream layer has to hardcode its own stale subset. #222 closes the upstream root cause of three downstream gaps and unblocks live-catalog-driven cost-estimation, max-tokens-validation, batch-capability-detection, and CLI-vs-slash-command-symmetry that the runtime's clawability doctrine treats as canonical baseline expectations.
+
+🪨
