@@ -4,12 +4,13 @@ All notable changes to claw-code are documented in this file.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html) (currently pre-1.0).
 
-## [Unreleased] — 2026-04-26 to 2026-04-27 (extended dogfood audit cycles)
+## [Unreleased] — 2026-04-26 to 2026-04-27 (extended dogfood audit cycles, through #427)
 
 Branch: `feat/jobdori-168c-emission-routing`
 
 ### Added — Documentation
 
+- **docs/ARCHITECTURE.md** — High-level architecture overview: 9 Rust crates, request flow, subsystem map with pinpoint links (cycle #426)
 - **CHANGELOG.md** — This file (cycle #424)
 - **docs/PINPOINT_FILING_GUIDE.md** — Step-by-step pinpoint filing workflow with #290 worked example (cycle #422)
 - **docs/SUPPORTED_PROVIDERS.md** — Documents 4 providers (Anthropic, xAI, DashScope/Qwen/Kimi, OpenAI/compat) from MODEL_REGISTRY (cycle #420)
@@ -30,7 +31,10 @@ Branch: `feat/jobdori-168c-emission-routing`
 
 ### Filed — Pinpoints (ROADMAP.md)
 
-46 pinpoints filed (#241-#291) during extended dogfood audit. New clusters identified:
+47 pinpoints filed (#241-#292) during extended dogfood audit. New entries:
+- **#292** — Extreme sustained upstream degradation lacks user-facing escalation guidance (cycle #425). Evidence: gaebal-gajae 17+ `500 empty_stream` failures across 5+ hours
+
+Clusters identified:
 - **Auto-compaction (4-deep):** #283, #287 (CRITICAL), #288, #289
 - **Transport / Provider Resilience:** #266, #285, #290, #291
 - **Provider Infrastructure:** #245, #246, #285
