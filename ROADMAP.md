@@ -34,6 +34,58 @@
 
 ---
 
+## Pinpoint Cluster Index
+
+For navigation. Click cluster name to jump to first member. Pinpoints can belong to multiple clusters.
+
+### Auto-compaction (4-deep)
+- #283 — Compaction threshold env-only, no settings.json key
+- #287 — Reactive-after-success, not preflight-before-request (CRITICAL)
+- #288 — Failure JSON envelope omits compaction diagnostics
+- #289 — Manual `/compact` skip-reason flattened to "below threshold"
+
+### Transport / Provider Resilience (new, post-#416)
+- #266 — Typed-error-kind taxonomy
+- #285 — Provider/model/websearch declarative source-of-truth
+- #290 — Upstream stream-init failures bypass typed envelope
+- #291 — No repeat-failure detection / circuit-breaker
+
+### Provider Infrastructure
+- #245 — Declarative providers config
+- #246 — Backend swap
+- #285 — Source-of-truth (overlap with Transport cluster)
+
+### Tool Lifecycle / Hooks
+- #254 — MCP refresh
+- #268 — Tool-rendering parity
+- #274 — Hook-execution-event envelope
+- #280 — Hook event tap
+- #286 — Parallel agent detached-thread (no JoinHandle)
+
+### CLI Dispatch
+- #262 — `--max-turns` spec
+- #267 — `--cwd` runtime fix
+- #272 — Position-independent parsing
+- #282 — env-vs-config consolidation
+- #283 — Compaction threshold (overlap with Auto-compaction)
+
+### Persistence / Migration
+- #278 — Version-comparison
+- #279 — Unknown-field policy
+
+### Provenance Consolidation
+- #259 — Unified provenance struct
+- #271 — Freshness assertions
+- #273 — Source-of-truth guards
+- #275 — Source-of-truth checks
+
+### Slash-command Contract
+- #284 — `/ultraplan` empty-shell
+
+For full list of all 46+ pinpoints (#200-#291), see the pinpoint sections below.
+
+---
+
 ## Goal
 
 Turn claw-code into the most **clawable** coding harness:
