@@ -214,4 +214,4 @@ Repo documentation suite shipped during extended dogfood audit. Status: present/
 | .github/PULL_REQUEST_TEMPLATE.md | ✅ Present | Medium | Standardizes PR descriptions |
 | docs/CONFIGURATION.md | ✅ Present | High | env vars, settings.json, provider config — relates to #283, #285 |
 | docs/API_REFERENCE.md | ❌ Missing | Medium | JSON envelope schema, output format contract |
-| .github/ISSUE_TEMPLATE/bug_report.md | ❌ Missing | Low | Standard bug template (pinpoint.md covers discovery) |
+| .github/ISSUE_TEMPLATE/bug_report.md | ✅ Present | #431 | Standard bug template with repro steps, environment, context sections |
