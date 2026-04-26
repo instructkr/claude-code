@@ -272,10 +272,38 @@ fn classify_error_kind(message: &str) -> &'static str {
         "unsupported_resumed_command"
     } else if message.contains("confirmation required") {
         "confirmation_required"
+    } else if message.contains("context_window_blocked") {
+        "context_window_blocked"
+    } else if message.contains("assistant stream produced no content") {
+        "assistant_no_content"
     } else if message.contains("api failed") || message.contains("api returned") {
         "api_http_error"
     } else {
         "unknown"
+    }
+}
+
+/// Returns `true` for error kinds that should not terminate the interactive
+/// REPL. The user can recover via `/compact`, `/clear`, switching model, etc.,
+/// and the runtime state has already been rolled back to the pre-turn snapshot
+/// because [`LiveCli::run_turn`] only commits via `replace_runtime` on success.
+fn is_repl_recoverable_kind(kind: &str) -> bool {
+    matches!(kind, "context_window_blocked" | "assistant_no_content")
+}
+
+/// Inspect a REPL turn failure. For recoverable kinds, render the error inline
+/// so the user sees the recovery suggestions and return `None` (caller continues
+/// the loop). For fatal kinds, return the error untouched (caller propagates).
+fn try_recover_repl_turn_error(
+    error: Box<dyn std::error::Error>,
+) -> Option<Box<dyn std::error::Error>> {
+    let message = error.to_string();
+    let kind = classify_error_kind(&message);
+    if is_repl_recoverable_kind(kind) {
+        eprintln!("[error-kind: {kind}]\nerror: {message}");
+        None
+    } else {
+        Some(error)
     }
 }
 
@@ -3642,12 +3670,20 @@ fn run_repl(
                 if let Some(prompt) = try_resolve_bare_skill_prompt(&cwd, &trimmed) {
                     editor.push_history(input);
                     cli.record_prompt_history(&trimmed);
-                    cli.run_turn(&prompt)?;
+                    if let Err(error) = cli.run_turn(&prompt) {
+                        if let Some(error) = try_recover_repl_turn_error(error) {
+                            return Err(error);
+                        }
+                    }
                     continue;
                 }
                 editor.push_history(input);
                 cli.record_prompt_history(&trimmed);
-                cli.run_turn(&trimmed)?;
+                if let Err(error) = cli.run_turn(&trimmed) {
+                    if let Some(error) = try_recover_repl_turn_error(error) {
+                        return Err(error);
+                    }
+                }
             }
             input::ReadOutcome::Cancel => {}
             input::ReadOutcome::Exit => {
@@ -9049,7 +9085,7 @@ mod tests {
         format_resume_report, format_status_report, format_tool_call_start, format_tool_result,
         format_ultraplan_report, format_unknown_slash_command,
         format_unknown_slash_command_message, format_user_visible_api_error,
-        classify_error_kind,
+        classify_error_kind, is_repl_recoverable_kind, try_recover_repl_turn_error,
         merge_prompt_with_stdin, normalize_permission_mode, parse_args, parse_export_args,
         parse_git_status_branch, parse_git_status_metadata_for, parse_git_workspace_summary,
         parse_history_count, permission_policy, print_help_to, push_output_block,
@@ -10565,7 +10601,52 @@ mod tests {
         assert_eq!(classify_error_kind("invalid model syntax: 'gpt-4'. Expected ..."), "invalid_model_syntax");
         assert_eq!(classify_error_kind("unsupported resumed command: /blargh"), "unsupported_resumed_command");
         assert_eq!(classify_error_kind("api failed after 3 attempts: ..."), "api_http_error");
+        assert_eq!(
+            classify_error_kind("Context window blocked\n  Failure class    context_window_blocked\n  Session abc"),
+            "context_window_blocked"
+        );
+        assert_eq!(
+            classify_error_kind("assistant stream produced no content"),
+            "assistant_no_content"
+        );
         assert_eq!(classify_error_kind("something completely unknown"), "unknown");
+    }
+
+    #[test]
+    fn is_repl_recoverable_kind_matches_only_recoverable_kinds() {
+        assert!(is_repl_recoverable_kind("context_window_blocked"));
+        assert!(is_repl_recoverable_kind("assistant_no_content"));
+        assert!(!is_repl_recoverable_kind("missing_credentials"));
+        assert!(!is_repl_recoverable_kind("api_http_error"));
+        assert!(!is_repl_recoverable_kind("session_not_found"));
+        assert!(!is_repl_recoverable_kind("unknown"));
+    }
+
+    #[test]
+    fn try_recover_repl_turn_error_swallows_recoverable_classes() {
+        let error: Box<dyn std::error::Error> = Box::<dyn std::error::Error + Send + Sync>::from(
+            "assistant stream produced no content",
+        );
+        assert!(try_recover_repl_turn_error(error).is_none());
+
+        let error: Box<dyn std::error::Error> = Box::<dyn std::error::Error + Send + Sync>::from(
+            "Context window blocked\n  Failure class    context_window_blocked",
+        );
+        assert!(try_recover_repl_turn_error(error).is_none());
+    }
+
+    #[test]
+    fn try_recover_repl_turn_error_propagates_fatal_classes() {
+        let error: Box<dyn std::error::Error> = Box::<dyn std::error::Error + Send + Sync>::from(
+            "missing Anthropic credentials; export ANTHROPIC_API_KEY",
+        );
+        let propagated =
+            try_recover_repl_turn_error(error).expect("fatal classes must propagate");
+        assert!(propagated.to_string().contains("missing Anthropic credentials"));
+
+        let error: Box<dyn std::error::Error> =
+            Box::<dyn std::error::Error + Send + Sync>::from("something completely unknown");
+        assert!(try_recover_repl_turn_error(error).is_some());
     }
 
     #[test]
