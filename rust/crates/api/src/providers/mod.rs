@@ -247,7 +247,63 @@ pub fn detect_provider_kind(model: &str) -> ProviderKind {
     if std::env::var_os("OPENAI_BASE_URL").is_some() {
         return ProviderKind::OpenAi;
     }
+    // Fallback: check stored provider config from setup wizard.
+    if let Some(kind) = stored_provider_kind() {
+        return kind;
+    }
     ProviderKind::Anthropic
+}
+
+/// Look up a stored provider config value by env var name.
+/// Returns the stored API key or base URL when the env var matches the
+/// configured provider kind, enabling the setup wizard to persist credentials
+/// that work without shell env vars.
+pub fn provider_config_value(key: &str) -> Option<String> {
+    let cwd = std::env::current_dir().ok()?;
+    let config = runtime::ConfigLoader::default_for(&cwd).load().ok()?;
+    let provider = config.provider();
+    let kind = provider.kind()?;
+    match (key, kind) {
+        ("ANTHROPIC_API_KEY" | "ANTHROPIC_AUTH_TOKEN", "anthropic") => provider.api_key().map(ToOwned::to_owned),
+        ("ANTHROPIC_BASE_URL", "anthropic") => provider.base_url().map(ToOwned::to_owned),
+        ("XAI_API_KEY", "xai") => provider.api_key().map(ToOwned::to_owned),
+        ("XAI_BASE_URL", "xai") => provider.base_url().map(ToOwned::to_owned),
+        ("OPENAI_API_KEY", "openai") => provider.api_key().map(ToOwned::to_owned),
+        ("OPENAI_BASE_URL", "openai") => provider.base_url().map(ToOwned::to_owned),
+        ("DASHSCOPE_API_KEY", "dashscope") => provider.api_key().map(ToOwned::to_owned),
+        ("DASHSCOPE_BASE_URL", "dashscope") => provider.base_url().map(ToOwned::to_owned),
+        _ => None,
+    }
+}
+
+/// Read an env var with a 3-tier fallback: process env -> .env file -> stored config.
+/// Environment variables always take priority over stored settings.
+pub fn read_env_or_config(key: &str) -> Result<Option<String>, ApiError> {
+    match std::env::var(key) {
+        Ok(value) if !value.is_empty() => return Ok(Some(value)),
+        Ok(_) | Err(std::env::VarError::NotPresent) => {}
+        Err(error) => return Err(ApiError::from(error)),
+    }
+    if let Some(value) = dotenv_value(key) {
+        return Ok(Some(value));
+    }
+    if let Some(value) = provider_config_value(key) {
+        return Ok(Some(value));
+    }
+    Ok(None)
+}
+
+/// Return the stored ProviderKind from config, if set.
+fn stored_provider_kind() -> Option<ProviderKind> {
+    let cwd = std::env::current_dir().ok()?;
+    let config = runtime::ConfigLoader::default_for(&cwd).load().ok()?;
+    let kind = config.provider().kind()?;
+    match kind {
+        "anthropic" => Some(ProviderKind::Anthropic),
+        "xai" => Some(ProviderKind::Xai),
+        "openai" => Some(ProviderKind::OpenAi),
+        _ => None,
+    }
 }
 
 #[must_use]

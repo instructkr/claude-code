@@ -23,6 +23,7 @@ pub enum ReadOutcome {
 struct SlashCommandHelper {
     completions: Vec<String>,
     current_line: RefCell<String>,
+    ctrl_p_pending: RefCell<bool>,
 }
 
 impl SlashCommandHelper {
@@ -30,6 +31,7 @@ impl SlashCommandHelper {
         Self {
             completions: normalize_completions(completions),
             current_line: RefCell::new(String::new()),
+            ctrl_p_pending: RefCell::new(false),
         }
     }
 
@@ -90,6 +92,13 @@ impl Highlighter for SlashCommandHelper {
     }
 
     fn highlight_char(&self, line: &str, _pos: usize, _kind: CmdKind) -> bool {
+        // Detect Ctrl+P: when previous line was empty and the new line is
+        // just "P", that's Ctrl+P on an empty buffer (AcceptLine inserts
+        // the character then submits). Set flag so read_line can intercept.
+        let prev = self.current_line();
+        if prev.is_empty() && line == "P" {
+            *self.ctrl_p_pending.borrow_mut() = true;
+        }
         self.set_current_line(line);
         false
     }
@@ -115,6 +124,11 @@ impl LineEditor {
         editor.set_helper(Some(SlashCommandHelper::new(completions)));
         editor.bind_sequence(KeyEvent(KeyCode::Char('J'), Modifiers::CTRL), Cmd::Newline);
         editor.bind_sequence(KeyEvent(KeyCode::Enter, Modifiers::SHIFT), Cmd::Newline);
+        // Ctrl+P: accept line to trigger provider wizard in the REPL loop
+        editor.bind_sequence(
+            KeyEvent(KeyCode::Char('P'), Modifiers::CTRL),
+            Cmd::AcceptLine,
+        );
 
         Self {
             prompt: prompt.into(),
@@ -147,7 +161,20 @@ impl LineEditor {
         }
 
         match self.editor.readline(&self.prompt) {
-            Ok(line) => Ok(ReadOutcome::Submit(line)),
+            Ok(line) => {
+                // Check if Ctrl+P was detected by the highlighter.
+                // The highlighter sets a flag when it sees the previous
+                // empty line change to uppercase "P", which is what
+                // Ctrl+P + AcceptLine produces on an empty buffer.
+                let is_ctrl_p = self
+                    .editor
+                    .helper()
+                    .is_some_and(|h| h.ctrl_p_pending.replace(false));
+                if is_ctrl_p {
+                    return Ok(ReadOutcome::Submit("/setup".to_string()));
+                }
+                Ok(ReadOutcome::Submit(line))
+            }
             Err(ReadlineError::Interrupted) => {
                 let has_input = !self.current_line().is_empty();
                 self.finish_interrupted_read()?;

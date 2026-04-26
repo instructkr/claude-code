@@ -65,6 +65,38 @@ pub struct RuntimeFeatureConfig {
     sandbox: SandboxConfig,
     provider_fallbacks: ProviderFallbackConfig,
     trusted_roots: Vec<String>,
+    provider: RuntimeProviderConfig,
+}
+
+/// Stored provider configuration from the setup wizard.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct RuntimeProviderConfig {
+    kind: Option<String>,
+    api_key: Option<String>,
+    base_url: Option<String>,
+    model: Option<String>,
+}
+
+impl RuntimeProviderConfig {
+    #[must_use]
+    pub fn kind(&self) -> Option<&str> {
+        self.kind.as_deref()
+    }
+
+    #[must_use]
+    pub fn api_key(&self) -> Option<&str> {
+        self.api_key.as_deref()
+    }
+
+    #[must_use]
+    pub fn base_url(&self) -> Option<&str> {
+        self.base_url.as_deref()
+    }
+
+    #[must_use]
+    pub fn model(&self) -> Option<&str> {
+        self.model.as_deref()
+    }
 }
 
 /// Ordered chain of fallback model identifiers used when the primary
@@ -315,6 +347,7 @@ impl ConfigLoader {
             sandbox: parse_optional_sandbox_config(&merged_value)?,
             provider_fallbacks: parse_optional_provider_fallbacks(&merged_value)?,
             trusted_roots: parse_optional_trusted_roots(&merged_value)?,
+            provider: parse_optional_provider_config(&merged_value)?,
         };
 
         Ok(RuntimeConfig {
@@ -414,6 +447,11 @@ impl RuntimeConfig {
     pub fn trusted_roots(&self) -> &[String] {
         &self.feature_config.trusted_roots
     }
+
+    #[must_use]
+    pub fn provider(&self) -> &RuntimeProviderConfig {
+        &self.feature_config.provider
+    }
 }
 
 impl RuntimeFeatureConfig {
@@ -482,6 +520,11 @@ impl RuntimeFeatureConfig {
     #[must_use]
     pub fn trusted_roots(&self) -> &[String] {
         &self.trusted_roots
+    }
+
+    #[must_use]
+    pub fn provider(&self) -> &RuntimeProviderConfig {
+        &self.provider
     }
 }
 
@@ -562,6 +605,91 @@ pub fn default_config_home() -> PathBuf {
         .map(PathBuf::from)
         .or_else(|| std::env::var_os("HOME").map(|home| PathBuf::from(home).join(".claw")))
         .unwrap_or_else(|| PathBuf::from(".claw"))
+}
+
+/// Save provider settings to the user-level `~/.claw/settings.json`.
+/// Creates the file and directory if they don't exist. Sets file permissions
+/// to `0o600` (owner read/write only) to protect stored API keys.
+pub fn save_user_provider_settings(
+    kind: &str,
+    api_key: &str,
+    base_url: Option<&str>,
+    model: Option<&str>,
+) -> Result<(), ConfigError> {
+    let config_home = default_config_home();
+    fs::create_dir_all(&config_home).map_err(ConfigError::Io)?;
+    let settings_path = config_home.join("settings.json");
+
+    let mut root = read_settings_root(&settings_path);
+
+    let mut provider = serde_json::Map::new();
+    provider.insert("kind".to_string(), serde_json::Value::String(kind.to_string()));
+    provider.insert("apiKey".to_string(), serde_json::Value::String(api_key.to_string()));
+    if let Some(base_url) = base_url {
+        provider.insert("baseUrl".to_string(), serde_json::Value::String(base_url.to_string()));
+    } else {
+        provider.remove("baseUrl");
+    }
+    if let Some(model) = model {
+        provider.insert("model".to_string(), serde_json::Value::String(model.to_string()));
+    } else {
+        provider.remove("model");
+    }
+    root.insert("provider".to_string(), serde_json::Value::Object(provider));
+
+    write_settings_root(&settings_path, &root)?;
+
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let perms = std::fs::Permissions::from_mode(0o600);
+        fs::set_permissions(&settings_path, perms).map_err(ConfigError::Io)?;
+    }
+
+    Ok(())
+}
+
+/// Remove the `provider` section from the user-level `~/.claw/settings.json`.
+pub fn clear_user_provider_settings() -> Result<(), ConfigError> {
+    let config_home = default_config_home();
+    let settings_path = config_home.join("settings.json");
+
+    if !settings_path.exists() {
+        return Ok(());
+    }
+
+    let mut root = read_settings_root(&settings_path);
+    if root.remove("provider").is_none() {
+        return Ok(());
+    }
+
+    write_settings_root(&settings_path, &root)?;
+
+    Ok(())
+}
+
+fn read_settings_root(path: &Path) -> serde_json::Map<String, serde_json::Value> {
+    match fs::read_to_string(path) {
+        Ok(contents) if !contents.trim().is_empty() => {
+            serde_json::from_str::<serde_json::Value>(&contents)
+                .ok()
+                .and_then(|v| v.as_object().cloned())
+                .unwrap_or_default()
+        }
+        _ => serde_json::Map::new(),
+    }
+}
+
+fn write_settings_root(
+    path: &Path,
+    root: &serde_json::Map<String, serde_json::Value>,
+) -> Result<(), ConfigError> {
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent).map_err(ConfigError::Io)?;
+    }
+    let rendered = serde_json::to_string_pretty(&serde_json::Value::Object(root.clone()))
+        .map_err(|e| ConfigError::Parse(e.to_string()))?;
+    fs::write(path, format!("{rendered}\n")).map_err(ConfigError::Io)
 }
 
 impl RuntimeHookConfig {
@@ -948,6 +1076,25 @@ fn parse_optional_oauth_config(
         manual_redirect_url,
         scopes,
     }))
+}
+
+fn parse_optional_provider_config(root: &JsonValue) -> Result<RuntimeProviderConfig, ConfigError> {
+    let Some(provider_value) = root.as_object().and_then(|object| object.get("provider")) else {
+        return Ok(RuntimeProviderConfig::default());
+    };
+    let Some(object) = provider_value.as_object() else {
+        return Ok(RuntimeProviderConfig::default());
+    };
+    let kind = optional_string(object, "kind", "provider")?.map(str::to_string);
+    let api_key = optional_string(object, "apiKey", "provider")?.map(str::to_string);
+    let base_url = optional_string(object, "baseUrl", "provider")?.map(str::to_string);
+    let model = optional_string(object, "model", "provider")?.map(str::to_string);
+    Ok(RuntimeProviderConfig {
+        kind,
+        api_key,
+        base_url,
+        model,
+    })
 }
 
 fn parse_mcp_server_config(
