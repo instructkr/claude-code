@@ -4,12 +4,16 @@ All notable changes to claw-code are documented in this file.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html) (currently pre-1.0).
 
-## [Unreleased] — 2026-04-26 to 2026-04-27 (extended dogfood audit cycles, through #427)
+## [Unreleased] — 2026-04-26 to 2026-04-27 (extended dogfood audit cycles, through #433)
 
 Branch: `feat/jobdori-168c-emission-routing`
 
 ### Added — Documentation
 
+- **docs/CONFIGURATION.md** — Configuration reference: env vars, settings.json, provider selection (cycle #429)
+- **CODE_OF_CONDUCT.md** — Contributor Covenant v2.1 (cycle #432)
+- **.github/PULL_REQUEST_TEMPLATE.md** — Standardized PR description template (cycle #430)
+- **.github/ISSUE_TEMPLATE/bug_report.md** — Standard bug report template (cycle #431)
 - **docs/ARCHITECTURE.md** — High-level architecture overview: 9 Rust crates, request flow, subsystem map with pinpoint links (cycle #426)
 - **CHANGELOG.md** — This file (cycle #424)
 - **docs/PINPOINT_FILING_GUIDE.md** — Step-by-step pinpoint filing workflow with #290 worked example (cycle #422)
