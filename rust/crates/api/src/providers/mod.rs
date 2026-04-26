@@ -8,6 +8,7 @@ use crate::error::ApiError;
 use crate::types::{MessageRequest, MessageResponse};
 
 pub mod anthropic;
+pub mod models_file;
 pub mod openai_compat;
 
 #[allow(dead_code)]
@@ -165,6 +166,12 @@ pub fn resolve_model_alias(model: &str) -> String {
 #[must_use]
 pub fn metadata_for_model(model: &str) -> Option<ProviderMetadata> {
     let canonical = resolve_model_alias(model);
+
+    // Check custom models from models.json first (user-defined overrides)
+    if let Some(custom) = models_file::custom_metadata_for_model(&canonical) {
+        return Some(custom);
+    }
+
     if canonical.starts_with("claude") {
         return Some(ProviderMetadata {
             provider: ProviderKind::Anthropic,
@@ -233,6 +240,10 @@ pub fn detect_provider_kind(model: &str) -> ProviderKind {
     {
         return ProviderKind::OpenAi;
     }
+    // Check if any custom model from models.json matches (without provider prefix)
+    if models_file::find_custom_model(model).is_some() {
+        return ProviderKind::OpenAi;
+    }
     if anthropic::has_auth_from_env_or_saved().unwrap_or(false) {
         return ProviderKind::Anthropic;
     }
@@ -254,6 +265,10 @@ pub fn detect_provider_kind(model: &str) -> ProviderKind {
 pub fn max_tokens_for_model(model: &str) -> u32 {
     model_token_limit(model).map_or_else(
         || {
+            // Check custom models from models.json
+            if let Some(custom) = models_file::custom_max_tokens(model) {
+                return custom;
+            }
             let canonical = resolve_model_alias(model);
             if canonical.contains("opus") {
                 32_000
@@ -276,6 +291,16 @@ pub fn max_tokens_for_model_with_override(model: &str, plugin_override: Option<u
 #[must_use]
 pub fn model_token_limit(model: &str) -> Option<ModelTokenLimit> {
     let canonical = resolve_model_alias(model);
+
+    // Check custom models from models.json first
+    if let Some(ctx) = models_file::custom_context_window(&canonical) {
+        let max_tokens = models_file::custom_max_tokens(&canonical).unwrap_or(16_384);
+        return Some(ModelTokenLimit {
+            max_output_tokens: max_tokens,
+            context_window_tokens: ctx,
+        });
+    }
+
     match canonical.as_str() {
         "claude-opus-4-6" => Some(ModelTokenLimit {
             max_output_tokens: 32_000,
