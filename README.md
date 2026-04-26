@@ -218,7 +218,7 @@ We welcome contributions! Before filing an issue or pull request:
 - **Supported providers:** See [docs/SUPPORTED_PROVIDERS.md](./docs/SUPPORTED_PROVIDERS.md)
 - **For security issues:** See [SECURITY.md](./SECURITY.md)
 - **For bug reports / features:** Check [ROADMAP.md](./ROADMAP.md) to see if it's already pinpointed
-- **How to file a pinpoint:** See [CONTRIBUTING.md](./CONTRIBUTING.md) for the exact format
+- **How to file a pinpoint:** See [CONTRIBUTING.md](./CONTRIBUTING.md) and the [Pinpoint Filing Guide](./docs/PINPOINT_FILING_GUIDE.md)
 - **Issue templates:** Use [.github/ISSUE_TEMPLATE/pinpoint.md](./.github/ISSUE_TEMPLATE/pinpoint.md)
 
 ## Ownership / affiliation disclaimer
