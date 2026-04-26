@@ -2,6 +2,10 @@
 
 Thanks for your interest. This project follows the **gaebal-gajae pinpoint cadence** — see [ROADMAP.md](./ROADMAP.md) for the current pinpoint census. Here's how to contribute effectively.
 
+## Security
+
+For security vulnerabilities, see [SECURITY.md](./SECURITY.md). **Do not file public pinpoints for security issues.**
+
 ## Filing a ROADMAP Pinpoint
 
 All feature requests and bug reports go through the pinpoint format (see `ROADMAP.md`). Each pinpoint must have:
