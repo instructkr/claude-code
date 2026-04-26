@@ -215,6 +215,7 @@ Claw Code is built in the open alongside the broader UltraWorkers toolchain:
 We welcome contributions! Before filing an issue or pull request:
 
 - **Troubleshooting:** See [TROUBLESHOOTING.md](./TROUBLESHOOTING.md) for common issues and recovery steps
+- **Supported providers:** See [docs/SUPPORTED_PROVIDERS.md](./docs/SUPPORTED_PROVIDERS.md)
 - **For security issues:** See [SECURITY.md](./SECURITY.md)
 - **For bug reports / features:** Check [ROADMAP.md](./ROADMAP.md) to see if it's already pinpointed
 - **How to file a pinpoint:** See [CONTRIBUTING.md](./CONTRIBUTING.md) for the exact format
