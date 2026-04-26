@@ -693,3 +693,17 @@ Current Rust crates:
 - `rusty-claude-cli`
 - `telemetry`
 - `tools`
+
+## Documentation
+
+- [ARCHITECTURE.md](docs/ARCHITECTURE.md) — System overview, crate layout, request flow
+- [CONFIGURATION.md](docs/CONFIGURATION.md) — Env vars, settings.json, provider config
+- [SUPPORTED_PROVIDERS.md](docs/SUPPORTED_PROVIDERS.md) — Provider/model matrix
+- [API_REFERENCE.md](docs/API_REFERENCE.md) — JSON output envelope, error format
+- [TROUBLESHOOTING.md](TROUBLESHOOTING.md) — Common failure modes and mitigation
+- [ROADMAP.md](ROADMAP.md) — Pinpoint-driven development roadmap
+- [CONTRIBUTING.md](CONTRIBUTING.md) — How to contribute, pinpoint format
+- [PINPOINT_FILING_GUIDE.md](docs/PINPOINT_FILING_GUIDE.md) — Step-by-step pinpoint workflow
+- [CHANGELOG.md](CHANGELOG.md) — Recent changes
+- [SECURITY.md](SECURITY.md) — Responsible disclosure
+- [CODE_OF_CONDUCT.md](CODE_OF_CONDUCT.md) — Community standards
