@@ -149,6 +149,8 @@ pub(crate) enum CliAction {
     Help {
         output_format: CliOutputFormat,
     },
+    /// Run JSON-RPC server over stdin/stdout for agent integration.
+    Rpc,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -257,6 +259,19 @@ pub(crate) fn parse_args(args: &[String]) -> Result<CliAction, String> {
             "--compact" => {
                 compact = true;
                 index += 1;
+            }
+            "--mode" => {
+                let value = args
+                    .get(index + 1)
+                    .ok_or_else(|| "missing value for --mode".to_string())?;
+                if value == "rpc" {
+                    return Ok(CliAction::Rpc);
+                } else {
+                    return Err(format!("unknown mode: {value} (supported: rpc)"));
+                }
+            }
+            "--mode=rpc" => {
+                return Ok(CliAction::Rpc);
             }
             "--base-commit" => {
                 let value = args

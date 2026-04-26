@@ -23,6 +23,25 @@ impl ProviderClient {
         anthropic_auth: Option<AuthSource>,
     ) -> Result<Self, ApiError> {
         let resolved_model = providers::resolve_model_alias(model);
+
+        // Check custom providers from models.json first
+        if let Some(custom) = providers::models_file::find_custom_model(&resolved_model) {
+            match custom.api.as_str() {
+                "anthropic-messages" => {
+                    let client =
+                        AnthropicClient::new(custom.api_key).with_base_url(custom.base_url);
+                    return Ok(Self::Anthropic(client));
+                }
+                _ => {
+                    // Default: openai-completions wire format
+                    let compat_config = OpenAiCompatConfig::openai();
+                    let client = OpenAiCompatClient::new(custom.api_key, compat_config)
+                        .with_base_url(custom.base_url);
+                    return Ok(Self::OpenAi(client));
+                }
+            }
+        }
+
         match providers::detect_provider_kind(&resolved_model) {
             ProviderKind::Anthropic => Ok(Self::Anthropic(match anthropic_auth {
                 Some(auth) => AnthropicClient::from_auth(auth),
