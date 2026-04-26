@@ -2,6 +2,7 @@ use serde_json;
 
 use std::fmt::Write as _;
 
+use crate::tui::theme::Theme;
 use crate::tui::tool_panel::{collapse_tool_output, ToolDisplayConfig};
 
 const DISPLAY_TRUNCATION_NOTICE: &str =
@@ -17,7 +18,7 @@ pub(crate) fn format_tool_call_start(name: &str, input: &str) -> String {
         "bash" | "Bash" => format_bash_call(&parsed),
         "read_file" | "Read" => {
             let path = extract_tool_path(&parsed);
-            format!("\x1b[2m📄 Reading {path}…\x1b[0m")
+            format!("{}📄 Reading {path}…{}", Theme::DIM, Theme::RESET)
         }
         "write_file" | "Write" => {
             let path = extract_tool_path(&parsed);
@@ -25,7 +26,13 @@ pub(crate) fn format_tool_call_start(name: &str, input: &str) -> String {
                 .get("content")
                 .and_then(|value| value.as_str())
                 .map_or(0, |content| content.lines().count());
-            format!("\x1b[1;32m✏️ Writing {path}\x1b[0m \x1b[2m({lines} lines)\x1b[0m")
+            format!(
+                "{}✏️ Writing {path}{} {}({lines} lines){}",
+                Theme::SUCCESS_BOLD,
+                Theme::RESET,
+                Theme::DIM,
+                Theme::RESET
+            )
         }
         "edit_file" | "Edit" => {
             let path = extract_tool_path(&parsed);
@@ -40,7 +47,9 @@ pub(crate) fn format_tool_call_start(name: &str, input: &str) -> String {
                 .and_then(|value| value.as_str())
                 .unwrap_or_default();
             format!(
-                "\x1b[1;33m📝 Editing {path}\x1b[0m{}",
+                "{}📝 Editing {path}{}{}",
+                Theme::WARNING,
+                Theme::RESET,
                 format_patch_preview(old_value, new_value)
                     .map(|preview| format!("\n{preview}"))
                     .unwrap_or_default()
@@ -58,35 +67,53 @@ pub(crate) fn format_tool_call_start(name: &str, input: &str) -> String {
 
     let border = "─".repeat(name.len() + 8);
     format!(
-        "\x1b[38;5;245m╭─ \x1b[1;36m{name}\x1b[0;38;5;245m ─╮\x1b[0m\n\x1b[38;5;245m│\x1b[0m {detail}\n\x1b[38;5;245m╰{border}╯\x1b[0m"
+        "{}╭─ {}{}{}{} ─╮{}\n{}{} {detail}\n{}╰{border}╯{}",
+        Theme::MUTED,
+        Theme::HIGHLIGHT,
+        name,
+        Theme::RESET,
+        Theme::MUTED,
+        Theme::RESET,
+        Theme::MUTED,
+        Theme::RESET,
+        Theme::MUTED,
+        Theme::RESET,
     )
 }
 
 pub(crate) fn format_tool_result(name: &str, output: &str, is_error: bool) -> String {
     let icon = if is_error {
-        "\x1b[1;31m✗\x1b[0m"
+        format!("{}{}{}", Theme::ERROR_BRIGHT, "✗", Theme::RESET)
     } else {
-        "\x1b[1;32m✓\x1b[0m"
+        format!("{}{}{}", Theme::SUCCESS_BOLD, "✓", Theme::RESET)
     };
     if is_error {
         let summary = truncate_for_summary(output.trim(), 160);
         return if summary.is_empty() {
-            format!("{icon} \x1b[38;5;245m{name}\x1b[0m")
+            format!("{icon} {}{}{}", Theme::MUTED, name, Theme::RESET)
         } else {
-            format!("{icon} \x1b[38;5;245m{name}\x1b[0m\n\x1b[38;5;203m{summary}\x1b[0m")
+            format!(
+                "{icon} {}{}{}\n{}{}{}",
+                Theme::MUTED,
+                name,
+                Theme::RESET,
+                Theme::ERROR,
+                summary,
+                Theme::RESET
+            )
         };
     }
 
     let parsed: serde_json::Value =
         serde_json::from_str(output).unwrap_or(serde_json::Value::String(output.to_string()));
     match name {
-        "bash" | "Bash" => format_bash_result(icon, &parsed),
-        "read_file" | "Read" => format_read_result(icon, &parsed),
-        "write_file" | "Write" => format_write_result(icon, &parsed),
-        "edit_file" | "Edit" => format_edit_result(icon, &parsed),
-        "glob_search" | "Glob" => format_glob_result(icon, &parsed),
-        "grep_search" | "Grep" => format_grep_result(icon, &parsed),
-        _ => format_generic_tool_result(icon, name, &parsed),
+        "bash" | "Bash" => format_bash_result(&icon, &parsed),
+        "read_file" | "Read" => format_read_result(&icon, &parsed),
+        "write_file" | "Write" => format_write_result(&icon, &parsed),
+        "edit_file" | "Edit" => format_edit_result(&icon, &parsed),
+        "glob_search" | "Glob" => format_glob_result(&icon, &parsed),
+        "grep_search" | "Grep" => format_grep_result(&icon, &parsed),
+        _ => format_generic_tool_result(&icon, name, &parsed),
     }
 }
 
@@ -109,7 +136,7 @@ pub(crate) fn format_search_start(label: &str, parsed: &serde_json::Value) -> St
         .get("path")
         .and_then(|value| value.as_str())
         .unwrap_or(".");
-    format!("{label} {pattern}\n\x1b[2min {scope}\x1b[0m")
+    format!("{label} {pattern}\n{}{scope}{}", Theme::DIM, Theme::RESET)
 }
 
 pub(crate) fn format_patch_preview(old_value: &str, new_value: &str) -> Option<String> {
@@ -117,9 +144,13 @@ pub(crate) fn format_patch_preview(old_value: &str, new_value: &str) -> Option<S
         return None;
     }
     Some(format!(
-        "\x1b[38;5;203m- {}\x1b[0m\n\x1b[38;5;70m+ {}\x1b[0m",
+        "{}- {}{}\n{}+ {}{}",
+        Theme::ERROR,
         truncate_for_summary(first_visible_line(old_value), 72),
-        truncate_for_summary(first_visible_line(new_value), 72)
+        Theme::RESET,
+        Theme::SUCCESS,
+        truncate_for_summary(first_visible_line(new_value), 72),
+        Theme::RESET,
     ))
 }
 
@@ -132,8 +163,10 @@ pub(crate) fn format_bash_call(parsed: &serde_json::Value) -> String {
         String::new()
     } else {
         format!(
-            "\x1b[48;5;236;38;5;255m $ {} \x1b[0m",
-            truncate_for_summary(command, 160)
+            "{} $ {} {}",
+            Theme::COMMAND_BG,
+            truncate_for_summary(command, 160),
+            Theme::RESET,
         )
     }
 }
@@ -145,7 +178,7 @@ pub(crate) fn first_visible_line(text: &str) -> &str {
 }
 
 pub(crate) fn format_bash_result(icon: &str, parsed: &serde_json::Value) -> String {
-    let mut lines = vec![format!("{icon} \x1b[38;5;245mbash\x1b[0m")];
+    let mut lines = vec![format!("{icon} {}{}{}", Theme::MUTED, "bash", Theme::RESET)];
     if let Some(task_id) = parsed
         .get("backgroundTaskId")
         .and_then(|value| value.as_str())
@@ -169,7 +202,12 @@ pub(crate) fn format_bash_result(icon: &str, parsed: &serde_json::Value) -> Stri
     if let Some(stderr) = parsed.get("stderr").and_then(|value| value.as_str()) {
         if !stderr.trim().is_empty() {
             let collapsed = collapse_tool_output(stderr, "bash", true, &config);
-            lines.push(format!("\x1b[38;5;203m{}\x1b[0m", collapsed.visible));
+            lines.push(format!(
+                "{}{}{}",
+                Theme::ERROR,
+                collapsed.visible,
+                Theme::RESET
+            ));
         }
     }
 
@@ -198,10 +236,12 @@ pub(crate) fn format_read_result(icon: &str, parsed: &serde_json::Value) -> Stri
     let end_line = start_line.saturating_add(num_lines.saturating_sub(1));
 
     format!(
-        "{icon} \x1b[2m📄 Read {path} (lines {}-{} of {})\x1b[0m\n{}",
+        "{icon} {}📄 Read {path} (lines {}-{} of {}){}\n{}",
+        Theme::DIM,
         start_line,
         end_line.max(start_line),
         total_lines,
+        Theme::RESET,
         truncate_output_for_display(content, READ_DISPLAY_MAX_LINES, READ_DISPLAY_MAX_CHARS)
     )
 }
@@ -217,8 +257,12 @@ pub(crate) fn format_write_result(icon: &str, parsed: &serde_json::Value) -> Str
         .and_then(|value| value.as_str())
         .map_or(0, |content| content.lines().count());
     format!(
-        "{icon} \x1b[1;32m✏️ {} {path}\x1b[0m \x1b[2m({line_count} lines)\x1b[0m",
+        "{icon} {}✏️ {} {path}{} {}({line_count} lines){}",
+        Theme::SUCCESS_BOLD,
         if kind == "create" { "Wrote" } else { "Updated" },
+        Theme::RESET,
+        Theme::DIM,
+        Theme::RESET,
     )
 }
 
@@ -229,8 +273,8 @@ pub(crate) fn format_structured_patch_preview(parsed: &serde_json::Value) -> Opt
         let lines = hunk.get("lines")?.as_array()?;
         for line in lines.iter().filter_map(|value| value.as_str()).take(6) {
             match line.chars().next() {
-                Some('+') => preview.push(format!("\x1b[38;5;70m{line}\x1b[0m")),
-                Some('-') => preview.push(format!("\x1b[38;5;203m{line}\x1b[0m")),
+                Some('+') => preview.push(format!("{}{}{}", Theme::SUCCESS, line, Theme::RESET)),
+                Some('-') => preview.push(format!("{}{}{}", Theme::ERROR, line, Theme::RESET)),
                 _ => preview.push(line.to_string()),
             }
         }
@@ -266,8 +310,16 @@ pub(crate) fn format_edit_result(icon: &str, parsed: &serde_json::Value) -> Stri
     });
 
     match preview {
-        Some(preview) => format!("{icon} \x1b[1;33m📝 Edited {path}{suffix}\x1b[0m\n{preview}"),
-        None => format!("{icon} \x1b[1;33m📝 Edited {path}{suffix}\x1b[0m"),
+        Some(preview) => format!(
+            "{icon} {}📝 Edited {path}{suffix}{}\n{preview}",
+            Theme::WARNING,
+            Theme::RESET
+        ),
+        None => format!(
+            "{icon} {}📝 Edited {path}{suffix}{}",
+            Theme::WARNING,
+            Theme::RESET
+        ),
     }
 }
 
@@ -289,9 +341,17 @@ pub(crate) fn format_glob_result(icon: &str, parsed: &serde_json::Value) -> Stri
         })
         .unwrap_or_default();
     if filenames.is_empty() {
-        format!("{icon} \x1b[38;5;245mglob_search\x1b[0m matched {num_files} files")
+        format!(
+            "{icon} {}glob_search{} matched {num_files} files",
+            Theme::MUTED,
+            Theme::RESET
+        )
     } else {
-        format!("{icon} \x1b[38;5;245mglob_search\x1b[0m matched {num_files} files\n{filenames}")
+        format!(
+            "{icon} {}glob_search{} matched {num_files} files\n{filenames}",
+            Theme::MUTED,
+            Theme::RESET
+        )
     }
 }
 
@@ -321,7 +381,9 @@ pub(crate) fn format_grep_result(icon: &str, parsed: &serde_json::Value) -> Stri
         })
         .unwrap_or_default();
     let summary = format!(
-        "{icon} \x1b[38;5;245mgrep_search\x1b[0m {num_matches} matches across {num_files} files"
+        "{icon} {}grep_search{} {num_matches} matches across {num_files} files",
+        Theme::MUTED,
+        Theme::RESET,
     );
     if !content.trim().is_empty() {
         let collapsed =
@@ -352,11 +414,11 @@ pub(crate) fn format_generic_tool_result(
     let preview = collapsed.visible;
 
     if preview.is_empty() {
-        format!("{icon} \x1b[38;5;245m{name}\x1b[0m")
+        format!("{icon} {}{}{}", Theme::MUTED, name, Theme::RESET)
     } else if preview.contains('\n') {
-        format!("{icon} \x1b[38;5;245m{name}\x1b[0m\n{preview}")
+        format!("{icon} {}{}{}\n{preview}", Theme::MUTED, name, Theme::RESET)
     } else {
-        format!("{icon} \x1b[38;5;245m{name}:\x1b[0m {preview}")
+        format!("{icon} {}{}:{} {preview}", Theme::MUTED, name, Theme::RESET)
     }
 }
 
