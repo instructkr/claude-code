@@ -738,11 +738,7 @@ fn now_unix_timestamp() -> u64 {
 }
 
 fn read_env_non_empty(key: &str) -> Result<Option<String>, ApiError> {
-    match std::env::var(key) {
-        Ok(value) if !value.is_empty() => Ok(Some(value)),
-        Ok(_) | Err(std::env::VarError::NotPresent) => Ok(super::dotenv_value(key)),
-        Err(error) => Err(ApiError::from(error)),
-    }
+    super::read_env_or_config(key)
 }
 
 #[cfg(test)]
@@ -763,7 +759,10 @@ fn read_auth_token() -> Option<String> {
 
 #[must_use]
 pub fn read_base_url() -> String {
-    std::env::var("ANTHROPIC_BASE_URL").unwrap_or_else(|_| DEFAULT_BASE_URL.to_string())
+    super::read_env_or_config("ANTHROPIC_BASE_URL")
+        .ok()
+        .flatten()
+        .unwrap_or_else(|| DEFAULT_BASE_URL.to_string())
 }
 
 fn request_id_from_headers(headers: &reqwest::header::HeaderMap) -> Option<String> {
