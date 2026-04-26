@@ -195,6 +195,11 @@ impl OpenAiCompatClient {
     }
 
     pub fn from_env(config: OpenAiCompatConfig) -> Result<Self, ApiError> {
+        // Providers that don't require auth (Ollama, vLLM) have an empty
+        // api_key_env and skip the credential check.
+        if config.api_key_env.is_empty() {
+            return Ok(Self::new(String::new(), config));
+        }
         let Some(api_key) = read_env_non_empty(config.api_key_env)? else {
             return Err(ApiError::missing_credentials(
                 config.provider_name,
