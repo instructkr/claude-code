@@ -9192,44 +9192,136 @@ fn permission_policy(
 }
 
 fn convert_messages(messages: &[ConversationMessage]) -> Vec<InputMessage> {
-    messages
-        .iter()
-        .filter_map(|message| {
-            let role = match message.role {
-                MessageRole::System | MessageRole::User | MessageRole::Tool => "user",
-                MessageRole::Assistant => "assistant",
-            };
-            let content = message
-                .blocks
-                .iter()
-                .map(|block| match block {
-                    ContentBlock::Text { text } => InputContentBlock::Text { text: text.clone() },
-                    ContentBlock::ToolUse { id, name, input } => InputContentBlock::ToolUse {
-                        id: id.clone(),
-                        name: name.clone(),
-                        input: serde_json::from_str(input)
-                            .unwrap_or_else(|_| serde_json::json!({ "raw": input })),
-                    },
-                    ContentBlock::ToolResult {
-                        tool_use_id,
-                        output,
-                        is_error,
-                        ..
-                    } => InputContentBlock::ToolResult {
-                        tool_use_id: tool_use_id.clone(),
-                        content: vec![ToolResultContentBlock::Text {
-                            text: output.clone(),
-                        }],
-                        is_error: *is_error,
-                    },
-                })
-                .collect::<Vec<_>>();
-            (!content.is_empty()).then(|| InputMessage {
-                role: role.to_string(),
-                content,
-            })
-        })
-        .collect()
+    let mut converted = Vec::new();
+    let mut index = 0;
+
+    while index < messages.len() {
+        let message = &messages[index];
+        match message.role {
+            MessageRole::Assistant => {
+                let tool_use_ids = message
+                    .blocks
+                    .iter()
+                    .filter_map(|block| match block {
+                        ContentBlock::ToolUse { id, .. } => Some(id.clone()),
+                        _ => None,
+                    })
+                    .collect::<Vec<_>>();
+                let (tool_result_blocks, next_index) = if tool_use_ids.is_empty() {
+                    (Vec::new(), index + 1)
+                } else {
+                    collect_immediate_tool_results(messages, index + 1)
+                };
+                let has_all_tool_results = !tool_use_ids.is_empty()
+                    && tool_use_ids.iter().all(|id| {
+                        tool_result_blocks.iter().any(|block| {
+                            matches!(block, InputContentBlock::ToolResult { tool_use_id, .. } if tool_use_id == id)
+                        })
+                    });
+                let paired_tool_result_blocks = if has_all_tool_results {
+                    tool_result_blocks
+                        .into_iter()
+                        .filter(|block| {
+                            matches!(block, InputContentBlock::ToolResult { tool_use_id, .. } if tool_use_ids.contains(tool_use_id))
+                        })
+                        .collect::<Vec<_>>()
+                } else {
+                    Vec::new()
+                };
+                let content = message
+                    .blocks
+                    .iter()
+                    .filter_map(|block| match block {
+                        ContentBlock::Text { text } => Some(InputContentBlock::Text {
+                            text: text.clone(),
+                        }),
+                        ContentBlock::ToolUse { id, name, input } if has_all_tool_results => {
+                            Some(InputContentBlock::ToolUse {
+                                id: id.clone(),
+                                name: name.clone(),
+                                input: serde_json::from_str(input)
+                                    .unwrap_or_else(|_| serde_json::json!({ "raw": input })),
+                            })
+                        }
+                        ContentBlock::ToolUse { .. } | ContentBlock::ToolResult { .. } => None,
+                    })
+                    .collect::<Vec<_>>();
+                if !content.is_empty() {
+                    converted.push(InputMessage {
+                        role: "assistant".to_string(),
+                        content,
+                    });
+                }
+                if has_all_tool_results && !paired_tool_result_blocks.is_empty() {
+                    converted.push(InputMessage {
+                        role: "user".to_string(),
+                        content: paired_tool_result_blocks,
+                    });
+                    index = next_index;
+                } else {
+                    index += 1;
+                }
+            }
+            MessageRole::Tool => {
+                // Anthropic requires tool_result blocks to appear in the user message
+                // immediately following their assistant tool_use. A bare Tool-role
+                // message here is orphaned (for example after a resume/edit/compaction
+                // boundary) and would be rejected with a provider 400.
+                index += 1;
+            }
+            MessageRole::System | MessageRole::User => {
+                let content = message
+                    .blocks
+                    .iter()
+                    .filter_map(|block| match block {
+                        ContentBlock::Text { text } => Some(InputContentBlock::Text {
+                            text: text.clone(),
+                        }),
+                        ContentBlock::ToolUse { .. } | ContentBlock::ToolResult { .. } => None,
+                    })
+                    .collect::<Vec<_>>();
+                if !content.is_empty() {
+                    converted.push(InputMessage {
+                        role: "user".to_string(),
+                        content,
+                    });
+                }
+                index += 1;
+            }
+        }
+    }
+
+    converted
+}
+
+fn collect_immediate_tool_results(
+    messages: &[ConversationMessage],
+    start: usize,
+) -> (Vec<InputContentBlock>, usize) {
+    let mut blocks = Vec::new();
+    let mut index = start;
+    while let Some(message) = messages.get(index) {
+        if message.role != MessageRole::Tool {
+            break;
+        }
+        blocks.extend(message.blocks.iter().filter_map(|block| match block {
+            ContentBlock::ToolResult {
+                tool_use_id,
+                output,
+                is_error,
+                ..
+            } => Some(InputContentBlock::ToolResult {
+                tool_use_id: tool_use_id.clone(),
+                content: vec![ToolResultContentBlock::Text {
+                    text: output.clone(),
+                }],
+                is_error: *is_error,
+            }),
+            ContentBlock::Text { .. } | ContentBlock::ToolUse { .. } => None,
+        }));
+        index += 1;
+    }
+    (blocks, index)
 }
 
 #[allow(clippy::too_many_lines)]
@@ -9433,7 +9525,7 @@ mod tests {
         PromptHistoryEntry, SlashCommand, StatusUsage, DEFAULT_MODEL, LATEST_SESSION_REFERENCE,
         STUB_COMMANDS,
     };
-    use api::{ApiError, MessageResponse, OutputContentBlock, Usage};
+    use api::{ApiError, InputContentBlock, MessageResponse, OutputContentBlock, Usage};
     use plugins::{
         PluginManager, PluginManagerConfig, PluginTool, PluginToolDefinition, PluginToolPermission,
     };
@@ -12899,6 +12991,93 @@ UU conflicted.rs",
         assert_eq!(converted.len(), 3);
         assert_eq!(converted[1].role, "assistant");
         assert_eq!(converted[2].role, "user");
+    }
+
+    #[test]
+    fn converts_parallel_tool_results_into_immediate_single_user_message_256() {
+        let messages = vec![
+            ConversationMessage::assistant(vec![
+                ContentBlock::ToolUse {
+                    id: "tool-1".to_string(),
+                    name: "read".to_string(),
+                    input: "{\"path\":\"a\"}".to_string(),
+                },
+                ContentBlock::ToolUse {
+                    id: "tool-2".to_string(),
+                    name: "read".to_string(),
+                    input: "{\"path\":\"b\"}".to_string(),
+                },
+            ]),
+            ConversationMessage::tool_result(
+                "tool-1".to_string(),
+                "read".to_string(),
+                "a".to_string(),
+                false,
+            ),
+            ConversationMessage::tool_result(
+                "tool-2".to_string(),
+                "read".to_string(),
+                "b".to_string(),
+                false,
+            ),
+        ];
+
+        let converted = super::convert_messages(&messages);
+
+        assert_eq!(converted.len(), 2);
+        assert_eq!(converted[0].role, "assistant");
+        assert_eq!(converted[1].role, "user");
+        assert!(matches!(
+            converted[0].content.as_slice(),
+            [
+                InputContentBlock::ToolUse { id: id1, .. },
+                InputContentBlock::ToolUse { id: id2, .. }
+            ] if id1 == "tool-1" && id2 == "tool-2"
+        ));
+        assert!(matches!(
+            converted[1].content.as_slice(),
+            [
+                InputContentBlock::ToolResult { tool_use_id: id1, .. },
+                InputContentBlock::ToolResult { tool_use_id: id2, .. }
+            ] if id1 == "tool-1" && id2 == "tool-2"
+        ));
+    }
+
+    #[test]
+    fn drops_orphan_tool_use_and_tool_result_before_anthropic_dispatch_256() {
+        let messages = vec![
+            ConversationMessage::assistant(vec![
+                ContentBlock::Text {
+                    text: "before tool".to_string(),
+                },
+                ContentBlock::ToolUse {
+                    id: "orphan".to_string(),
+                    name: "bash".to_string(),
+                    input: "{\"command\":\"pwd\"}".to_string(),
+                },
+            ]),
+            ConversationMessage::user_text("resume prompt"),
+            ConversationMessage::tool_result(
+                "orphan".to_string(),
+                "bash".to_string(),
+                "late".to_string(),
+                false,
+            ),
+        ];
+
+        let converted = super::convert_messages(&messages);
+
+        assert_eq!(converted.len(), 2);
+        assert_eq!(converted[0].role, "assistant");
+        assert!(matches!(
+            converted[0].content.as_slice(),
+            [InputContentBlock::Text { text }] if text == "before tool"
+        ));
+        assert_eq!(converted[1].role, "user");
+        assert!(matches!(
+            converted[1].content.as_slice(),
+            [InputContentBlock::Text { text }] if text == "resume prompt"
+        ));
     }
     #[test]
     fn repl_help_mentions_history_completion_and_multiline() {
