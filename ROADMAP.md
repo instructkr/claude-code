@@ -17321,3 +17321,30 @@ Gap. Stream-init error paths (pre-first-payload provider failure) are not covere
 Required fix shape: (a) classify `empty_stream` / stream-closed-before-first-payload as `failure_class=upstream_stream_init` in the JSON error envelope; (b) include `cause_class=stream_closed_before_first_payload`, upstream provider name and endpoint in the envelope; (c) include `recommended_retry: true/false` and `recommended_backoff_ms: <int>` for transient stream-init classes; (d) add a live recovery hint in text output ("upstream provider transient; retry in N seconds"); (e) regression-test `--output-format json` with a synthetic upstream-stream-init failure to assert parseable JSON with the correct discriminant fields. Acceptance: any stream-init failure is machine-readable and gives both humans and orchestrators an unambiguous retry/backoff signal.
 
 **Status:** Open. No source code changed. Filed 2026-04-26 21:31 KST. Branch: feat/jobdori-168c-emission-routing. HEAD: `096f155` before filing. Live evidence: gaebal-gajae 4× `500 empty_stream` in ~25 min, 2026-04-26 KST evening. Cluster delta: json-envelope-failure-path +1 (stream-init variant). Concrete delta this cycle: ROADMAP-only pinpoint appended from live gaebal-gajae session evidence.
+
+### #291 — No repeat-failure detection / circuit-breaker for sustained upstream degradation
+
+**Exact pinpoint:** When upstream provider fails repeatedly (e.g., 5+ `500 empty_stream` failures in <60 min on the same provider+endpoint), claw-code does NOT detect the pattern, surface a circuit-breaker recommendation, OR trigger automatic provider-fallback. Each retry attempts the same dead upstream blindly. No `repeat_failure_count` or `degradation_window_ms` in JSON envelope. No CLI hint like "switch provider" or "wait for circuit-breaker reset."
+
+**Live evidence:**
+- gaebal-gajae's session hit `500 empty_stream: upstream stream closed before first payload` 6 times in ~50 min on 2026-04-26 KST evening (21:04, 21:12, 21:22, 21:33, 21:37, 21:59 KST)
+- All same upstream layer (CCAPI/Anthropic), same endpoint, same authentication
+- claw-code surfaced each as identical bare-string error, no escalating diagnostics
+
+**Why distinct:**
+- #266 (typed-error-kind taxonomy) — covers single-failure categorization, not repeat-pattern detection
+- #287 (auto-compaction reactive) — about session-size; this is about provider-side health
+- #288 (JSON envelope failure-path) — covers single-failure envelope, not multi-failure aggregation
+- #290 (typed stream-init envelope) — covers single stream-init failure typing, not repeat-pattern + circuit-breaker
+
+**Fix shape recorded:**
+- per-session repeat-failure counter with sliding window (e.g., `repeat_failure_count`, `degradation_window_ms`, `last_failure_at`)
+- circuit-breaker pattern: after N failures in window, surface "upstream degraded — circuit-breaker open for X seconds, automatic retry blocked"
+- automatic provider-fallback when configured (link to #285 declarative providers config)
+- typed JSON envelope with repeat-failure metadata
+- CLI command `claw provider status` to show per-provider health/circuit-breaker state
+- regression tests for repeat-failure detection and circuit-breaker open/close transitions
+
+**Status:** Open. No source code changed. Filed 2026-04-26 22:00 KST. Branch: feat/jobdori-168c-emission-routing. HEAD: `bfd5f2b` before filing. Live evidence: gaebal-gajae 6× `500 empty_stream` in ~50 min sustained, 2026-04-26 KST evening. Cluster delta: new cluster (repeat-failure-detection / circuit-breaker). Concrete delta this cycle: ROADMAP.md appended with #291; pushed to both remotes.
+
+**Branch / parity:** local==origin==fork at `96388c8`
