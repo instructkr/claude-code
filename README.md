@@ -208,6 +208,15 @@ Claw Code is built in the open alongside the broader UltraWorkers toolchain:
 - [oh-my-codex](https://github.com/Yeachan-Heo/oh-my-codex)
 - [UltraWorkers Discord](https://discord.gg/5TUQKqFWd)
 
+## Contributing
+
+We welcome contributions! Before filing an issue or pull request:
+
+- **For security issues:** See [SECURITY.md](./SECURITY.md)
+- **For bug reports / features:** Check [ROADMAP.md](./ROADMAP.md) to see if it's already pinpointed
+- **How to file a pinpoint:** See [CONTRIBUTING.md](./CONTRIBUTING.md) for the exact format
+- **Issue templates:** Use [.github/ISSUE_TEMPLATE/pinpoint.md](./.github/ISSUE_TEMPLATE/pinpoint.md)
+
 ## Ownership / affiliation disclaimer
 
 - This repository does **not** claim ownership of the original Claude Code source material.
