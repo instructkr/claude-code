@@ -186,3 +186,32 @@ Canonical scenario map: `rust/mock_parity_scenarios.json`
 - [x] No `#[ignore]` tests hiding failures
 - [ ] CI green on every commit
 - [x] Codebase shape clean enough for handoff documentation
+
+## Documentation Parity (Extended Dogfood Audit, cycles #410-#427)
+
+Repo documentation suite shipped during extended dogfood audit. Status: present/absent vs standard OSS project expectations.
+
+| Document | Status | Cycle | Notes |
+|----------|--------|-------|-------|
+| LICENSE (MIT) | ✅ Present | #410 | Root license file |
+| CONTRIBUTING.md | ✅ Present | #411 | Pinpoint format, build commands, branch naming |
+| .github/ISSUE_TEMPLATE/pinpoint.md | ✅ Present | #412 | GitHub-discoverable template |
+| SECURITY.md | ✅ Present | #414 | Responsible-disclosure stub |
+| README.md contributing nav | ✅ Present | #415 | Links to all docs |
+| ROADMAP.md audit summary | ✅ Present | #416 | Extended audit header |
+| TROUBLESHOOTING.md | ✅ Present | #418, #423 | 5 failure modes with mitigation |
+| docs/SUPPORTED_PROVIDERS.md | ✅ Present | #420 | 4 providers documented |
+| ROADMAP.md cluster index | ✅ Present | #421 | 8 named clusters |
+| docs/PINPOINT_FILING_GUIDE.md | ✅ Present | #422 | 5-step workflow |
+| CHANGELOG.md | ✅ Present | #424, #427 | Keep-a-Changelog format |
+| docs/ARCHITECTURE.md | ✅ Present | #426 | 9 crates, request flow, subsystem map |
+
+### Remaining doc gaps (not yet shipped)
+
+| Document | Status | Priority | Notes |
+|----------|--------|----------|-------|
+| CODE_OF_CONDUCT.md | ❌ Missing | Low | Standard for public repos |
+| .github/PULL_REQUEST_TEMPLATE.md | ❌ Missing | Medium | Would standardize PR descriptions |
+| docs/CONFIGURATION.md | ❌ Missing | High | env vars, settings.json, provider config — relates to #283, #285 |
+| docs/API_REFERENCE.md | ❌ Missing | Medium | JSON envelope schema, output format contract |
+| .github/ISSUE_TEMPLATE/bug_report.md | ❌ Missing | Low | Standard bug template (pinpoint.md covers discovery) |
