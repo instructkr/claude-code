@@ -33,6 +33,7 @@ mod rpc;
 mod session;
 mod session_manager;
 mod session_tree;
+mod session_tree_log;
 mod tool_registry;
 
 pub use agent_context::{AgentContext, AgentTask, TaskRegistry};
@@ -45,6 +46,7 @@ pub use resource_loader::{DefaultResourceLoader, ResourceLoader};
 pub use session::{AgentSession, AgentSessionBuilder, BoxedApiClient, DummyApiClient};
 pub use session_manager::{SessionManager, SessionManagerConfig};
 pub use session_tree::{SessionTree, SessionTreeNode};
+pub use session_tree_log::{SessionTreeLog, TreeEntry};
 pub use tool_registry::{
     create_builtin_tools, define_tool, FnToolHandler, SchemaValidationError, SchemaValidator,
     SdkToolExecutor, ToolDefinition, ToolDefinitionBuilder, ToolHandler, ToolRegistry,

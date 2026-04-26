@@ -164,6 +164,12 @@ impl SessionTree {
         self.active_id = Some(node_id.to_string());
         Ok(())
     }
+
+    /// Get the active node ID.
+    #[must_use]
+    pub fn active_id(&self) -> Option<&str> {
+        self.active_id.as_deref()
+    }
 }
 
 impl Default for SessionTree {

@@ -49,18 +49,24 @@ Make the SDK consumable by any agent framework with minimal effort.
 
 ### 2.3 Tool Registration
 
-- [ ] `define_tool()` ergonomic builder with schema validation
+- [x] `define_tool()` ergonomic builder with schema validation
+- [x] Tool input/output schema enforcement (JSON Schema)
+- [x] Custom tool handlers with `ToolHandler` trait and `FnToolHandler` closure wrapper
 - [ ] Async tool execution support
-- [ ] Tool input/output schema enforcement (JSON Schema)
 - [ ] Custom tool factories per working directory
 
 ### 2.4 Framework Adapters
 
-- [ ] LangChain adapter (Python)
-- [ ] AutoGen adapter (Python)
-- [ ] CrewAI adapter (Python)
+- [ ] LangChain adapter (Python) — thin wrapper over JSON-RPC (`claw --mode rpc`)
+- [ ] AutoGen adapter (Python) — thin wrapper over JSON-RPC
+- [ ] CrewAI adapter (Python) — thin wrapper over JSON-RPC
 - [ ] Generic HTTP/WebSocket adapter for any framework
 - [ ] Example: spawn 3 coordinated agents that code, test, and review
+
+> **Note:** Framework adapters are Python libraries that consume the JSON-RPC
+> server built in Phase 2.1. They are not Rust code — they wrap the `claw --mode rpc`
+> protocol for each Python framework's tool/agent conventions. These belong in a
+> separate repository or as standalone pip-installable packages.
 
 ### 2.5 Session Tree Persistence
 
@@ -190,12 +196,15 @@ Multi-agent coordination for complex workflows.
 
 ## Priority Order
 
-1. **Phase 2.1** — RPC mode (unblocks all framework integrations)
-2. **Phase 2.2** — SDK hardening (pluggable client, builder pattern)
-3. **Phase 6.1** — Onboarding (first impression matters)
-4. **Phase 3.1** — Review workflow (humans need to see what agents do)
-5. **Phase 4.1** — Agent orchestrator (multi-agent coordination)
-6. **Phase 3.3** — Demo deployments (visual verification)
-7. **Phase 5** — Security & operations
-8. **Phase 3.2** — Notifications
-9. **Phase 6.3** — Packaging
+1. ~~**Phase 2.1** — RPC mode~~ (done)
+2. ~~**Phase 2.2** — SDK hardening~~ (done)
+3. ~~**Phase 2.3** — Tool registration~~ (done)
+4. **Phase 2.5** — Session Tree Persistence
+5. **Phase 3.1** — Review workflow (humans need to see what agents do)
+6. **Phase 6.1** — Onboarding (first impression matters)
+7. **Phase 4.1** — Agent orchestrator (multi-agent coordination)
+8. **Phase 2.4** — Framework adapters (Python, separate repo)
+9. **Phase 3.3** — Demo deployments (visual verification)
+10. **Phase 5** — Security & operations
+11. **Phase 3.2** — Notifications
+12. **Phase 6.3** — Packaging
