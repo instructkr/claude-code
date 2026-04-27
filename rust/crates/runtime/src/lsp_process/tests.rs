@@ -1,5 +1,5 @@
-use super::*;
 use super::parse::*;
+use super::*;
 
 /// Requires rust-analyzer to be installed on the system.
 /// Run with: cargo test -p runtime -- --ignored
@@ -15,7 +15,10 @@ async fn spawn_and_initialize_rust_analyzer() {
     assert_eq!(process.language(), "rust-analyzer");
 
     let shutdown_result = process.shutdown().await;
-    assert!(shutdown_result.is_ok(), "shutdown should succeed: {shutdown_result:?}");
+    assert!(
+        shutdown_result.is_ok(),
+        "shutdown should succeed: {shutdown_result:?}"
+    );
 }
 
 /// Requires rust-analyzer to be installed and a Rust project on disk.
@@ -33,7 +36,11 @@ async fn hover_on_real_file() {
     let file_path = root.join("src").join("main.rs");
     let path_str = file_path.to_string_lossy();
     let result = process.hover(&path_str, 0, 0).await;
-    assert!(result.is_ok(), "hover should not return an error: {:?}", result.err());
+    assert!(
+        result.is_ok(),
+        "hover should not return an error: {:?}",
+        result.err()
+    );
 
     let _ = process.shutdown().await;
 }

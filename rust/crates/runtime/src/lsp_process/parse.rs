@@ -19,8 +19,8 @@ pub(super) fn path_to_uri(path: &str) -> String {
     if canonical.is_absolute() {
         format!("file://{path}")
     } else {
-        let resolved = std::env::current_dir()
-            .map_or_else(|_| canonical.to_path_buf(), |d| d.join(path));
+        let resolved =
+            std::env::current_dir().map_or_else(|_| canonical.to_path_buf(), |d| d.join(path));
         let canonicalized = resolved
             .canonicalize()
             .unwrap_or(resolved)

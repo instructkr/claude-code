@@ -351,8 +351,7 @@ impl LspProcess {
                 if let Some(params) = &n.params {
                     if let Some(uri) = params.get("uri").and_then(|v| v.as_str()) {
                         let path = uri_to_path(uri);
-                        if let Some(diags) = params.get("diagnostics").and_then(|v| v.as_array())
-                        {
+                        if let Some(diags) = params.get("diagnostics").and_then(|v| v.as_array()) {
                             for d in diags {
                                 diagnostics.push(LspDiagnostic {
                                     path: path.clone(),

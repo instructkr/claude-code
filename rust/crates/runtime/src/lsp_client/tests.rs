@@ -1,7 +1,7 @@
 //! Tests for the LSP client registry: registration, diagnostics, and type unit tests.
 
-use super::*;
 use super::types::*;
+use super::*;
 
 #[test]
 fn registers_and_retrieves_server() {

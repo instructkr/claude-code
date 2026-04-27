@@ -1,8 +1,8 @@
 //! Tests for the LSP client registry: extension mapping, server lifecycle,
 //! and diagnostics edge cases.
 
-use super::*;
 use super::types::*;
+use super::*;
 
 #[test]
 fn find_server_for_all_extensions() {
@@ -197,7 +197,9 @@ fn register_with_descriptor_stores_entry() {
         descriptor,
     );
 
-    let server = registry.get("rust").expect("should exist after register_with_descriptor");
+    let server = registry
+        .get("rust")
+        .expect("should exist after register_with_descriptor");
     assert_eq!(server.language, "rust");
     assert_eq!(server.status, LspServerStatus::Connected);
     assert_eq!(server.root_path.as_deref(), Some("/project"));
@@ -208,9 +210,15 @@ fn register_with_descriptor_stores_entry() {
 fn stop_server_on_nonexistent_errors() {
     let registry = LspRegistry::new();
     let result = registry.stop_server("missing");
-    assert!(result.is_err(), "stopping a nonexistent server should error");
+    assert!(
+        result.is_err(),
+        "stopping a nonexistent server should error"
+    );
     let error = result.unwrap_err();
-    assert!(error.contains("missing"), "error message should reference 'missing', got: {error}");
+    assert!(
+        error.contains("missing"),
+        "error message should reference 'missing', got: {error}"
+    );
 }
 
 /// This test requires rust-analyzer to be installed on the system.
@@ -221,7 +229,10 @@ fn start_server_without_descriptor_falls_back_to_discovery() {
     let registry = LspRegistry::new();
     registry.register("rust", LspServerStatus::Starting, None, vec![]);
     let result = registry.start_server("rust");
-    assert!(result.is_ok(), "start_server should discover and start rust-analyzer: {result:?}");
+    assert!(
+        result.is_ok(),
+        "start_server should discover and start rust-analyzer: {result:?}"
+    );
     let server = registry.get("rust").expect("rust should be registered");
     assert_eq!(server.status, LspServerStatus::Connected);
     let _ = registry.stop_server("rust");
@@ -239,13 +250,7 @@ fn dispatch_hover_lazy_starts_server() {
         args: vec![],
         extensions: vec!["rs".into()],
     };
-    registry.register_with_descriptor(
-        "rust",
-        LspServerStatus::Starting,
-        None,
-        vec![],
-        descriptor,
-    );
+    registry.register_with_descriptor("rust", LspServerStatus::Starting, None, vec![], descriptor);
     // dispatch should trigger start_server because process is None
     let result = registry.dispatch("hover", Some("src/main.rs"), Some(0), Some(0), None);
     // Result may be Ok or Err depending on whether rust-analyzer can actually
@@ -272,23 +277,25 @@ fn start_and_stop_server() {
         args: vec![],
         extensions: vec!["rs".into()],
     };
-    registry.register_with_descriptor(
-        "rust",
-        LspServerStatus::Starting,
-        None,
-        vec![],
-        descriptor,
-    );
+    registry.register_with_descriptor("rust", LspServerStatus::Starting, None, vec![], descriptor);
 
     let start_result = registry.start_server("rust");
-    assert!(start_result.is_ok(), "start_server should succeed: {start_result:?}");
+    assert!(
+        start_result.is_ok(),
+        "start_server should succeed: {start_result:?}"
+    );
 
     let server = registry.get("rust").expect("rust should exist");
     assert_eq!(server.status, LspServerStatus::Connected);
 
     let stop_result = registry.stop_server("rust");
-    assert!(stop_result.is_ok(), "stop_server should succeed: {stop_result:?}");
+    assert!(
+        stop_result.is_ok(),
+        "stop_server should succeed: {stop_result:?}"
+    );
 
-    let server = registry.get("rust").expect("rust should still be in registry");
+    let server = registry
+        .get("rust")
+        .expect("rust should still be in registry");
     assert_eq!(server.status, LspServerStatus::Disconnected);
 }

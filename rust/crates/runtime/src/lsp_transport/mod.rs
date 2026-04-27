@@ -111,7 +111,11 @@ impl std::fmt::Display for LspTransportError {
         match self {
             Self::Io(error) => write!(f, "{error}"),
             Self::Timeout { method, timeout } => {
-                write!(f, "LSP request `{method}` timed out after {}s", timeout.as_secs())
+                write!(
+                    f,
+                    "LSP request `{method}` timed out after {}s",
+                    timeout.as_secs()
+                )
             }
             Self::JsonRpc(error) => {
                 write!(f, "LSP JSON-RPC error: {} ({})", error.message, error.code)
@@ -128,7 +132,10 @@ impl std::error::Error for LspTransportError {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match self {
             Self::Io(error) => Some(error),
-            Self::JsonRpc(_) | Self::Timeout { .. } | Self::InvalidResponse { .. } | Self::ServerExited => None,
+            Self::JsonRpc(_)
+            | Self::Timeout { .. }
+            | Self::InvalidResponse { .. }
+            | Self::ServerExited => None,
         }
     }
 }
@@ -189,10 +196,7 @@ impl LspTransport {
     /// Primarily useful for testing.
     #[cfg(test)]
     fn from_child(mut child: Child, request_timeout: Duration) -> Self {
-        let stdin = child
-            .stdin
-            .take()
-            .expect("LSP process missing stdin pipe");
+        let stdin = child.stdin.take().expect("LSP process missing stdin pipe");
         let stdout = child
             .stdout
             .take()
@@ -278,10 +282,7 @@ impl LspTransport {
         if response.id != id {
             return Err(LspTransportError::InvalidResponse {
                 method: method.to_string(),
-                details: format!(
-                    "mismatched id: expected {:?}, got {:?}",
-                    id, response.id
-                ),
+                details: format!("mismatched id: expected {:?}, got {:?}", id, response.id),
             });
         }
 
@@ -346,9 +347,7 @@ impl LspTransport {
     }
 
     pub async fn shutdown(&mut self) -> Result<(), LspTransportError> {
-        let _ = self
-            .send_notification("shutdown", None)
-            .await;
+        let _ = self.send_notification("shutdown", None).await;
 
         let _ = self.send_notification("exit", None).await;
 
@@ -389,33 +388,30 @@ impl LspTransport {
             let header = line.trim_end_matches(['\r', '\n']);
             if let Some((name, value)) = header.split_once(':') {
                 if name.trim().eq_ignore_ascii_case("Content-Length") {
-                    let parsed = value
-                        .trim()
-                        .parse::<usize>()
-                        .map_err(|error| LspTransportError::Io(io::Error::new(
-                            io::ErrorKind::InvalidData,
-                            error,
-                        )))?;
+                    let parsed = value.trim().parse::<usize>().map_err(|error| {
+                        LspTransportError::Io(io::Error::new(io::ErrorKind::InvalidData, error))
+                    })?;
                     content_length = Some(parsed);
                 }
             }
         }
 
-        let content_length = content_length.ok_or_else(|| {
-            LspTransportError::InvalidResponse {
-                method: "unknown".to_string(),
-                details: "missing Content-Length header".to_string(),
-            }
+        let content_length = content_length.ok_or_else(|| LspTransportError::InvalidResponse {
+            method: "unknown".to_string(),
+            details: "missing Content-Length header".to_string(),
         })?;
 
         let mut payload = vec![0u8; content_length];
-        self.stdout.read_exact(&mut payload).await.map_err(|error| {
-            if error.kind() == io::ErrorKind::UnexpectedEof {
-                LspTransportError::ServerExited
-            } else {
-                LspTransportError::Io(error)
-            }
-        })?;
+        self.stdout
+            .read_exact(&mut payload)
+            .await
+            .map_err(|error| {
+                if error.kind() == io::ErrorKind::UnexpectedEof {
+                    LspTransportError::ServerExited
+                } else {
+                    LspTransportError::Io(error)
+                }
+            })?;
 
         Ok(payload)
     }
