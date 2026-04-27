@@ -1,0 +1,528 @@
+From 20965809f4bebd76e112f38c473f75f620d6b2f2 Mon Sep 17 00:00:00 2001
+From: prcdslnc13 <prcdslnc13@gmail.com>
+Date: Mon, 27 Apr 2026 16:54:12 -0500
+Subject: [PATCH] Switch MCP stdio transport from LSP framing to NDJSON
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+claw's MCP stdio transport sent and expected LSP-style
+`Content-Length: N\r\n\r\n<json>` framing on both the client side
+(`mcp_stdio.rs`) and the `claw mcp serve` server side (`mcp_server.rs`).
+The MCP stdio spec is newline-delimited JSON: one JSON message per line,
+no headers. The Python `mcp` SDK (which most off-the-shelf MCP servers
+use, including the user's `brain` server) only implements NDJSON, so
+claw could not communicate with any standard-SDK-built MCP server in
+either direction.
+
+Symptom from the user's session 2026-04-27: with brain MCP wired through
+`~/.claw/settings.json`, claw spawned the server, which then flooded
+stderr with `pydantic.ValidationError: Invalid JSON: ... input_value=
+'Content-Length: 156\n'` because brain tried to JSON-parse claw's
+header line.
+
+Fix is symmetric on both ends:
+
+- `mcp_stdio.rs::write_jsonrpc_message` now serializes to a string and
+  writes `<json>\n` via the existing `write_line` helper.
+- `mcp_stdio.rs::read_jsonrpc_message` reads a line, trims, and parses
+  with `serde_json::from_str`. Blank lines are skipped to tolerate
+  defensive padding from peers.
+- `write_frame`, `read_frame`, and `encode_frame` are removed (no
+  remaining users).
+- `mcp_server.rs::run` uses a new `read_message` helper that returns
+  one trimmed line per call (None on EOF). `write_response` writes
+  `<json>\n`.
+- Module doc updated to reflect NDJSON, not LSP-framed.
+
+Test fixtures and unit tests:
+
+- All four Python server fixtures (`jsonrpc-mcp.py`, `fake-mcp-server.py`,
+  `manager-mcp-server.py`, `initialize-disconnect.py`) plus the bridge
+  fixture in `mcp_tool_bridge.rs` and the CLI fixture in
+  `rusty-claude-cli/src/main.rs` now read with `sys.stdin.readline()`
+  + `json.loads(line)` and write with `sys.stdout.write(json.dumps(...) + '\n')`.
+- The `INVALID_TOOL_CALL_RESPONSE` mode in `fake-mcp-server.py` now
+  writes a single `nope!\n` line instead of a Content-Length-framed
+  payload. The `manager_surfaces_parse_errors_from_tool_calls` test's
+  serde_json error-message assertion still matches.
+- `write_jsonrpc_request_emits_content_length_frame` renamed to
+  `write_jsonrpc_request_roundtrips_over_ndjson`.
+- `given_lowercase_content_length_when_initialize_then_response_parses`
+  deleted — the test exercised LSP header case-insensitivity, which
+  has no NDJSON analogue. The corresponding `MCP_LOWERCASE_CONTENT_LENGTH`
+  env support in the fixture is also removed.
+
+Verification (from `rust/`):
+
+- `cargo build --workspace` clean.
+- `cargo test --workspace`: all 936 tests pass; only failure is the
+  pre-existing `resumed_status_command_emits_structured_json_when_requested`
+  test, which also fails on `main` and is unrelated to this patch.
+- `cargo clippy --workspace --all-targets -- -D warnings` clean.
+
+Note: this is a fork-side fix per the personal-build hardening pattern
+(`fork-is-personal-hardened-build-not-upstream-contribution`). Upstream
+may have its own opinions about backward compatibility with LSP-style
+servers, so this is not contributed back to `ultraworkers/claw-code`.
+---
+ rust/crates/runtime/src/mcp_server.rs      |  58 ++-----
+ rust/crates/runtime/src/mcp_stdio.rs       | 190 ++++-----------------
+ rust/crates/runtime/src/mcp_tool_bridge.rs |  21 +--
+ rust/crates/rusty-claude-cli/src/main.rs   |  21 +--
+ 4 files changed, 64 insertions(+), 226 deletions(-)
+
+diff --git a/rust/crates/runtime/src/mcp_server.rs b/rust/crates/runtime/src/mcp_server.rs
+index 4610ed4..f7e96cf 100644
+--- a/rust/crates/runtime/src/mcp_server.rs
++++ b/rust/crates/runtime/src/mcp_server.rs
+@@ -1,9 +1,9 @@
+ //! Minimal Model Context Protocol (MCP) server.
+ //!
+-//! Implements a newline-safe, LSP-framed JSON-RPC server over stdio that
+-//! answers `initialize`, `tools/list`, and `tools/call` requests. The framing
+-//! matches the client transport implemented in [`crate::mcp_stdio`] so this
+-//! server can be driven by either an external MCP client (e.g. Claude
++//! Implements a newline-delimited JSON-RPC server over stdio that answers
++//! `initialize`, `tools/list`, and `tools/call` requests. The framing matches
++//! the MCP stdio transport spec (one JSON message per line, no headers) so
++//! this server can be driven by either an external MCP client (e.g. Claude
+ //! Desktop) or `claw`'s own [`McpServerManager`](crate::McpServerManager).
+ //!
+ //! The server is intentionally small: it exposes a list of pre-built
+@@ -16,9 +16,7 @@
+ use std::io;
+ 
+ use serde_json::{json, Value as JsonValue};
+-use tokio::io::{
+-    stdin, stdout, AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader, Stdin, Stdout,
+-};
++use tokio::io::{stdin, stdout, AsyncBufReadExt, AsyncWriteExt, BufReader, Stdin, Stdout};
+ 
+ use crate::mcp_stdio::{
+     JsonRpcError, JsonRpcId, JsonRpcRequest, JsonRpcResponse, McpInitializeResult,
+@@ -85,7 +83,7 @@ impl McpServer {
+     /// callers can log and exit non-zero.
+     pub async fn run(&mut self) -> io::Result<()> {
+         loop {
+-            let Some(payload) = read_frame(&mut self.stdin).await? else {
++            let Some(payload) = read_message(&mut self.stdin).await? else {
+                 return Ok(());
+             };
+ 
+@@ -242,47 +240,24 @@ fn invalid_params_response(id: JsonRpcId, message: &str) -> JsonRpcResponse<Json
+     }
+ }
+ 
+-/// Reads a single LSP-framed JSON-RPC payload from `reader`.
++/// Reads a single newline-delimited JSON-RPC payload from `reader`.
+ ///
+-/// Returns `Ok(None)` on clean EOF before any header bytes have been read,
++/// Returns `Ok(None)` on clean EOF before any non-blank line has been read,
+ /// matching how [`crate::mcp_stdio::McpStdioProcess`] treats stream closure.
+-async fn read_frame(reader: &mut BufReader<Stdin>) -> io::Result<Option<Vec<u8>>> {
+-    let mut content_length: Option<usize> = None;
+-    let mut first_header = true;
++/// Blank lines are skipped to tolerate defensive padding from peers.
++async fn read_message(reader: &mut BufReader<Stdin>) -> io::Result<Option<Vec<u8>>> {
+     loop {
+         let mut line = String::new();
+         let bytes_read = reader.read_line(&mut line).await?;
+         if bytes_read == 0 {
+-            if first_header {
+-                return Ok(None);
+-            }
+-            return Err(io::Error::new(
+-                io::ErrorKind::UnexpectedEof,
+-                "MCP stdio stream closed while reading headers",
+-            ));
++            return Ok(None);
+         }
+-        first_header = false;
+-        if line == "\r\n" || line == "\n" {
+-            break;
+-        }
+-        let header = line.trim_end_matches(['\r', '\n']);
+-        if let Some((name, value)) = header.split_once(':') {
+-            if name.trim().eq_ignore_ascii_case("Content-Length") {
+-                let parsed = value
+-                    .trim()
+-                    .parse::<usize>()
+-                    .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
+-                content_length = Some(parsed);
+-            }
++        let trimmed = line.trim();
++        if trimmed.is_empty() {
++            continue;
+         }
++        return Ok(Some(trimmed.as_bytes().to_vec()));
+     }
+-
+-    let content_length = content_length.ok_or_else(|| {
+-        io::Error::new(io::ErrorKind::InvalidData, "missing Content-Length header")
+-    })?;
+-    let mut payload = vec![0_u8; content_length];
+-    reader.read_exact(&mut payload).await?;
+-    Ok(Some(payload))
+ }
+ 
+ async fn write_response(
+@@ -291,9 +266,8 @@ async fn write_response(
+ ) -> io::Result<()> {
+     let body = serde_json::to_vec(response)
+         .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
+-    let header = format!("Content-Length: {}\r\n\r\n", body.len());
+-    stdout.write_all(header.as_bytes()).await?;
+     stdout.write_all(&body).await?;
++    stdout.write_all(b"\n").await?;
+     stdout.flush().await
+ }
+ 
+diff --git a/rust/crates/runtime/src/mcp_stdio.rs b/rust/crates/runtime/src/mcp_stdio.rs
+index 5fbc31b..d661e29 100644
+--- a/rust/crates/runtime/src/mcp_stdio.rs
++++ b/rust/crates/runtime/src/mcp_stdio.rs
+@@ -1206,56 +1206,22 @@ impl McpStdioProcess {
+         Ok(buffer)
+     }
+ 
+-    pub async fn write_frame(&mut self, payload: &[u8]) -> io::Result<()> {
+-        let encoded = encode_frame(payload);
+-        self.write_all(&encoded).await?;
+-        self.flush().await
+-    }
+-
+-    pub async fn read_frame(&mut self) -> io::Result<Vec<u8>> {
+-        let mut content_length = None;
+-        loop {
+-            let mut line = String::new();
+-            let bytes_read = self.stdout.read_line(&mut line).await?;
+-            if bytes_read == 0 {
+-                return Err(io::Error::new(
+-                    io::ErrorKind::UnexpectedEof,
+-                    "MCP stdio stream closed while reading headers",
+-                ));
+-            }
+-            if line == "\r\n" {
+-                break;
+-            }
+-            let header = line.trim_end_matches(['\r', '\n']);
+-            if let Some((name, value)) = header.split_once(':') {
+-                if name.trim().eq_ignore_ascii_case("Content-Length") {
+-                    let parsed = value
+-                        .trim()
+-                        .parse::<usize>()
+-                        .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
+-                    content_length = Some(parsed);
+-                }
+-            }
+-        }
+-
+-        let content_length = content_length.ok_or_else(|| {
+-            io::Error::new(io::ErrorKind::InvalidData, "missing Content-Length header")
+-        })?;
+-        let mut payload = vec![0_u8; content_length];
+-        self.stdout.read_exact(&mut payload).await?;
+-        Ok(payload)
+-    }
+-
+     pub async fn write_jsonrpc_message<T: Serialize>(&mut self, message: &T) -> io::Result<()> {
+-        let body = serde_json::to_vec(message)
++        let body = serde_json::to_string(message)
+             .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
+-        self.write_frame(&body).await
++        self.write_line(&body).await
+     }
+ 
+     pub async fn read_jsonrpc_message<T: DeserializeOwned>(&mut self) -> io::Result<T> {
+-        let payload = self.read_frame().await?;
+-        serde_json::from_slice(&payload)
+-            .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))
++        loop {
++            let line = self.read_line().await?;
++            let trimmed = line.trim();
++            if trimmed.is_empty() {
++                continue;
++            }
++            return serde_json::from_str(trimmed)
++                .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error));
++        }
+     }
+ 
+     pub async fn send_request<T: Serialize>(
+@@ -1387,13 +1353,6 @@ fn apply_env(command: &mut Command, env: &BTreeMap<String, String>) {
+     }
+ }
+ 
+-fn encode_frame(payload: &[u8]) -> Vec<u8> {
+-    let header = format!("Content-Length: {}\r\n\r\n", payload.len());
+-    let mut framed = header.into_bytes();
+-    framed.extend_from_slice(payload);
+-    framed
+-}
+-
+ fn default_initialize_params() -> McpInitializeParams {
+     McpInitializeParams {
+         protocol_version: "2025-03-26".to_string(),
+@@ -1465,24 +1424,14 @@ mod tests {
+         let script = [
+             "#!/usr/bin/env python3",
+             "import json, os, sys",
+-            "LOWERCASE_CONTENT_LENGTH = os.environ.get('MCP_LOWERCASE_CONTENT_LENGTH') == '1'",
+             "MISMATCHED_RESPONSE_ID = os.environ.get('MCP_MISMATCHED_RESPONSE_ID') == '1'",
+-            "header = b''",
+-            r"while not header.endswith(b'\r\n\r\n'):",
+-            "    chunk = sys.stdin.buffer.read(1)",
+-            "    if not chunk:",
+-            "        raise SystemExit(1)",
+-            "    header += chunk",
+-            "length = 0",
+-            r"for line in header.decode().split('\r\n'):",
+-            r"    if line.lower().startswith('content-length:'):",
+-            r"        length = int(line.split(':', 1)[1].strip())",
+-            "payload = sys.stdin.buffer.read(length)",
+-            "request = json.loads(payload.decode())",
++            "line = sys.stdin.readline()",
++            "if not line:",
++            "    raise SystemExit(1)",
++            "request = json.loads(line)",
+             r"assert request['jsonrpc'] == '2.0'",
+             r"assert request['method'] == 'initialize'",
+             "response_id = 'wrong-id' if MISMATCHED_RESPONSE_ID else request['id']",
+-            "header_name = 'content-length' if LOWERCASE_CONTENT_LENGTH else 'Content-Length'",
+             r"response = json.dumps({",
+             r"    'jsonrpc': '2.0',",
+             r"    'id': response_id,",
+@@ -1491,9 +1440,9 @@ mod tests {
+             r"        'capabilities': {'tools': {}},",
+             r"        'serverInfo': {'name': 'fake-mcp', 'version': '0.1.0'}",
+             r"    }",
+-            r"}).encode()",
+-            r"sys.stdout.buffer.write(f'{header_name}: {len(response)}\r\n\r\n'.encode() + response)",
+-            "sys.stdout.buffer.flush()",
++            r"})",
++            r"sys.stdout.write(response + '\n')",
++            "sys.stdout.flush()",
+             "",
+         ]
+         .join("\n");
+@@ -1516,23 +1465,14 @@ mod tests {
+             "INVALID_TOOL_CALL_RESPONSE = os.environ.get('MCP_INVALID_TOOL_CALL_RESPONSE') == '1'",
+             "",
+             "def read_message():",
+-            "    header = b''",
+-            r"    while not header.endswith(b'\r\n\r\n'):",
+-            "        chunk = sys.stdin.buffer.read(1)",
+-            "        if not chunk:",
+-            "            return None",
+-            "        header += chunk",
+-            "    length = 0",
+-            r"    for line in header.decode().split('\r\n'):",
+-            r"        if line.lower().startswith('content-length:'):",
+-            r"            length = int(line.split(':', 1)[1].strip())",
+-            "    payload = sys.stdin.buffer.read(length)",
+-            "    return json.loads(payload.decode())",
++            "    line = sys.stdin.readline()",
++            "    if not line:",
++            "        return None",
++            "    return json.loads(line)",
+             "",
+             "def send_message(message):",
+-            "    payload = json.dumps(message).encode()",
+-            r"    sys.stdout.buffer.write(f'Content-Length: {len(payload)}\r\n\r\n'.encode() + payload)",
+-            "    sys.stdout.buffer.flush()",
++            "    sys.stdout.write(json.dumps(message) + '\\n')",
++            "    sys.stdout.flush()",
+             "",
+             "while True:",
+             "    request = read_message()",
+@@ -1569,8 +1509,8 @@ mod tests {
+             "        })",
+             "    elif method == 'tools/call':",
+             "        if INVALID_TOOL_CALL_RESPONSE:",
+-            "            sys.stdout.buffer.write(b'Content-Length: 5\\r\\n\\r\\nnope!')",
+-            "            sys.stdout.buffer.flush()",
++            "            sys.stdout.write('nope!\\n')",
++            "            sys.stdout.flush()",
+             "            continue",
+             "        if TOOL_CALL_DELAY_MS:",
+             "            time.sleep(TOOL_CALL_DELAY_MS / 1000)",
+@@ -1669,23 +1609,14 @@ mod tests {
+             "    return True",
+             "",
+             "def read_message():",
+-            "    header = b''",
+-            r"    while not header.endswith(b'\r\n\r\n'):",
+-            "        chunk = sys.stdin.buffer.read(1)",
+-            "        if not chunk:",
+-            "            return None",
+-            "        header += chunk",
+-            "    length = 0",
+-            r"    for line in header.decode().split('\r\n'):",
+-            r"        if line.lower().startswith('content-length:'):",
+-            r"            length = int(line.split(':', 1)[1].strip())",
+-            "    payload = sys.stdin.buffer.read(length)",
+-            "    return json.loads(payload.decode())",
++            "    line = sys.stdin.readline()",
++            "    if not line:",
++            "        return None",
++            "    return json.loads(line)",
+             "",
+             "def send_message(message):",
+-            "    payload = json.dumps(message).encode()",
+-            r"    sys.stdout.buffer.write(f'Content-Length: {len(payload)}\r\n\r\n'.encode() + payload)",
+-            "    sys.stdout.buffer.flush()",
++            "    sys.stdout.write(json.dumps(message) + '\\n')",
++            "    sys.stdout.flush()",
+             "",
+             "while True:",
+             "    request = read_message()",
+@@ -1932,7 +1863,7 @@ mod tests {
+     }
+ 
+     #[test]
+-    fn write_jsonrpc_request_emits_content_length_frame() {
++    fn write_jsonrpc_request_roundtrips_over_ndjson() {
+         let runtime = Builder::new_current_thread()
+             .enable_all()
+             .build()
+@@ -1965,46 +1896,6 @@ mod tests {
+         });
+     }
+ 
+-    #[test]
+-    fn given_lowercase_content_length_when_initialize_then_response_parses() {
+-        let runtime = Builder::new_current_thread()
+-            .enable_all()
+-            .build()
+-            .expect("runtime");
+-        runtime.block_on(async {
+-            let script_path = write_jsonrpc_script();
+-            let transport = script_transport_with_env(
+-                &script_path,
+-                BTreeMap::from([("MCP_LOWERCASE_CONTENT_LENGTH".to_string(), "1".to_string())]),
+-            );
+-            let mut process = McpStdioProcess::spawn(&transport).expect("spawn transport directly");
+-
+-            let response = process
+-                .initialize(
+-                    JsonRpcId::Number(8),
+-                    McpInitializeParams {
+-                        protocol_version: "2025-03-26".to_string(),
+-                        capabilities: json!({"roots": {}}),
+-                        client_info: McpInitializeClientInfo {
+-                            name: "runtime-tests".to_string(),
+-                            version: "0.1.0".to_string(),
+-                        },
+-                    },
+-                )
+-                .await
+-                .expect("initialize roundtrip");
+-
+-            assert_eq!(response.id, JsonRpcId::Number(8));
+-            assert_eq!(response.error, None);
+-            assert!(response.result.is_some());
+-
+-            let status = process.wait().await.expect("wait for exit");
+-            assert!(status.success());
+-
+-            cleanup_script(&script_path);
+-        });
+-    }
+-
+     #[test]
+     fn given_mismatched_response_id_when_initialize_then_invalid_data_is_returned() {
+         let runtime = Builder::new_current_thread()
+@@ -2659,18 +2550,9 @@ mod tests {
+         let script = [
+             "#!/usr/bin/env python3",
+             "import sys",
+-            "header = b''",
+-            r"while not header.endswith(b'\r\n\r\n'):",
+-            "    chunk = sys.stdin.buffer.read(1)",
+-            "    if not chunk:",
+-            "        raise SystemExit(1)",
+-            "    header += chunk",
+-            "length = 0",
+-            r"for line in header.decode().split('\r\n'):",
+-            r"    if line.lower().startswith('content-length:'):",
+-            r"        length = int(line.split(':', 1)[1].strip())",
+-            "if length:",
+-            "    sys.stdin.buffer.read(length)",
++            "line = sys.stdin.readline()",
++            "if not line:",
++            "    raise SystemExit(1)",
+             "raise SystemExit(0)",
+             "",
+         ]
+diff --git a/rust/crates/runtime/src/mcp_tool_bridge.rs b/rust/crates/runtime/src/mcp_tool_bridge.rs
+index af637a9..d9ac6ff 100644
+--- a/rust/crates/runtime/src/mcp_tool_bridge.rs
++++ b/rust/crates/runtime/src/mcp_tool_bridge.rs
+@@ -356,23 +356,14 @@ mod tests {
+             "            handle.write(f'{method}\\n')",
+             "",
+             "def read_message():",
+-            "    header = b''",
+-            r"    while not header.endswith(b'\r\n\r\n'):",
+-            "        chunk = sys.stdin.buffer.read(1)",
+-            "        if not chunk:",
+-            "            return None",
+-            "        header += chunk",
+-            "    length = 0",
+-            r"    for line in header.decode().split('\r\n'):",
+-            r"        if line.lower().startswith('content-length:'):",
+-            r"            length = int(line.split(':', 1)[1].strip())",
+-            "    payload = sys.stdin.buffer.read(length)",
+-            "    return json.loads(payload.decode())",
++            "    line = sys.stdin.readline()",
++            "    if not line:",
++            "        return None",
++            "    return json.loads(line)",
+             "",
+             "def send_message(message):",
+-            "    payload = json.dumps(message).encode()",
+-            r"    sys.stdout.buffer.write(f'Content-Length: {len(payload)}\r\n\r\n'.encode() + payload)",
+-            "    sys.stdout.buffer.flush()",
++            "    sys.stdout.write(json.dumps(message) + '\\n')",
++            "    sys.stdout.flush()",
+             "",
+             "while True:",
+             "    request = read_message()",
+diff --git a/rust/crates/rusty-claude-cli/src/main.rs b/rust/crates/rusty-claude-cli/src/main.rs
+index 1957b50..a8707bb 100644
+--- a/rust/crates/rusty-claude-cli/src/main.rs
++++ b/rust/crates/rusty-claude-cli/src/main.rs
+@@ -13091,23 +13091,14 @@ fn write_mcp_server_fixture(script_path: &Path) {
+             "import json, sys",
+             "",
+             "def read_message():",
+-            "    header = b''",
+-            r"    while not header.endswith(b'\r\n\r\n'):",
+-            "        chunk = sys.stdin.buffer.read(1)",
+-            "        if not chunk:",
+-            "            return None",
+-            "        header += chunk",
+-            "    length = 0",
+-            r"    for line in header.decode().split('\r\n'):",
+-            r"        if line.lower().startswith('content-length:'):",
+-            "            length = int(line.split(':', 1)[1].strip())",
+-            "    payload = sys.stdin.buffer.read(length)",
+-            "    return json.loads(payload.decode())",
++            "    line = sys.stdin.readline()",
++            "    if not line:",
++            "        return None",
++            "    return json.loads(line)",
+             "",
+             "def send_message(message):",
+-            "    payload = json.dumps(message).encode()",
+-            r"    sys.stdout.buffer.write(f'Content-Length: {len(payload)}\r\n\r\n'.encode() + payload)",
+-            "    sys.stdout.buffer.flush()",
++            "    sys.stdout.write(json.dumps(message) + '\\n')",
++            "    sys.stdout.flush()",
+             "",
+             "while True:",
+             "    request = read_message()",
+-- 
+2.43.0
+
