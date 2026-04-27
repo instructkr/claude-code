@@ -3573,6 +3573,14 @@ fn run_repl(
     run_stale_base_preflight(base_commit.as_deref());
     let resolved_model = resolve_repl_model(model);
     let mut cli = LiveCli::new(resolved_model, true, allowed_tools, permission_mode)?;
+
+    // Read config for LSP auto-start setting
+    let cwd = std::env::current_dir().unwrap_or_default();
+    let lsp_auto = runtime::ConfigLoader::default_for(&cwd)
+        .load()
+        .map(|c| c.lsp_auto_start())
+        .unwrap_or(true);
+    cli.lsp_auto_start = lsp_auto;
     cli.set_reasoning_effort(reasoning_effort);
     let mut editor =
         input::LineEditor::new("> ", cli.repl_completion_candidates().unwrap_or_default());
@@ -3595,6 +3603,16 @@ fn run_repl(
                 vec![],
                 server.clone(),
             );
+        }
+        // Auto-start all discovered servers if enabled
+        if cli.lsp_auto_start {
+            let registry = tools::global_lsp_registry();
+            for server in &lsp_servers {
+                match registry.start_server(&server.language) {
+                    Ok(()) => eprintln!("  {} started", server.language),
+                    Err(e) => eprintln!("  {} failed to start: {e}", server.language),
+                }
+            }
         }
     }
 
@@ -3675,6 +3693,7 @@ struct LiveCli {
     runtime: BuiltRuntime,
     session: SessionHandle,
     prompt_history: Vec<PromptHistoryEntry>,
+    lsp_auto_start: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -4183,6 +4202,7 @@ impl LiveCli {
             runtime,
             session,
             prompt_history: Vec::new(),
+            lsp_auto_start: true,
         };
         cli.persist_session()?;
         Ok(cli)
@@ -4587,7 +4607,7 @@ impl LiveCli {
         })
     }
 
-    fn handle_lsp_command(&self, action: Option<&str>, target: Option<&str>) {
+    fn handle_lsp_command(&mut self, action: Option<&str>, target: Option<&str>) {
         let registry = tools::global_lsp_registry();
         match action {
             Some("start") => {
@@ -4612,8 +4632,15 @@ impl LiveCli {
                     Err(e) => eprintln!("Failed to restart LSP server '{lang}': {e}"),
                 }
             }
+            Some("toggle") => {
+                self.lsp_auto_start = !self.lsp_auto_start;
+                let state = if self.lsp_auto_start { "on" } else { "off" };
+                eprintln!("LSP auto-start: {state}");
+            }
             _ => {
                 let servers = registry.list_servers();
+                let auto_state = if self.lsp_auto_start { "on" } else { "off" };
+                eprintln!("LSP auto-start: {auto_state}");
                 if servers.is_empty() {
                     eprintln!("No LSP servers registered.");
                 } else {

@@ -112,16 +112,64 @@ pub fn command_exists_on_path(command: &str) -> bool {
         .is_ok()
 }
 
+/// Check if a binary is a rustup proxy by running `--version` and looking for
+/// the "Unknown binary" error message that rustup prints for uninstalled tools.
+#[must_use]
+fn is_rustup_proxy(command: &str) -> bool {
+    let Ok(output) = Command::new(command).arg("--version").output() else {
+        return false;
+    };
+    // rustup proxy exits non-zero and prints "error: Unknown binary '...' in official toolchain"
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    stderr.contains("Unknown binary")
+}
+
+/// Check whether a rustup component is actually functional by running it through
+/// `rustup run stable <command> --version`. Returns `true` only if the process
+/// exits successfully (exit code 0), meaning the component is installed.
+#[must_use]
+fn rustup_component_works(component: &str) -> bool {
+    Command::new("rustup")
+        .args(["run", "stable", component, "--version"])
+        .output()
+        .is_ok_and(|o| o.status.success())
+}
+
 /// Discover LSP servers that are actually installed on the current system.
 ///
 /// Iterates over the known server table and returns only those whose command
-/// is found on `PATH`.
+/// is found on `PATH` **and** is actually functional. For `rust-analyzer`,
+/// rustup ships a stub proxy that always exists on PATH but prints
+/// "Unknown binary" when the component isn't installed. We detect that
+/// case and either rewrite to `rustup run stable rust-analyzer` (when the
+/// component is installed) or skip the server entirely (when it's not).
 #[must_use]
 pub fn discover_available_servers() -> Vec<LspServerDescriptor> {
     KNOWN_LSP_SERVERS_TABLE
         .iter()
         .filter(|desc| command_exists_on_path(desc.command))
-        .map(StaticLspServerDescriptor::to_descriptor)
+        .filter_map(|desc| {
+            let mut server = desc.to_descriptor();
+            // rustup ships a proxy `rust-analyzer` that exists on PATH but
+            // errors with "Unknown binary" when the component isn't installed.
+            if desc.command == "rust-analyzer" && is_rustup_proxy("rust-analyzer") {
+                // The component isn't installed under this toolchain.
+                // Check if `rustup run stable rust-analyzer --version` works
+                // (e.g. user installed it via rustup but the proxy is misconfigured).
+                if rustup_component_works("rust-analyzer") {
+                    server.command = "rustup".to_string();
+                    server.args = vec![
+                        "run".to_string(),
+                        "stable".to_string(),
+                        "rust-analyzer".to_string(),
+                    ];
+                } else {
+                    // Component truly not installed — skip it.
+                    return None;
+                }
+            }
+            Some(server)
+        })
         .collect()
 }
 
