@@ -890,7 +890,7 @@ async fn expect_success(response: reqwest::Response) -> Result<reqwest::Response
     let request_id = request_id_from_headers(&headers);
     let body = response.text().await.unwrap_or_else(|_| String::new());
     let parsed_error = serde_json::from_str::<AnthropicErrorEnvelope>(&body).ok();
-    let retryable = is_retryable_status(status);
+    let retryable = is_retryable_status(status) || is_retryable_400(status, &body);
     let retry_after = parse_retry_after(&headers, status);
 
     Err(ApiError::Api {
@@ -934,10 +934,15 @@ fn is_retryable_400(status: reqwest::StatusCode, body: &str) -> bool {
         return false;
     }
     let lowered = body.to_ascii_lowercase();
+    // Gateway/proxy flakes that return 400 with transient error bodies
     lowered.contains("no parseable body")
         || lowered.contains("connection reset")
         || lowered.contains("broken pipe")
         || lowered.contains("empty reply from server")
+        // Anthropic sometimes returns 400 invalid_request_error when their
+        // backend flakes — the body contains "no parseable body" in the
+        // message field of the JSON error envelope.
+        || (lowered.contains("invalid_request_error") && lowered.contains("no parseable body"))
 }
 
 /// Anthropic API keys (`sk-ant-*`) are accepted over the `x-api-key` header

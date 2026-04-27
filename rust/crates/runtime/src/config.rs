@@ -57,6 +57,8 @@ pub struct LspServerConfig {
     pub command: String,
     pub args: Vec<String>,
     pub enabled: bool,
+}
+
 /// API timeout and retry configuration.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ApiTimeoutConfig {
@@ -95,6 +97,7 @@ pub struct RuntimeFeatureConfig {
     trusted_roots: Vec<String>,
     provider: RuntimeProviderConfig,
     lsp: BTreeMap<String, LspServerConfig>,
+    api_timeout: ApiTimeoutConfig,
 }
 
 impl Default for RuntimeFeatureConfig {
@@ -114,6 +117,7 @@ impl Default for RuntimeFeatureConfig {
             trusted_roots: Vec::new(),
             provider: RuntimeProviderConfig::default(),
             lsp: BTreeMap::new(),
+            api_timeout: ApiTimeoutConfig::default(),
         }
     }
 }
@@ -147,7 +151,6 @@ impl RuntimeProviderConfig {
     pub fn model(&self) -> Option<&str> {
         self.model.as_deref()
     }
-    api_timeout: ApiTimeoutConfig,
 }
 
 /// Ordered chain of fallback model identifiers used when the primary

@@ -15,6 +15,7 @@ const CONTEXT_WINDOW_ERROR_MARKERS: &[&str] = &[
     "prompt is too long",
     "input is too long",
     "request is too large",
+    "no parseable body",
 ];
 
 #[derive(Debug)]

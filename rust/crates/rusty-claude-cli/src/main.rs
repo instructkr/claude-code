@@ -4380,59 +4380,86 @@ impl LiveCli {
                 // ============================================================================
                 
                 let error_str = error.to_string();
-                let is_context_window = error_str.contains("context_window") || error_str.contains("Context window");
+                let is_context_window = error_str.contains("context_window")
+                    || error_str.contains("Context window")
+                    || error_str.contains("no parseable body");
                 
                 if is_context_window {
-                    println!("  Auto-compacting session and retrying...");
+                    // Progressive auto-compact retry loop:
+                    // Each round compacts more aggressively (fewer preserved messages)
+                    // until the request fits in the model's context window.
+                    // Max 4 rounds of compaction before giving up.
+                    let max_compact_rounds = 4;
+                    let preserve_schedule = [4, 2, 1, 0];
                     
-                    // Step 1: Compact the session to free up context space
-                    // Run the Trident compaction pipeline (supersede + collapse + cluster)
-                    // then apply summary-based compaction for maximum context reduction
-                    let result = runtime::trident::trident_compact_session(
-                        runtime.session(),
-                        CompactionConfig {
-                            max_estimated_tokens: 0,
-                            ..CompactionConfig::default()
-                        },
-                        &runtime::trident::TridentConfig::default(),
-                    );
-                    let removed = result.removed_message_count;
-                    
-                    // Only proceed if compaction actually happened (messages were removed)
-                    // or there's still a session to work with
-                    if removed > 0 || result.compacted_session.messages.len() > 0 {
+                    for round in 0..max_compact_rounds {
+                        let preserve = preserve_schedule[round];
+                        println!(
+                            "  Auto-compacting session (round {}/{}, preserving {} recent messages)...",
+                            round + 1,
+                            max_compact_rounds,
+                            preserve
+                        );
+                        
+                        // Run Trident pipeline then summary-based compaction
+                        let result = runtime::trident::trident_compact_session(
+                            runtime.session(),
+                            CompactionConfig {
+                                preserve_recent_messages: preserve,
+                                max_estimated_tokens: 0,
+                            },
+                            &runtime::trident::TridentConfig::default(),
+                        );
+                        let removed = result.removed_message_count;
+                        
+                        if removed == 0 && round > 0 {
+                            // No more messages to compact — further rounds won't help
+                            println!("  No further compaction possible.");
+                            break;
+                        }
+                        
                         if removed > 0 {
-                            // Report compaction results to user
                             println!("{}", format_compact_report(removed, result.compacted_session.messages.len(), false));
                         }
                         
-                        // Step 2: Build a new runtime with the compacted session and retry
-                        let (mut new_runtime, hook_abort_monitor) = self.prepare_turn_runtime(true)?;
-                        drop(hook_abort_monitor); // not needed for retry
+                        // Replace self.runtime's session with the compacted version
+                        // so prepare_turn_runtime builds from the compacted session
+                        *self.runtime.session_mut() = result.compacted_session.clone();
                         
-                        // Step 3: Run the turn again with the smaller session
+                        // Build a new runtime with the compacted session and retry
+                        let (mut new_runtime, hook_abort_monitor) = self.prepare_turn_runtime(true)?;
+                        drop(hook_abort_monitor);
+                        
                         let mut rp = CliPermissionPrompter::new(self.permission_mode);
                         match new_runtime.run_turn(input, Some(&mut rp)) {
                             Ok(summary) => {
-                                // Success! Replace old runtime with the new compacted one
                                 self.replace_runtime(new_runtime)?;
                                 spinner.finish(
-                                    "✨ Done (after auto-compact)",
+                                    if round == 0 { "✨ Done (after auto-compact)" } else { "✨ Done (after aggressive auto-compact)" },
                                     TerminalRenderer::new().color_theme(),
                                     &mut stdout,
                                 )?;
                                 println!();
-                                // If additional auto-compaction happened during retry,
-                                // report that too
                                 if let Some(event) = summary.auto_compaction {
                                     println!("{}", format_auto_compaction_notice(event.removed_message_count));
                                 }
-                                // Save the compacted session to disk
                                 self.persist_session()?;
                                 return Ok(());
                             }
-                            // If retry also fails, propagate the new error
                             Err(retry_error) => {
+                                let retry_str = retry_error.to_string();
+                                let still_context_window = retry_str.contains("context_window")
+                                    || retry_str.contains("Context window")
+                                    || retry_str.contains("no parseable body");
+                                
+                                if still_context_window && round + 1 < max_compact_rounds {
+                                    // Still too large — compact more aggressively next round
+                                    runtime.shutdown_plugins()?;
+                                    runtime = new_runtime;
+                                    continue;
+                                }
+                                
+                                // Not a context window error, or out of rounds
                                 return Err(Box::new(retry_error));
                             }
                         }
