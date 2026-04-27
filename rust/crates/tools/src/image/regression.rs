@@ -7,8 +7,12 @@
 
 use std::collections::BTreeMap;
 use std::path::Path;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
+use runtime::{
+    ImageGateVerdict, ImageRegressionSummaryPayload, ImageStepProvenance, LaneEvent,
+    LaneFailureClass,
+};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
@@ -19,6 +23,40 @@ use super::provider::{
 use super::validator::{
     PatternRegion, SymmetryExpectation, ValidatorReport, ValidatorRequest, ValidatorStage,
 };
+
+/// Sink that receives `LaneEvent`s emitted during a regression run. Buffered
+/// in a `Mutex<Vec<_>>` so a CI orchestrator can stream / persist them after
+/// `RegressionRun::execute` returns.
+#[derive(Debug, Default, Clone)]
+pub struct LaneEventSink {
+    inner: Arc<Mutex<Vec<LaneEvent>>>,
+}
+
+impl LaneEventSink {
+    #[must_use]
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    pub fn push(&self, event: LaneEvent) {
+        if let Ok(mut guard) = self.inner.lock() {
+            guard.push(event);
+        }
+    }
+
+    #[must_use]
+    pub fn drain(&self) -> Vec<LaneEvent> {
+        self.inner
+            .lock()
+            .map(|mut guard| std::mem::take(&mut *guard))
+            .unwrap_or_default()
+    }
+
+    #[must_use]
+    pub fn snapshot(&self) -> Vec<LaneEvent> {
+        self.inner.lock().map(|g| g.clone()).unwrap_or_default()
+    }
+}
 
 /// Fixture format from §8.2 with the additional `provider` field needed to
 /// route the scene through one of the registered adapters.
@@ -124,6 +162,11 @@ pub struct RegressionRun<'a> {
     pub validator: &'a ValidatorStage,
     pub generator: Arc<dyn HttpInvoker>,
     pub release_gate: Option<ReleaseGate>,
+    /// Optional sink that buffers `LaneEvent`s emitted as each scene
+    /// progresses through generate / validate / gate / scene-accept-or-reject.
+    /// Wire this through to surface image runs alongside code lanes in the
+    /// same CI status pane.
+    pub event_sink: Option<LaneEventSink>,
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize)]
@@ -162,6 +205,24 @@ impl RegressionRun<'_> {
             &outcomes,
             self.release_gate.unwrap_or_default(),
         );
+        if let Some(sink) = &self.event_sink {
+            let payload = ImageRegressionSummaryPayload {
+                run_id: summary.run_id.clone(),
+                profile: summary.profile.clone(),
+                scenes_total: summary.scenes_total,
+                seeds_total: summary.seeds_total,
+                accepted: summary.accepted,
+                rejected: summary.rejected,
+                errored: summary.errored,
+                pass_rate: summary.pass_rate,
+                catastrophic_failure_rate: summary.catastrophic_failure_rate,
+                release_gate_passed: summary.release_gate.passed,
+            };
+            sink.push(LaneEvent::image_regression_summary(
+                emitted_at_now(),
+                &payload,
+            ));
+        }
         let markdown = render_markdown(&summary, &outcomes);
         Ok(RegressionRunReport {
             run_id: self.run_id.clone(),
@@ -173,12 +234,30 @@ impl RegressionRun<'_> {
         })
     }
 
+    fn provenance(&self, fixture: &RegressionFixture, seed: u64) -> ImageStepProvenance {
+        ImageStepProvenance::new(&self.run_id, &fixture.id, seed, &fixture.provider)
+            .with_profile(&self.profile)
+    }
+
+    fn emit(&self, event: LaneEvent) {
+        if let Some(sink) = &self.event_sink {
+            sink.push(event);
+        }
+    }
+
+    #[allow(clippy::too_many_lines)]
     fn run_seed(
         &self,
         fixture: &RegressionFixture,
         seed: u64,
         resolved: &super::profile::ResolvedParams,
     ) -> SceneOutcome {
+        let provenance = self.provenance(fixture, seed);
+        self.emit(LaneEvent::image_generate_started(
+            emitted_at_now(),
+            &provenance,
+        ));
+
         let canonical = CanonicalGenerationRequest {
             prompt: fixture.prompt.clone(),
             negative_prompt: fixture.negative_prompt.clone(),
@@ -201,7 +280,14 @@ impl RegressionRun<'_> {
         ) {
             Ok(inv) => inv,
             Err(err) => {
-                return failure_outcome(fixture, seed, format!("translate failed: {err}"));
+                let detail = format!("translate failed: {err}");
+                self.emit(LaneEvent::image_scene_rejected(
+                    emitted_at_now(),
+                    &provenance,
+                    LaneFailureClass::ImageBackend,
+                    detail.clone(),
+                ));
+                return failure_outcome(fixture, seed, detail);
             }
         };
         let raw = match self
@@ -209,17 +295,43 @@ impl RegressionRun<'_> {
             .post_json(&invocation.endpoint, &invocation.payload)
         {
             Ok(value) => value,
-            Err(err) => return failure_outcome(fixture, seed, format!("generate HTTP: {err}")),
+            Err(err) => {
+                let detail = format!("generate HTTP: {err}");
+                self.emit(LaneEvent::image_scene_rejected(
+                    emitted_at_now(),
+                    &provenance,
+                    LaneFailureClass::ImageBackend,
+                    detail.clone(),
+                ));
+                return failure_outcome(fixture, seed, detail);
+            }
         };
         let parsed: CanonicalGenerationResponse =
             match self.providers.parse_response(&fixture.provider, &raw) {
                 Ok(p) => p,
-                Err(err) => return failure_outcome(fixture, seed, format!("parse failed: {err}")),
+                Err(err) => {
+                    let detail = format!("parse failed: {err}");
+                    self.emit(LaneEvent::image_scene_rejected(
+                        emitted_at_now(),
+                        &provenance,
+                        LaneFailureClass::ImageBackend,
+                        detail.clone(),
+                    ));
+                    return failure_outcome(fixture, seed, detail);
+                }
             };
-        let image = match parsed.images.first() {
-            Some(img) => img.clone(),
-            None => return failure_outcome(fixture, seed, "no images returned".to_string()),
+        let Some(image) = parsed.images.first().cloned() else {
+            let detail = "no images returned".to_string();
+            self.emit(LaneEvent::image_scene_rejected(
+                emitted_at_now(),
+                &provenance,
+                LaneFailureClass::ImageBackend,
+                detail.clone(),
+            ));
+            return failure_outcome(fixture, seed, detail);
         };
+
+        let scene_provenance = provenance.clone().with_final_image_uri(image.uri.clone());
 
         let req = ValidatorRequest {
             image_uri: image.uri.clone(),
@@ -229,8 +341,22 @@ impl RegressionRun<'_> {
         };
         let report: ValidatorReport = match self.validator.run(&req) {
             Ok(r) => r,
-            Err(err) => return failure_outcome(fixture, seed, format!("validator: {err}")),
+            Err(err) => {
+                let detail = format!("validator: {err}");
+                self.emit(LaneEvent::image_scene_rejected(
+                    emitted_at_now(),
+                    &scene_provenance,
+                    LaneFailureClass::ImageValidator,
+                    detail.clone(),
+                ));
+                return failure_outcome(fixture, seed, detail);
+            }
         };
+        self.emit(LaneEvent::image_validator_ran(
+            emitted_at_now(),
+            &scene_provenance,
+            report.scores.weighted_total(),
+        ));
 
         let expects_symmetry = !fixture.expectations.symmetry_regions.is_empty();
         let expects_pattern = !fixture.expectations.pattern_regions.is_empty();
@@ -239,10 +365,72 @@ impl RegressionRun<'_> {
                 .scores
                 .passes(&resolved.thresholds, expects_symmetry, expects_pattern);
 
+        let verdict = ImageGateVerdict {
+            passed: accepted,
+            anatomy_score: report.scores.anatomy_score,
+            symmetry_score: report.scores.symmetry_score,
+            pattern_score: report.scores.pattern_score,
+            artifact_score: report.scores.artifact_score,
+            creative_score: report.scores.creative_score,
+            weighted_total: report.scores.weighted_total(),
+        };
+        self.emit(LaneEvent::image_gate_verdict(
+            emitted_at_now(),
+            &scene_provenance,
+            &verdict,
+        ));
+
         // Catastrophic = anatomy/symmetry below "0.5 × threshold" floor.
         let catastrophic = report.scores.anatomy_score < resolved.thresholds.anatomy * 0.5
             || (expects_symmetry
                 && report.scores.symmetry_score < resolved.thresholds.symmetry * 0.5);
+
+        if accepted {
+            self.emit(LaneEvent::image_scene_accepted(
+                emitted_at_now(),
+                &scene_provenance,
+            ));
+        } else {
+            // Plan a repair if violations are recoverable; emit the repair-planned
+            // event so CI sees what the inpaint would target. The actual inpaint
+            // call lives in the iterative loop (Spec §6) — this hook keeps the
+            // event surface ready when that lands.
+            let mut repair_kinds = Vec::new();
+            if !report.anatomy_issues.is_empty() {
+                repair_kinds.push("anatomy");
+            }
+            if !report.symmetry_violations.is_empty() {
+                repair_kinds.push("symmetry");
+            }
+            if !report.pattern_violations.is_empty() {
+                repair_kinds.push("pattern");
+            }
+            if !report.artifact_issues.is_empty() {
+                repair_kinds.push("artifact");
+            }
+            if !repair_kinds.is_empty() {
+                self.emit(LaneEvent::image_repair_planned(
+                    emitted_at_now(),
+                    &scene_provenance,
+                    &repair_kinds,
+                ));
+            }
+            let detail = if catastrophic {
+                "catastrophic anatomy/symmetry score".to_string()
+            } else {
+                format!(
+                    "weighted_total={:.3} below gate {:.3}",
+                    report.scores.weighted_total(),
+                    resolved.thresholds.weighted_total
+                )
+            };
+            self.emit(LaneEvent::image_scene_rejected(
+                emitted_at_now(),
+                &scene_provenance,
+                LaneFailureClass::ImageRegressionGate,
+                detail,
+            ));
+        }
 
         SceneOutcome {
             scene_id: fixture.id.clone(),
@@ -260,6 +448,13 @@ impl RegressionRun<'_> {
             error: None,
         }
     }
+}
+
+fn emitted_at_now() -> String {
+    use std::time::{SystemTime, UNIX_EPOCH};
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_or_else(|_| "0".to_string(), |d| d.as_millis().to_string())
 }
 
 fn failure_outcome(fixture: &RegressionFixture, seed: u64, error: String) -> SceneOutcome {
@@ -592,6 +787,7 @@ mod tests {
             validator: &validator,
             generator,
             release_gate: None,
+            event_sink: None,
         }
         .execute()
         .expect("execute");
@@ -653,6 +849,7 @@ mod tests {
             validator: &validator,
             generator,
             release_gate: None,
+            event_sink: None,
         }
         .execute()
         .expect("execute");
@@ -701,6 +898,7 @@ mod tests {
             validator: &validator,
             generator,
             release_gate: None,
+            event_sink: None,
         }
         .execute()
         .expect("execute");

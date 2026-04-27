@@ -4,7 +4,7 @@ pub type GreenLevel = u8;
 
 const STALE_BRANCH_THRESHOLD: Duration = Duration::from_secs(60 * 60);
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct PolicyRule {
     pub name: String,
     pub condition: PolicyCondition,
@@ -34,18 +34,37 @@ impl PolicyRule {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 pub enum PolicyCondition {
     And(Vec<PolicyCondition>),
     Or(Vec<PolicyCondition>),
-    GreenAt { level: GreenLevel },
+    GreenAt {
+        level: GreenLevel,
+    },
     StaleBranch,
     StartupBlocked,
     LaneCompleted,
     LaneReconciled,
     ReviewPassed,
     ScopedDiff,
-    TimedOut { duration: Duration },
+    TimedOut {
+        duration: Duration,
+    },
+    /// Match when the image regression's pass rate for `fixture` is at
+    /// least `min` (0.0..=1.0). When `fixture` is `None`, applies to the
+    /// run-wide pass rate.
+    ImagePassRate {
+        fixture: Option<String>,
+        min: f64,
+    },
+    /// Match when the image regression's catastrophic-failure rate is at
+    /// most `max` (0.0..=1.0). Mirrors §8.3 release-gate behaviour.
+    ImageCatastrophicRateAtMost {
+        max: f64,
+    },
+    /// Match when the image regression's release-gate verdict is
+    /// `passed == true` (i.e. all configured gate metrics cleared).
+    ImageReleaseGatePassed,
 }
 
 impl PolicyCondition {
@@ -66,6 +85,23 @@ impl PolicyCondition {
             Self::ReviewPassed => context.review_status == ReviewStatus::Approved,
             Self::ScopedDiff => context.diff_scope == DiffScope::Scoped,
             Self::TimedOut { duration } => context.branch_freshness >= *duration,
+            Self::ImagePassRate { fixture, min } => match (&context.image_regression, fixture) {
+                (Some(report), None) => report.pass_rate >= *min,
+                (Some(report), Some(name)) => report
+                    .per_fixture_pass_rate
+                    .get(name)
+                    .copied()
+                    .is_some_and(|rate| rate >= *min),
+                (None, _) => false,
+            },
+            Self::ImageCatastrophicRateAtMost { max } => context
+                .image_regression
+                .as_ref()
+                .is_some_and(|r| r.catastrophic_failure_rate <= *max),
+            Self::ImageReleaseGatePassed => context
+                .image_regression
+                .as_ref()
+                .is_some_and(|r| r.release_gate_passed),
         }
     }
 }
@@ -75,13 +111,33 @@ pub enum PolicyAction {
     MergeToDev,
     MergeForward,
     RecoverOnce,
-    Escalate { reason: String },
+    Escalate {
+        reason: String,
+    },
     CloseoutLane,
     CleanupSession,
-    Reconcile { reason: ReconcileReason },
-    Notify { channel: String },
-    Block { reason: String },
+    Reconcile {
+        reason: ReconcileReason,
+    },
+    Notify {
+        channel: String,
+    },
+    Block {
+        reason: String,
+    },
     Chain(Vec<PolicyAction>),
+    /// Promote a passing image regression run (e.g. publish artifacts,
+    /// flip a `latest` pointer, or merge a generated assets PR).
+    PromoteImageRun {
+        run_id: String,
+    },
+    /// Freeze image promotion for a fixture (e.g. when pass-rate has
+    /// dropped below the gate). The frozen fixture is held until
+    /// `UnfreezeImageFixture` clears it.
+    FreezeImageFixture {
+        fixture: String,
+        reason: String,
+    },
 }
 
 /// Why a lane was reconciled without further action.
@@ -130,7 +186,49 @@ pub enum DiffScope {
     Scoped,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+/// Snapshot of an image regression run's release-gate signals, attached
+/// to a `LaneContext` so policy rules can consume them. The numbers come
+/// from `tools::image::regression::RegressionSummary`; this lives here
+/// instead of in `tools` to avoid a runtime → tools dependency cycle.
+#[derive(Debug, Clone, PartialEq)]
+pub struct ImageRegressionReport {
+    pub run_id: String,
+    pub pass_rate: f64,
+    pub catastrophic_failure_rate: f64,
+    pub release_gate_passed: bool,
+    pub per_fixture_pass_rate: std::collections::BTreeMap<String, f64>,
+}
+
+impl ImageRegressionReport {
+    #[must_use]
+    pub fn new(run_id: impl Into<String>, pass_rate: f64) -> Self {
+        Self {
+            run_id: run_id.into(),
+            pass_rate,
+            catastrophic_failure_rate: 0.0,
+            release_gate_passed: pass_rate >= 1.0,
+            per_fixture_pass_rate: std::collections::BTreeMap::new(),
+        }
+    }
+
+    #[must_use]
+    pub fn with_catastrophic_failure_rate(mut self, rate: f64) -> Self {
+        self.catastrophic_failure_rate = rate;
+        self
+    }
+
+    #[must_use]
+    pub fn with_release_gate_passed(mut self, passed: bool) -> Self {
+        self.release_gate_passed = passed;
+        self
+    }
+
+    pub fn record_fixture_pass_rate(&mut self, fixture: impl Into<String>, rate: f64) {
+        self.per_fixture_pass_rate.insert(fixture.into(), rate);
+    }
+}
+
+#[derive(Debug, Clone, PartialEq)]
 pub struct LaneContext {
     pub lane_id: String,
     pub green_level: GreenLevel,
@@ -140,6 +238,9 @@ pub struct LaneContext {
     pub diff_scope: DiffScope,
     pub completed: bool,
     pub reconciled: bool,
+    /// Optional image-regression telemetry; set on lanes that drive an
+    /// `ImageRegressionRun` so `ImagePassRate` rules can fire.
+    pub image_regression: Option<ImageRegressionReport>,
 }
 
 impl LaneContext {
@@ -162,6 +263,7 @@ impl LaneContext {
             diff_scope,
             completed,
             reconciled: false,
+            image_regression: None,
         }
     }
 
@@ -177,11 +279,19 @@ impl LaneContext {
             diff_scope: DiffScope::Full,
             completed: true,
             reconciled: true,
+            image_regression: None,
         }
+    }
+
+    /// Attach an image regression report to this lane context.
+    #[must_use]
+    pub fn with_image_regression(mut self, report: ImageRegressionReport) -> Self {
+        self.image_regression = Some(report);
+        self
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct PolicyEngine {
     rules: Vec<PolicyRule>,
 }
@@ -577,5 +687,164 @@ mod tests {
     fn reconcile_reason_variants_are_distinct() {
         assert_ne!(ReconcileReason::AlreadyMerged, ReconcileReason::Superseded);
         assert_ne!(ReconcileReason::EmptyDiff, ReconcileReason::ManualClose);
+    }
+
+    fn image_lane_context(report: super::ImageRegressionReport) -> LaneContext {
+        LaneContext::new(
+            "image-lane-1",
+            0,
+            Duration::from_secs(0),
+            LaneBlocker::None,
+            ReviewStatus::Pending,
+            DiffScope::Full,
+            true,
+        )
+        .with_image_regression(report)
+    }
+
+    #[test]
+    fn image_pass_rate_rule_fires_when_run_wide_pass_rate_clears_threshold() {
+        let engine = PolicyEngine::new(vec![PolicyRule::new(
+            "promote-image",
+            PolicyCondition::ImagePassRate {
+                fixture: None,
+                min: 0.85,
+            },
+            PolicyAction::PromoteImageRun {
+                run_id: "iqh_2026_04_27".to_string(),
+            },
+            10,
+        )]);
+        let report = super::ImageRegressionReport::new("iqh_2026_04_27", 0.92);
+        let actions = engine.evaluate(&image_lane_context(report));
+        assert_eq!(
+            actions,
+            vec![PolicyAction::PromoteImageRun {
+                run_id: "iqh_2026_04_27".to_string()
+            }]
+        );
+    }
+
+    #[test]
+    fn image_pass_rate_rule_does_not_fire_below_threshold() {
+        let engine = PolicyEngine::new(vec![PolicyRule::new(
+            "promote-image",
+            PolicyCondition::ImagePassRate {
+                fixture: None,
+                min: 0.85,
+            },
+            PolicyAction::PromoteImageRun {
+                run_id: "iqh_low".to_string(),
+            },
+            10,
+        )]);
+        let report = super::ImageRegressionReport::new("iqh_low", 0.55);
+        let actions = engine.evaluate(&image_lane_context(report));
+        assert!(actions.is_empty());
+    }
+
+    #[test]
+    fn image_pass_rate_rule_can_target_a_specific_fixture() {
+        let engine = PolicyEngine::new(vec![PolicyRule::new(
+            "armor-promote",
+            PolicyCondition::ImagePassRate {
+                fixture: Some("scene_003_fullbody_armor".to_string()),
+                min: 0.9,
+            },
+            PolicyAction::PromoteImageRun {
+                run_id: "armor-only".to_string(),
+            },
+            10,
+        )]);
+        let mut report = super::ImageRegressionReport::new("armor-only", 0.5);
+        report.record_fixture_pass_rate("scene_003_fullbody_armor", 0.95);
+        report.record_fixture_pass_rate("scene_004_fabric_pattern", 0.4);
+        let actions = engine.evaluate(&image_lane_context(report));
+        assert_eq!(
+            actions,
+            vec![PolicyAction::PromoteImageRun {
+                run_id: "armor-only".to_string()
+            }]
+        );
+    }
+
+    #[test]
+    fn image_release_gate_rule_chains_freeze_when_catastrophic_rate_exceeds_max() {
+        let engine = PolicyEngine::new(vec![PolicyRule::new(
+            "freeze-on-catastrophe",
+            PolicyCondition::And(vec![
+                PolicyCondition::LaneCompleted,
+                PolicyCondition::Or(vec![
+                    PolicyCondition::ImagePassRate {
+                        fixture: None,
+                        min: 0.85,
+                    },
+                    PolicyCondition::ImageReleaseGatePassed,
+                ]),
+            ]),
+            PolicyAction::PromoteImageRun {
+                run_id: "iqh".to_string(),
+            },
+            5,
+        )]);
+        // catastrophic-rate above default 0.02 → release gate failed → no promote
+        let mut report = super::ImageRegressionReport::new("iqh", 0.6)
+            .with_catastrophic_failure_rate(0.10)
+            .with_release_gate_passed(false);
+        report.record_fixture_pass_rate("scene_a", 0.6);
+        let actions = engine.evaluate(&image_lane_context(report));
+        assert!(actions.is_empty());
+    }
+
+    #[test]
+    fn image_pass_rate_rule_does_not_fire_when_no_image_report_attached() {
+        let engine = PolicyEngine::new(vec![PolicyRule::new(
+            "promote",
+            PolicyCondition::ImagePassRate {
+                fixture: None,
+                min: 0.0,
+            },
+            PolicyAction::PromoteImageRun {
+                run_id: "noop".to_string(),
+            },
+            10,
+        )]);
+        // Default LaneContext has image_regression = None
+        let actions = engine.evaluate(&default_context());
+        assert!(actions.is_empty());
+    }
+
+    #[test]
+    fn freeze_image_fixture_action_round_trips_through_chain() {
+        let engine = PolicyEngine::new(vec![PolicyRule::new(
+            "freeze-bad-fixture",
+            PolicyCondition::ImageCatastrophicRateAtMost { max: 0.01 },
+            PolicyAction::PromoteImageRun {
+                run_id: "ok".to_string(),
+            },
+            10,
+        )]);
+        let report = super::ImageRegressionReport::new("ok", 1.0)
+            .with_catastrophic_failure_rate(0.0)
+            .with_release_gate_passed(true);
+        let actions = engine.evaluate(&image_lane_context(report));
+        assert!(matches!(actions[0], PolicyAction::PromoteImageRun { .. }));
+    }
+
+    #[test]
+    fn image_freeze_action_serializes_into_policy_chain() {
+        let action = PolicyAction::Chain(vec![
+            PolicyAction::FreezeImageFixture {
+                fixture: "scene_a".to_string(),
+                reason: "pass_rate=0.4 < 0.85".to_string(),
+            },
+            PolicyAction::Notify {
+                channel: "image-ops".to_string(),
+            },
+        ]);
+        let mut flat = Vec::new();
+        action.flatten_into(&mut flat);
+        assert!(matches!(flat[0], PolicyAction::FreezeImageFixture { .. }));
+        assert!(matches!(flat[1], PolicyAction::Notify { .. }));
     }
 }

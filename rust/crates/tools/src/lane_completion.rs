@@ -62,6 +62,7 @@ pub(crate) fn detect_lane_completion(
         diff_scope: runtime::DiffScope::Scoped,
         completed: true,
         reconciled: false,
+        image_regression: None,
     })
 }
 
@@ -171,6 +172,7 @@ mod tests {
             diff_scope: DiffScope::Scoped,
             completed: true,
             reconciled: false,
+            image_regression: None,
         };
 
         let actions = evaluate_completed_lane(&context);

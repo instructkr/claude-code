@@ -84,7 +84,8 @@ pub use hooks::{
 };
 pub use lane_events::{
     compute_event_fingerprint, dedupe_superseded_commit_events, dedupe_terminal_events,
-    is_terminal_event, BlockedSubphase, EventProvenance, LaneCommitProvenance, LaneEvent,
+    is_terminal_event, BlockedSubphase, EventProvenance, ImageGateVerdict,
+    ImageRegressionSummaryPayload, ImageStepProvenance, LaneCommitProvenance, LaneEvent,
     LaneEventBlocker, LaneEventBuilder, LaneEventMetadata, LaneEventName, LaneEventStatus,
     LaneFailureClass, LaneOwnership, SessionIdentity, ShipMergeMethod, ShipProvenance,
     WatcherAction,
@@ -127,8 +128,8 @@ pub use plugin_lifecycle::{
     PluginState, ResourceInfo, ServerHealth, ServerStatus, ToolInfo,
 };
 pub use policy_engine::{
-    evaluate, DiffScope, GreenLevel, LaneBlocker, LaneContext, PolicyAction, PolicyCondition,
-    PolicyEngine, PolicyRule, ReconcileReason, ReviewStatus,
+    evaluate, DiffScope, GreenLevel, ImageRegressionReport, LaneBlocker, LaneContext, PolicyAction,
+    PolicyCondition, PolicyEngine, PolicyRule, ReconcileReason, ReviewStatus,
 };
 pub use prompt::{
     load_system_prompt, prepend_bullets, ContextFile, ProjectContext, PromptBuildError,

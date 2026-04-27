@@ -654,3 +654,118 @@ fn image_regression_run_executes_diffusers_fixture_and_emits_markdown_summary() 
     assert!(markdown.contains("scene1"));
     assert!(*dispatch.lock().unwrap(), "all paths matched a known route");
 }
+
+#[test]
+fn image_regression_run_emits_lane_events_when_emit_lane_events_is_set() {
+    let server = MockBackend::spawn(Arc::new(move |req| match req.path.as_str() {
+        "/v1/text-to-image" => (
+            200,
+            json!({"artifacts": [{"uri": "s3://lane/0.png", "seed": 42}]}),
+        ),
+        "/v1/anatomy" => (
+            200,
+            json!({"regions": [], "scores": {"anatomy_score": 0.95}}),
+        ),
+        "/v1/artifact" => (200, json!({"artifact_score": 0.92, "issues": []})),
+        other => (404, json!({"error": format!("unexpected path {other}")})),
+    }));
+
+    let result = execute_tool(
+        "ImageRegressionRun",
+        &json!({
+            "run_id": "iqh_lane_events",
+            "profile": "production",
+            "emit_lane_events": true,
+            "fixtures": [{
+                "id": "scene_lane_events",
+                "prompt": "p",
+                "negative_prompt": "n",
+                "width": 512,
+                "height": 512,
+                "model": "sdxl",
+                "seeds": [42],
+                "expectations": {
+                    "requires_hands": true,
+                    "requires_feet": false,
+                    "symmetry_labels": [],
+                    "pattern_labels": []
+                },
+                "provider": "diffusers",
+                "backend_url": server.base()
+            }],
+            "validator_endpoints": {
+                "hands_feet": server.url("/v1/anatomy"),
+                "artifact": server.url("/v1/artifact")
+            }
+        }),
+    )
+    .expect("regression with events");
+    let parsed = pretty_value(&result);
+    let lane_events = parsed["lane_events"]
+        .as_array()
+        .expect("lane_events array")
+        .clone();
+    let event_kinds: Vec<&str> = lane_events
+        .iter()
+        .filter_map(|e| e["event"].as_str())
+        .collect();
+    assert!(
+        event_kinds.contains(&"image.generate.started"),
+        "got {event_kinds:?}"
+    );
+    assert!(event_kinds.contains(&"image.validator.ran"));
+    assert!(event_kinds.contains(&"image.gate.verdict"));
+    assert!(event_kinds.contains(&"image.scene.accepted"));
+    assert!(event_kinds.contains(&"image.regression.summary"));
+
+    // Verify provenance carries through the canonical fields.
+    let started = lane_events
+        .iter()
+        .find(|e| e["event"] == "image.generate.started")
+        .expect("started event");
+    assert_eq!(started["data"]["scene_id"], "scene_lane_events");
+    assert_eq!(started["data"]["provider"], "diffusers");
+    assert_eq!(started["data"]["seed"], 42);
+}
+
+#[test]
+fn image_regression_run_omits_lane_events_array_when_flag_unset() {
+    let server = MockBackend::spawn(Arc::new(|req| match req.path.as_str() {
+        "/v1/text-to-image" => (
+            200,
+            json!({"artifacts": [{"uri": "s3://e/0.png", "seed": 1}]}),
+        ),
+        "/v1/anatomy" => (
+            200,
+            json!({"regions": [], "scores": {"anatomy_score": 0.95}}),
+        ),
+        "/v1/artifact" => (200, json!({"artifact_score": 0.92, "issues": []})),
+        _ => (404, json!({"error": "no"})),
+    }));
+    let result = execute_tool(
+        "ImageRegressionRun",
+        &json!({
+            "run_id": "iqh_no_events",
+            "profile": "production",
+            "fixtures": [{
+                "id": "scene_no_events",
+                "prompt": "p",
+                "negative_prompt": "n",
+                "width": 512,
+                "height": 512,
+                "model": "sdxl",
+                "seeds": [1],
+                "provider": "diffusers",
+                "backend_url": server.base()
+            }],
+            "validator_endpoints": {
+                "hands_feet": server.url("/v1/anatomy"),
+                "artifact": server.url("/v1/artifact")
+            }
+        }),
+    )
+    .expect("regression without events");
+    let parsed = pretty_value(&result);
+    let lane_events = parsed["lane_events"].as_array().expect("array");
+    assert!(lane_events.is_empty());
+}

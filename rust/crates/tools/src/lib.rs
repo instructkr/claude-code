@@ -1457,7 +1457,8 @@ pub fn mvp_tool_specs() -> Vec<ToolSpec> {
                         },
                         "additionalProperties": false
                     },
-                    "output_path": { "type": "string" }
+                    "output_path": { "type": "string" },
+                    "emit_lane_events": { "type": "boolean" }
                 },
                 "required": ["run_id", "profile"],
                 "additionalProperties": false
@@ -2551,6 +2552,11 @@ fn run_image_regression_run(input: ImageRegressionRunInput) -> Result<String, St
         std::sync::Arc::new(image::provider::ReqwestInvoker::default());
     let validator = image::ValidatorStage::new(endpoints, invoker.clone());
 
+    let event_sink = if input.emit_lane_events.unwrap_or(false) {
+        Some(image::regression::LaneEventSink::new())
+    } else {
+        None
+    };
     let report = image::regression::RegressionRun {
         run_id: input.run_id.clone(),
         profile: input.profile.clone(),
@@ -2560,6 +2566,7 @@ fn run_image_regression_run(input: ImageRegressionRunInput) -> Result<String, St
         validator: &validator,
         generator: invoker,
         release_gate: input.release_gate,
+        event_sink: event_sink.clone(),
     }
     .execute()?;
 
@@ -2569,6 +2576,15 @@ fn run_image_regression_run(input: ImageRegressionRunInput) -> Result<String, St
     }
 
     let json_value = serde_json::to_value(&report).map_err(|e| e.to_string())?;
+    let lane_events = event_sink
+        .as_ref()
+        .map(|sink| {
+            sink.snapshot()
+                .into_iter()
+                .map(|e| serde_json::to_value(e).unwrap_or(Value::Null))
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default();
     to_pretty_json(json!({
         "tool": "ImageRegressionRun",
         "run_id": report.run_id,
@@ -2577,7 +2593,8 @@ fn run_image_regression_run(input: ImageRegressionRunInput) -> Result<String, St
         "outcomes": json_value.get("outcomes"),
         "thresholds": json_value.get("thresholds"),
         "markdown": report.markdown,
-        "output_path": input.output_path
+        "output_path": input.output_path,
+        "lane_events": lane_events
     }))
 }
 
@@ -3497,6 +3514,12 @@ struct ImageRegressionRunInput {
     release_gate: Option<image::regression::ReleaseGate>,
     #[serde(default)]
     output_path: Option<String>,
+    /// When true, emit `LaneEvent`s for each generate / validator / gate /
+    /// repair / accept-or-reject step plus a final regression-summary event.
+    /// The events appear under `lane_events` in the tool output and are also
+    /// available to callers that pass an external sink in process.
+    #[serde(default)]
+    emit_lane_events: Option<bool>,
 }
 
 #[derive(Debug, Deserialize)]

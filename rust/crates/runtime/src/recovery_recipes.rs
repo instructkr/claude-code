@@ -23,6 +23,17 @@ pub enum FailureScenario {
     McpHandshakeFailure,
     PartialPluginStartup,
     ProviderFailure,
+    /// Image backend HTTP timeout / connection refused. Recoverable by
+    /// retrying once with exponential backoff, then escalating.
+    ImageBackendTimeout,
+    /// Image backend reachable but reports degraded state — `model not
+    /// loaded`, `queue full`, 503/Service Unavailable, etc. Recoverable
+    /// by falling back to the next provider in the chain.
+    ImageBackendDegraded,
+    /// A validator endpoint declared by the regression fixture is missing
+    /// or returns 404. Recoverable by skipping the axis (per-axis
+    /// thresholds become advisory) and emitting a degraded-mode warning.
+    ValidatorEndpointMissing,
 }
 
 impl FailureScenario {
@@ -37,6 +48,9 @@ impl FailureScenario {
             Self::McpHandshakeFailure,
             Self::PartialPluginStartup,
             Self::ProviderFailure,
+            Self::ImageBackendTimeout,
+            Self::ImageBackendDegraded,
+            Self::ValidatorEndpointMissing,
         ]
     }
 
@@ -53,6 +67,36 @@ impl FailureScenario {
             }
         }
     }
+
+    /// Map an image-backend error string into the matching scenario.
+    /// `None` is returned when the error doesn't look like an image-pipeline
+    /// failure (caller should leave it alone).
+    #[must_use]
+    pub fn from_image_error(error: &str) -> Option<Self> {
+        let lower = error.to_lowercase();
+        if lower.contains("timed out")
+            || lower.contains("timeout")
+            || lower.contains("connection refused")
+            || lower.contains("connection reset")
+        {
+            return Some(Self::ImageBackendTimeout);
+        }
+        if lower.contains("model not loaded")
+            || lower.contains("queue full")
+            || lower.contains("http 503")
+            || lower.contains("http 502")
+            || lower.contains("service unavailable")
+            || lower.contains("backend degraded")
+        {
+            return Some(Self::ImageBackendDegraded);
+        }
+        if lower.contains("validator endpoint")
+            && (lower.contains("missing") || lower.contains("404") || lower.contains("not found"))
+        {
+            return Some(Self::ValidatorEndpointMissing);
+        }
+        None
+    }
 }
 
 impl std::fmt::Display for FailureScenario {
@@ -65,6 +109,9 @@ impl std::fmt::Display for FailureScenario {
             Self::McpHandshakeFailure => write!(f, "mcp_handshake_failure"),
             Self::PartialPluginStartup => write!(f, "partial_plugin_startup"),
             Self::ProviderFailure => write!(f, "provider_failure"),
+            Self::ImageBackendTimeout => write!(f, "image_backend_timeout"),
+            Self::ImageBackendDegraded => write!(f, "image_backend_degraded"),
+            Self::ValidatorEndpointMissing => write!(f, "validator_endpoint_missing"),
         }
     }
 }
@@ -77,10 +124,31 @@ pub enum RecoveryStep {
     RedirectPromptToAgent,
     RebaseBranch,
     CleanBuild,
-    RetryMcpHandshake { timeout: u64 },
-    RestartPlugin { name: String },
+    RetryMcpHandshake {
+        timeout: u64,
+    },
+    RestartPlugin {
+        name: String,
+    },
     RestartWorker,
-    EscalateToHuman { reason: String },
+    EscalateToHuman {
+        reason: String,
+    },
+    /// Retry an image backend invocation after a backoff delay (ms).
+    RetryImageBackend {
+        backoff_ms: u64,
+    },
+    /// Switch from the current provider to the next adapter in the
+    /// fallback chain (e.g. `comfyui` → `diffusers`).
+    FallbackToNextProvider {
+        from: String,
+        to: String,
+    },
+    /// Skip an unhealthy validator axis so the rest of the gate can
+    /// still run; emits a degraded-mode warning when applied.
+    SkipValidatorAxis {
+        axis: String,
+    },
 }
 
 /// Policy governing what happens when automatic recovery is exhausted.
@@ -222,6 +290,29 @@ pub fn recipe_for(scenario: &FailureScenario) -> RecoveryRecipe {
             steps: vec![RecoveryStep::RestartWorker],
             max_attempts: 1,
             escalation_policy: EscalationPolicy::AlertHuman,
+        },
+        FailureScenario::ImageBackendTimeout => RecoveryRecipe {
+            scenario: *scenario,
+            steps: vec![RecoveryStep::RetryImageBackend { backoff_ms: 2_000 }],
+            max_attempts: 1,
+            escalation_policy: EscalationPolicy::AlertHuman,
+        },
+        FailureScenario::ImageBackendDegraded => RecoveryRecipe {
+            scenario: *scenario,
+            steps: vec![RecoveryStep::FallbackToNextProvider {
+                from: "primary".to_string(),
+                to: "fallback".to_string(),
+            }],
+            max_attempts: 1,
+            escalation_policy: EscalationPolicy::AlertHuman,
+        },
+        FailureScenario::ValidatorEndpointMissing => RecoveryRecipe {
+            scenario: *scenario,
+            steps: vec![RecoveryStep::SkipValidatorAxis {
+                axis: "unknown".to_string(),
+            }],
+            max_attempts: 1,
+            escalation_policy: EscalationPolicy::LogAndContinue,
         },
     }
 }
@@ -629,5 +720,114 @@ mod tests {
             .events()
             .iter()
             .any(|e| matches!(e, RecoveryEvent::Escalated)));
+    }
+
+    #[test]
+    fn image_backend_timeout_recipe_uses_retry_with_backoff() {
+        let recipe = recipe_for(&FailureScenario::ImageBackendTimeout);
+        assert_eq!(recipe.scenario, FailureScenario::ImageBackendTimeout);
+        assert_eq!(recipe.steps.len(), 1);
+        assert!(matches!(
+            recipe.steps[0],
+            RecoveryStep::RetryImageBackend { backoff_ms: 2_000 }
+        ));
+        assert_eq!(recipe.escalation_policy, EscalationPolicy::AlertHuman);
+        assert_eq!(recipe.max_attempts, 1);
+    }
+
+    #[test]
+    fn image_backend_degraded_recipe_falls_back_to_next_provider() {
+        let recipe = recipe_for(&FailureScenario::ImageBackendDegraded);
+        assert_eq!(recipe.steps.len(), 1);
+        assert!(matches!(
+            &recipe.steps[0],
+            RecoveryStep::FallbackToNextProvider { .. }
+        ));
+    }
+
+    #[test]
+    fn validator_endpoint_missing_recipe_skips_axis_and_logs() {
+        let recipe = recipe_for(&FailureScenario::ValidatorEndpointMissing);
+        assert_eq!(recipe.steps.len(), 1);
+        assert!(matches!(
+            &recipe.steps[0],
+            RecoveryStep::SkipValidatorAxis { .. }
+        ));
+        assert_eq!(recipe.escalation_policy, EscalationPolicy::LogAndContinue);
+    }
+
+    #[test]
+    fn from_image_error_classifies_timeout_degraded_and_missing_endpoint() {
+        assert_eq!(
+            FailureScenario::from_image_error("request timed out after 60s"),
+            Some(FailureScenario::ImageBackendTimeout),
+        );
+        assert_eq!(
+            FailureScenario::from_image_error("connection refused (os error 111)"),
+            Some(FailureScenario::ImageBackendTimeout),
+        );
+        assert_eq!(
+            FailureScenario::from_image_error("backend HTTP 503: model not loaded"),
+            Some(FailureScenario::ImageBackendDegraded),
+        );
+        assert_eq!(
+            FailureScenario::from_image_error("queue full at upstream worker"),
+            Some(FailureScenario::ImageBackendDegraded),
+        );
+        assert_eq!(
+            FailureScenario::from_image_error("validator endpoint missing for symmetry axis"),
+            Some(FailureScenario::ValidatorEndpointMissing),
+        );
+        assert_eq!(
+            FailureScenario::from_image_error("validator endpoint returned 404"),
+            Some(FailureScenario::ValidatorEndpointMissing),
+        );
+        assert_eq!(
+            FailureScenario::from_image_error("merge conflict on README.md"),
+            None,
+        );
+    }
+
+    #[test]
+    fn image_backend_timeout_recovery_attempt_succeeds_then_escalates() {
+        let mut ctx = RecoveryContext::new();
+        let scenario = FailureScenario::ImageBackendTimeout;
+
+        let first = attempt_recovery(&scenario, &mut ctx);
+        assert!(matches!(first, RecoveryResult::Recovered { .. }));
+
+        let second = attempt_recovery(&scenario, &mut ctx);
+        assert!(matches!(second, RecoveryResult::EscalationRequired { .. }));
+    }
+
+    #[test]
+    fn validator_endpoint_missing_recovery_uses_log_and_continue_after_exhaustion() {
+        // LogAndContinue scenarios still report `EscalationRequired` once the
+        // attempt budget is exhausted; the policy field signals that callers
+        // should keep going rather than abort.
+        let mut ctx = RecoveryContext::new();
+        let scenario = FailureScenario::ValidatorEndpointMissing;
+        let _first = attempt_recovery(&scenario, &mut ctx);
+        let second = attempt_recovery(&scenario, &mut ctx);
+        assert!(matches!(second, RecoveryResult::EscalationRequired { .. }));
+        assert_eq!(
+            recipe_for(&scenario).escalation_policy,
+            EscalationPolicy::LogAndContinue
+        );
+    }
+
+    #[test]
+    fn all_image_scenarios_are_listed_in_failure_scenario_all() {
+        let all = FailureScenario::all();
+        for scenario in [
+            FailureScenario::ImageBackendTimeout,
+            FailureScenario::ImageBackendDegraded,
+            FailureScenario::ValidatorEndpointMissing,
+        ] {
+            assert!(
+                all.contains(&scenario),
+                "FailureScenario::all() missing {scenario}"
+            );
+        }
     }
 }

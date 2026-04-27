@@ -13,6 +13,9 @@ pub enum TaskScope {
     SingleFile,
     /// Custom scope defined by the user
     Custom,
+    /// Run an image-quality regression scene pack (Spec §8 / §10).
+    /// `scope_path` carries the fixture set identifier (or path).
+    ImageRegression,
 }
 
 impl std::fmt::Display for TaskScope {
@@ -22,6 +25,7 @@ impl std::fmt::Display for TaskScope {
             Self::Module => write!(f, "module"),
             Self::SingleFile => write!(f, "single-file"),
             Self::Custom => write!(f, "custom"),
+            Self::ImageRegression => write!(f, "image-regression"),
         }
     }
 }
@@ -117,10 +121,10 @@ pub fn validate_packet(packet: TaskPacket) -> Result<ValidatedPacket, TaskPacket
 }
 
 fn validate_scope_requirements(packet: &TaskPacket, errors: &mut Vec<String>) {
-    // Scope path is required for Module, SingleFile, and Custom scopes
+    // Scope path is required for Module, SingleFile, Custom, and ImageRegression scopes
     let needs_scope_path = matches!(
         packet.scope,
-        TaskScope::Module | TaskScope::SingleFile | TaskScope::Custom
+        TaskScope::Module | TaskScope::SingleFile | TaskScope::Custom | TaskScope::ImageRegression
     );
 
     if needs_scope_path
@@ -209,5 +213,34 @@ mod tests {
         let deserialized: TaskPacket =
             serde_json::from_str(&serialized).expect("packet should deserialize");
         assert_eq!(deserialized, packet);
+    }
+
+    #[test]
+    fn image_regression_scope_displays_and_serializes_canonically() {
+        assert_eq!(TaskScope::ImageRegression.to_string(), "image-regression");
+        let serialized =
+            serde_json::to_value(TaskScope::ImageRegression).expect("scope should serialize");
+        assert_eq!(serialized, serde_json::json!("image_regression"));
+    }
+
+    #[test]
+    fn image_regression_scope_requires_scope_path_to_identify_fixture_set() {
+        let mut packet = sample_packet();
+        packet.scope = TaskScope::ImageRegression;
+        packet.scope_path = None;
+        let error = validate_packet(packet).expect_err("missing fixture path should reject");
+        assert!(error
+            .errors()
+            .iter()
+            .any(|e| e.contains("scope_path is required")));
+    }
+
+    #[test]
+    fn image_regression_scope_with_fixture_path_validates() {
+        let mut packet = sample_packet();
+        packet.scope = TaskScope::ImageRegression;
+        packet.scope_path = Some(".claw/image-fixtures/release.json".to_string());
+        let validated = validate_packet(packet).expect("image regression packet should validate");
+        assert_eq!(validated.packet().scope, TaskScope::ImageRegression);
     }
 }

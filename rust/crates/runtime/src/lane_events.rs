@@ -47,6 +47,21 @@ pub enum LaneEventName {
     ShipMerged,
     #[serde(rename = "ship.pushed_main")]
     ShipPushedMain,
+    /// Image-quality harness lifecycle (Spec §10).
+    #[serde(rename = "image.generate.started")]
+    ImageGenerateStarted,
+    #[serde(rename = "image.validator.ran")]
+    ImageValidatorRan,
+    #[serde(rename = "image.gate.verdict")]
+    ImageGateVerdict,
+    #[serde(rename = "image.repair.planned")]
+    ImageRepairPlanned,
+    #[serde(rename = "image.scene.accepted")]
+    ImageSceneAccepted,
+    #[serde(rename = "image.scene.rejected")]
+    ImageSceneRejected,
+    #[serde(rename = "image.regression.summary")]
+    ImageRegressionSummary,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -80,6 +95,17 @@ pub enum LaneFailureClass {
     ToolRuntime,
     WorkspaceMismatch,
     Infra,
+    /// Image backend (`generate_image` / `inpaint_region`) failure —
+    /// timeouts, 5xx, or degraded model state.
+    ImageBackend,
+    /// Image validator endpoint failure — missing axis or non-2xx
+    /// response from `detect_hands_feet` / `check_symmetry` /
+    /// `check_pattern_consistency`.
+    ImageValidator,
+    /// Image regression release gate failed (`pass_rate`,
+    /// `catastrophic_failure_rate`, or `avg_iterations_to_pass` did not
+    /// clear configured thresholds).
+    ImageRegressionGate,
 }
 
 /// Provenance labels for event source classification.
@@ -346,6 +372,9 @@ pub fn is_terminal_event(event: LaneEventName) -> bool {
             | LaneEventName::Superseded
             | LaneEventName::Closed
             | LaneEventName::Merged
+            | LaneEventName::ImageSceneAccepted
+            | LaneEventName::ImageSceneRejected
+            | LaneEventName::ImageRegressionSummary
     )
 }
 
@@ -405,7 +434,10 @@ pub enum BlockedSubphase {
     #[serde(rename = "blocked.branch_freshness")]
     BranchFreshness { behind_main: u32 },
     #[serde(rename = "blocked.test_hang")]
-    TestHang { elapsed_secs: u32, test_name: Option<String> },
+    TestHang {
+        elapsed_secs: u32,
+        test_name: Option<String>,
+    },
     #[serde(rename = "blocked.report_pending")]
     ReportPending { since_secs: u32 },
 }
@@ -454,6 +486,88 @@ pub enum ShipMergeMethod {
     MergeCommit,
     SquashMerge,
     RebaseMerge,
+}
+
+/// Per-step provenance metadata for image-pipeline lane events. Mirrors
+/// what `tools::image::regression::SceneOutcome` already records, so an
+/// orchestrator can cheaply lift outcome data into a `LaneEvent` payload.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ImageStepProvenance {
+    pub run_id: String,
+    pub scene_id: String,
+    pub seed: u64,
+    pub provider: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub profile: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub iteration: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub final_image_uri: Option<String>,
+}
+
+impl ImageStepProvenance {
+    #[must_use]
+    pub fn new(
+        run_id: impl Into<String>,
+        scene_id: impl Into<String>,
+        seed: u64,
+        provider: impl Into<String>,
+    ) -> Self {
+        Self {
+            run_id: run_id.into(),
+            scene_id: scene_id.into(),
+            seed,
+            provider: provider.into(),
+            profile: None,
+            iteration: None,
+            final_image_uri: None,
+        }
+    }
+
+    #[must_use]
+    pub fn with_profile(mut self, profile: impl Into<String>) -> Self {
+        self.profile = Some(profile.into());
+        self
+    }
+
+    #[must_use]
+    pub fn with_iteration(mut self, iteration: u32) -> Self {
+        self.iteration = Some(iteration);
+        self
+    }
+
+    #[must_use]
+    pub fn with_final_image_uri(mut self, uri: impl Into<String>) -> Self {
+        self.final_image_uri = Some(uri.into());
+        self
+    }
+}
+
+/// Verdict payload for `lane.image.gate.verdict` events.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ImageGateVerdict {
+    pub passed: bool,
+    pub anatomy_score: f64,
+    pub symmetry_score: f64,
+    pub pattern_score: f64,
+    pub artifact_score: f64,
+    pub creative_score: f64,
+    pub weighted_total: f64,
+}
+
+/// Aggregate payload for `lane.image.regression.summary` events.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ImageRegressionSummaryPayload {
+    pub run_id: String,
+    pub profile: String,
+    pub scenes_total: usize,
+    pub seeds_total: usize,
+    pub accepted: usize,
+    pub rejected: usize,
+    pub errored: usize,
+    pub pass_rate: f64,
+    pub catastrophic_failure_rate: f64,
+    pub release_gate_passed: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -543,7 +657,8 @@ impl LaneEvent {
             .with_failure_class(blocker.failure_class)
             .with_detail(blocker.detail.clone());
         if let Some(ref subphase) = blocker.subphase {
-            event = event.with_data(serde_json::to_value(subphase).expect("subphase should serialize"));
+            event =
+                event.with_data(serde_json::to_value(subphase).expect("subphase should serialize"));
         }
         event
     }
@@ -554,7 +669,8 @@ impl LaneEvent {
             .with_failure_class(blocker.failure_class)
             .with_detail(blocker.detail.clone());
         if let Some(ref subphase) = blocker.subphase {
-            event = event.with_data(serde_json::to_value(subphase).expect("subphase should serialize"));
+            event =
+                event.with_data(serde_json::to_value(subphase).expect("subphase should serialize"));
         }
         event
     }
@@ -562,8 +678,12 @@ impl LaneEvent {
     /// Ship prepared — §4.44.5
     #[must_use]
     pub fn ship_prepared(emitted_at: impl Into<String>, provenance: &ShipProvenance) -> Self {
-        Self::new(LaneEventName::ShipPrepared, LaneEventStatus::Ready, emitted_at)
-            .with_data(serde_json::to_value(provenance).expect("ship provenance should serialize"))
+        Self::new(
+            LaneEventName::ShipPrepared,
+            LaneEventStatus::Ready,
+            emitted_at,
+        )
+        .with_data(serde_json::to_value(provenance).expect("ship provenance should serialize"))
     }
 
     /// Ship commits selected — §4.44.5
@@ -573,22 +693,159 @@ impl LaneEvent {
         commit_count: u32,
         commit_range: impl Into<String>,
     ) -> Self {
-        Self::new(LaneEventName::ShipCommitsSelected, LaneEventStatus::Ready, emitted_at)
-            .with_detail(format!("{} commits: {}", commit_count, commit_range.into()))
+        Self::new(
+            LaneEventName::ShipCommitsSelected,
+            LaneEventStatus::Ready,
+            emitted_at,
+        )
+        .with_detail(format!("{} commits: {}", commit_count, commit_range.into()))
     }
 
     /// Ship merged — §4.44.5
     #[must_use]
     pub fn ship_merged(emitted_at: impl Into<String>, provenance: &ShipProvenance) -> Self {
-        Self::new(LaneEventName::ShipMerged, LaneEventStatus::Completed, emitted_at)
-            .with_data(serde_json::to_value(provenance).expect("ship provenance should serialize"))
+        Self::new(
+            LaneEventName::ShipMerged,
+            LaneEventStatus::Completed,
+            emitted_at,
+        )
+        .with_data(serde_json::to_value(provenance).expect("ship provenance should serialize"))
     }
 
     /// Ship pushed to main — §4.44.5
     #[must_use]
     pub fn ship_pushed_main(emitted_at: impl Into<String>, provenance: &ShipProvenance) -> Self {
-        Self::new(LaneEventName::ShipPushedMain, LaneEventStatus::Completed, emitted_at)
-            .with_data(serde_json::to_value(provenance).expect("ship provenance should serialize"))
+        Self::new(
+            LaneEventName::ShipPushedMain,
+            LaneEventStatus::Completed,
+            emitted_at,
+        )
+        .with_data(serde_json::to_value(provenance).expect("ship provenance should serialize"))
+    }
+
+    /// Image-pipeline: a generation request was dispatched to a provider.
+    #[must_use]
+    pub fn image_generate_started(
+        emitted_at: impl Into<String>,
+        provenance: &ImageStepProvenance,
+    ) -> Self {
+        Self::new(
+            LaneEventName::ImageGenerateStarted,
+            LaneEventStatus::Running,
+            emitted_at,
+        )
+        .with_data(serde_json::to_value(provenance).expect("image provenance should serialize"))
+    }
+
+    /// Image-pipeline: validator suite produced a normalised score vector.
+    #[must_use]
+    pub fn image_validator_ran(
+        emitted_at: impl Into<String>,
+        provenance: &ImageStepProvenance,
+        weighted_total: f64,
+    ) -> Self {
+        let mut value =
+            serde_json::to_value(provenance).expect("image provenance should serialize");
+        if let Some(map) = value.as_object_mut() {
+            map.insert(
+                "weighted_total".to_string(),
+                serde_json::json!(weighted_total),
+            );
+        }
+        Self::new(
+            LaneEventName::ImageValidatorRan,
+            LaneEventStatus::Running,
+            emitted_at,
+        )
+        .with_data(value)
+    }
+
+    /// Image-pipeline: per-image policy gate verdict.
+    #[must_use]
+    pub fn image_gate_verdict(
+        emitted_at: impl Into<String>,
+        provenance: &ImageStepProvenance,
+        verdict: &ImageGateVerdict,
+    ) -> Self {
+        let mut value = serde_json::to_value(provenance).expect("provenance");
+        if let Some(map) = value.as_object_mut() {
+            map.insert(
+                "verdict".to_string(),
+                serde_json::to_value(verdict).expect("verdict"),
+            );
+        }
+        let status = if verdict.passed {
+            LaneEventStatus::Green
+        } else {
+            LaneEventStatus::Red
+        };
+        Self::new(LaneEventName::ImageGateVerdict, status, emitted_at).with_data(value)
+    }
+
+    /// Image-pipeline: a repair plan was scheduled (mask + targeted prompt).
+    #[must_use]
+    pub fn image_repair_planned(
+        emitted_at: impl Into<String>,
+        provenance: &ImageStepProvenance,
+        repair_kinds: &[&str],
+    ) -> Self {
+        let mut value = serde_json::to_value(provenance).expect("provenance");
+        if let Some(map) = value.as_object_mut() {
+            map.insert("repair_kinds".to_string(), serde_json::json!(repair_kinds));
+        }
+        Self::new(
+            LaneEventName::ImageRepairPlanned,
+            LaneEventStatus::Running,
+            emitted_at,
+        )
+        .with_data(value)
+    }
+
+    /// Image-pipeline: scene accepted under the configured policy gate.
+    #[must_use]
+    pub fn image_scene_accepted(
+        emitted_at: impl Into<String>,
+        provenance: &ImageStepProvenance,
+    ) -> Self {
+        Self::new(
+            LaneEventName::ImageSceneAccepted,
+            LaneEventStatus::Completed,
+            emitted_at,
+        )
+        .with_data(serde_json::to_value(provenance).expect("provenance"))
+    }
+
+    /// Image-pipeline: scene rejected after exhausting repair budget.
+    #[must_use]
+    pub fn image_scene_rejected(
+        emitted_at: impl Into<String>,
+        provenance: &ImageStepProvenance,
+        failure_class: LaneFailureClass,
+        detail: impl Into<String>,
+    ) -> Self {
+        Self::new(
+            LaneEventName::ImageSceneRejected,
+            LaneEventStatus::Failed,
+            emitted_at,
+        )
+        .with_failure_class(failure_class)
+        .with_detail(detail)
+        .with_data(serde_json::to_value(provenance).expect("provenance"))
+    }
+
+    /// Image-pipeline: aggregate summary at end of regression run.
+    #[must_use]
+    pub fn image_regression_summary(
+        emitted_at: impl Into<String>,
+        summary: &ImageRegressionSummaryPayload,
+    ) -> Self {
+        let status = if summary.release_gate_passed {
+            LaneEventStatus::Green
+        } else {
+            LaneEventStatus::Red
+        };
+        Self::new(LaneEventName::ImageRegressionSummary, status, emitted_at)
+            .with_data(serde_json::to_value(summary).expect("summary"))
     }
 
     #[must_use]
@@ -662,7 +919,8 @@ mod tests {
 
     use super::{
         compute_event_fingerprint, dedupe_superseded_commit_events, dedupe_terminal_events,
-        is_terminal_event, BlockedSubphase, EventProvenance, LaneCommitProvenance, LaneEvent,
+        is_terminal_event, BlockedSubphase, EventProvenance, ImageGateVerdict,
+        ImageRegressionSummaryPayload, ImageStepProvenance, LaneCommitProvenance, LaneEvent,
         LaneEventBlocker, LaneEventBuilder, LaneEventMetadata, LaneEventName, LaneEventStatus,
         LaneFailureClass, LaneOwnership, SessionIdentity, ShipMergeMethod, ShipProvenance,
         WatcherAction,
@@ -698,6 +956,19 @@ mod tests {
             (LaneEventName::ShipCommitsSelected, "ship.commits_selected"),
             (LaneEventName::ShipMerged, "ship.merged"),
             (LaneEventName::ShipPushedMain, "ship.pushed_main"),
+            (
+                LaneEventName::ImageGenerateStarted,
+                "image.generate.started",
+            ),
+            (LaneEventName::ImageValidatorRan, "image.validator.ran"),
+            (LaneEventName::ImageGateVerdict, "image.gate.verdict"),
+            (LaneEventName::ImageRepairPlanned, "image.repair.planned"),
+            (LaneEventName::ImageSceneAccepted, "image.scene.accepted"),
+            (LaneEventName::ImageSceneRejected, "image.scene.rejected"),
+            (
+                LaneEventName::ImageRegressionSummary,
+                "image.regression.summary",
+            ),
         ];
 
         for (event, expected) in cases {
@@ -1083,5 +1354,155 @@ mod tests {
         assert_eq!(round_trip.seq, 5);
         assert_eq!(round_trip.provenance, EventProvenance::Healthcheck);
         assert_eq!(round_trip.nudge_id, Some("nudge-abc".to_string()));
+    }
+
+    fn sample_image_provenance() -> ImageStepProvenance {
+        ImageStepProvenance::new("iqh_2026_04", "scene_003_fullbody_armor", 101, "diffusers")
+            .with_profile("production")
+            .with_iteration(1)
+            .with_final_image_uri("s3://run/0.png")
+    }
+
+    #[test]
+    fn image_generate_started_event_carries_provenance_payload() {
+        let event = LaneEvent::image_generate_started("now", &sample_image_provenance());
+        assert_eq!(event.event, LaneEventName::ImageGenerateStarted);
+        assert_eq!(event.status, LaneEventStatus::Running);
+        let data = event.data.as_ref().expect("provenance data");
+        assert_eq!(data["scene_id"], "scene_003_fullbody_armor");
+        assert_eq!(data["seed"], 101);
+        assert_eq!(data["provider"], "diffusers");
+        assert_eq!(data["profile"], "production");
+        assert_eq!(data["iteration"], 1);
+    }
+
+    #[test]
+    fn image_validator_ran_event_includes_weighted_total_alongside_provenance() {
+        let event = LaneEvent::image_validator_ran("now", &sample_image_provenance(), 0.913);
+        let data = event.data.expect("data");
+        assert_eq!(data["scene_id"], "scene_003_fullbody_armor");
+        assert!((data["weighted_total"].as_f64().unwrap() - 0.913).abs() < 1e-9);
+    }
+
+    #[test]
+    fn image_gate_verdict_event_status_reflects_pass_or_fail() {
+        let verdict = ImageGateVerdict {
+            passed: true,
+            anatomy_score: 0.95,
+            symmetry_score: 0.92,
+            pattern_score: 0.91,
+            artifact_score: 0.88,
+            creative_score: 0.80,
+            weighted_total: 0.91,
+        };
+        let pass = LaneEvent::image_gate_verdict("now", &sample_image_provenance(), &verdict);
+        assert_eq!(pass.status, LaneEventStatus::Green);
+        let payload = pass.data.expect("data");
+        assert_eq!(payload["verdict"]["passed"], true);
+
+        let mut failed = verdict;
+        failed.passed = false;
+        let fail = LaneEvent::image_gate_verdict("now", &sample_image_provenance(), &failed);
+        assert_eq!(fail.status, LaneEventStatus::Red);
+    }
+
+    #[test]
+    fn image_repair_planned_event_records_repair_kinds_array() {
+        let event = LaneEvent::image_repair_planned(
+            "now",
+            &sample_image_provenance(),
+            &["anatomy", "symmetry"],
+        );
+        let data = event.data.expect("data");
+        assert_eq!(data["repair_kinds"][0], "anatomy");
+        assert_eq!(data["repair_kinds"][1], "symmetry");
+    }
+
+    #[test]
+    fn image_scene_accepted_and_rejected_events_round_trip() {
+        let accepted = LaneEvent::image_scene_accepted("now", &sample_image_provenance());
+        assert_eq!(accepted.event, LaneEventName::ImageSceneAccepted);
+        assert_eq!(accepted.status, LaneEventStatus::Completed);
+        assert!(is_terminal_event(accepted.event));
+
+        let rejected = LaneEvent::image_scene_rejected(
+            "now",
+            &sample_image_provenance(),
+            LaneFailureClass::ImageRegressionGate,
+            "anatomy_score below floor",
+        );
+        assert_eq!(rejected.event, LaneEventName::ImageSceneRejected);
+        assert_eq!(rejected.status, LaneEventStatus::Failed);
+        assert_eq!(
+            rejected.failure_class,
+            Some(LaneFailureClass::ImageRegressionGate)
+        );
+        assert_eq!(
+            rejected.detail.as_deref(),
+            Some("anatomy_score below floor")
+        );
+    }
+
+    #[test]
+    fn image_regression_summary_event_marks_release_gate_outcome() {
+        let summary = ImageRegressionSummaryPayload {
+            run_id: "iqh".to_string(),
+            profile: "production".to_string(),
+            scenes_total: 5,
+            seeds_total: 20,
+            accepted: 18,
+            rejected: 2,
+            errored: 0,
+            pass_rate: 0.9,
+            catastrophic_failure_rate: 0.0,
+            release_gate_passed: true,
+        };
+        let event = LaneEvent::image_regression_summary("now", &summary);
+        assert_eq!(event.event, LaneEventName::ImageRegressionSummary);
+        assert_eq!(event.status, LaneEventStatus::Green);
+        let payload = event.data.expect("payload");
+        assert_eq!(payload["accepted"], 18);
+        assert_eq!(payload["release_gate_passed"], true);
+    }
+
+    #[test]
+    fn image_failure_classes_serialize_to_canonical_wire_values() {
+        let cases = [
+            (LaneFailureClass::ImageBackend, "image_backend"),
+            (LaneFailureClass::ImageValidator, "image_validator"),
+            (
+                LaneFailureClass::ImageRegressionGate,
+                "image_regression_gate",
+            ),
+        ];
+        for (class, expected) in cases {
+            assert_eq!(serde_json::to_value(class).expect("serialize"), expected);
+        }
+    }
+
+    #[test]
+    fn image_terminal_events_dedupe_when_repeated_in_window() {
+        let provenance = sample_image_provenance();
+        let one = LaneEventBuilder::new(
+            LaneEventName::ImageSceneAccepted,
+            LaneEventStatus::Completed,
+            "t1",
+            1,
+            EventProvenance::LiveLane,
+        )
+        .with_data(serde_json::to_value(&provenance).unwrap())
+        .build_terminal();
+        let dup = LaneEventBuilder::new(
+            LaneEventName::ImageSceneAccepted,
+            LaneEventStatus::Completed,
+            "t1",
+            2,
+            EventProvenance::LiveLane,
+        )
+        .with_data(serde_json::to_value(&provenance).unwrap())
+        .build_terminal();
+
+        let deduped = dedupe_terminal_events(&[one, dup]);
+        assert_eq!(deduped.len(), 1);
     }
 }
