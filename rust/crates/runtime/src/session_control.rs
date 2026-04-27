@@ -161,7 +161,7 @@ impl SessionStore {
         if let Some(latest) = self.list_sessions()?.into_iter().next() {
             return Ok(latest);
         }
-        if let Some(latest) = Self::scan_global_sessions()?.into_iter().next() {
+        if let Some(latest) = self.scan_global_sessions()?.into_iter().next() {
             return Ok(latest);
         }
         Err(SessionControlError::Format(format_no_managed_sessions(
@@ -248,28 +248,43 @@ impl SessionStore {
             .map(Path::to_path_buf)
     }
 
-    /// Scan all workspace namespaces under the global sessions root
-    /// (`~/.claw/sessions/`) to find sessions from any workspace.
-    /// Used as a fallback when the current workspace has no sessions.
-    fn scan_global_sessions() -> Result<Vec<ManagedSessionSummary>, SessionControlError> {
-        let global_root = global_sessions_root();
-        let entries = match fs::read_dir(&global_root) {
-            Ok(entries) => entries,
-            Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
-            Err(err) => return Err(err.into()),
-        };
+    /// Scan all known session storage locations for sessions from any workspace.
+    /// Checks both the global root (~/.claw/sessions/) and the project-local
+    /// .claw/sessions/ parent directory. Used as a fallback when the current
+    /// workspace has no sessions.
+    #[allow(clippy::unnecessary_wraps)]
+    fn scan_global_sessions(&self) -> Result<Vec<ManagedSessionSummary>, SessionControlError> {
         let mut sessions = Vec::new();
-        for entry in entries {
-            let Ok(entry) = entry else {
-                continue;
-            };
-            let path = entry.path();
-            if !path.is_dir() {
-                continue;
+
+        // Scan global root: ~/.claw/sessions/<fingerprint>/
+        let global_root = global_sessions_root();
+        if let Ok(entries) = fs::read_dir(&global_root) {
+            for entry in entries.flatten() {
+                let path = entry.path();
+                if path.is_dir() {
+                    let _ = Self::collect_sessions_from_dir_unvalidated(&path, &mut sessions);
+                }
             }
-            // Silently ignore errors reading individual workspace dirs
-            let _ = Self::collect_sessions_from_dir_unvalidated(&path, &mut sessions);
         }
+
+        // Scan project-local parent: <cwd>/.claw/sessions/<fingerprint>/
+        // Sessions are stored here by from_cwd(), so we must check all
+        // fingerprint subdirs, not just the current workspace's.
+        if let Some(local_parent) = self.legacy_sessions_root() {
+            if let Ok(entries) = fs::read_dir(&local_parent) {
+                for entry in entries.flatten() {
+                    let path = entry.path();
+                    if path.is_dir() && path != self.sessions_root {
+                        let _ = Self::collect_sessions_from_dir_unvalidated(&path, &mut sessions);
+                    } else if path == self.sessions_root {
+                        // Already searched in list_sessions(), but include here
+                        // in case this is called standalone
+                        let _ = Self::collect_sessions_from_dir_unvalidated(&path, &mut sessions);
+                    }
+                }
+            }
+        }
+
         sort_managed_sessions(&mut sessions);
         Ok(sessions)
     }
