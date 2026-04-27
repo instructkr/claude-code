@@ -2,9 +2,13 @@
 //! LSP (Language Server Protocol) client registry for tool dispatch.
 
 use std::collections::HashMap;
+use std::path::Path;
 use std::sync::{Arc, Mutex};
 
 use serde::{Deserialize, Serialize};
+
+use crate::lsp_discovery::{discover_available_servers, LspServerDescriptor};
+use crate::lsp_process::LspProcess;
 
 /// Supported LSP actions.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -106,6 +110,44 @@ pub struct LspServerState {
     pub diagnostics: Vec<LspDiagnostic>,
 }
 
+/// Entry in the LSP registry combining process handle, descriptor, and state.
+struct LspServerEntry {
+    /// The running LSP process, if started. Wrapped in Arc<Mutex<>> for thread-safe async access.
+    process: Option<Arc<Mutex<LspProcess>>>,
+    /// The server descriptor for lazy-start on first use.
+    descriptor: Option<LspServerDescriptor>,
+    /// The server state metadata (status, capabilities, diagnostics).
+    state: LspServerState,
+}
+
+impl std::fmt::Debug for LspServerEntry {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("LspServerEntry")
+            .field("process", &self.process.is_some())
+            .field("descriptor", &self.descriptor)
+            .field("state", &self.state)
+            .finish()
+    }
+}
+
+impl LspServerEntry {
+    fn new(state: LspServerState) -> Self {
+        Self {
+            process: None,
+            descriptor: None,
+            state,
+        }
+    }
+
+    fn with_descriptor(state: LspServerState, descriptor: LspServerDescriptor) -> Self {
+        Self {
+            process: None,
+            descriptor: Some(descriptor),
+            state,
+        }
+    }
+}
+
 #[derive(Debug, Clone, Default)]
 pub struct LspRegistry {
     inner: Arc<Mutex<RegistryInner>>,
@@ -113,7 +155,7 @@ pub struct LspRegistry {
 
 #[derive(Debug, Default)]
 struct RegistryInner {
-    servers: HashMap<String, LspServerState>,
+    servers: HashMap<String, LspServerEntry>,
 }
 
 impl LspRegistry {
@@ -122,6 +164,8 @@ impl LspRegistry {
         Self::default()
     }
 
+    /// Register an LSP server with metadata but without starting the process.
+    /// The server can be started later via `start_server()` or lazily on first `dispatch()`.
     pub fn register(
         &self,
         language: &str,
@@ -129,22 +173,46 @@ impl LspRegistry {
         root_path: Option<&str>,
         capabilities: Vec<String>,
     ) {
+        let state = LspServerState {
+            language: language.to_owned(),
+            status,
+            root_path: root_path.map(str::to_owned),
+            capabilities,
+            diagnostics: Vec::new(),
+        };
+        let mut inner = self.inner.lock().expect("lsp registry lock poisoned");
+        inner
+            .servers
+            .insert(language.to_owned(), LspServerEntry::new(state));
+    }
+
+    /// Register an LSP server with a descriptor for lazy-start.
+    /// The descriptor provides the command and args to start the server when needed.
+    pub fn register_with_descriptor(
+        &self,
+        language: &str,
+        status: LspServerStatus,
+        root_path: Option<&str>,
+        capabilities: Vec<String>,
+        descriptor: LspServerDescriptor,
+    ) {
+        let state = LspServerState {
+            language: language.to_owned(),
+            status,
+            root_path: root_path.map(str::to_owned),
+            capabilities,
+            diagnostics: Vec::new(),
+        };
         let mut inner = self.inner.lock().expect("lsp registry lock poisoned");
         inner.servers.insert(
             language.to_owned(),
-            LspServerState {
-                language: language.to_owned(),
-                status,
-                root_path: root_path.map(str::to_owned),
-                capabilities,
-                diagnostics: Vec::new(),
-            },
+            LspServerEntry::with_descriptor(state, descriptor),
         );
     }
 
     pub fn get(&self, language: &str) -> Option<LspServerState> {
         let inner = self.inner.lock().expect("lsp registry lock poisoned");
-        inner.servers.get(language).cloned()
+        inner.servers.get(language).map(|entry| entry.state.clone())
     }
 
     /// Find the appropriate server for a file path based on extension.
@@ -171,10 +239,37 @@ impl LspRegistry {
         self.get(language)
     }
 
+    /// Get the language name for a file path based on extension.
+    fn language_for_path(path: &str) -> Option<String> {
+        let ext = std::path::Path::new(path)
+            .extension()
+            .and_then(|e| e.to_str())?;
+
+        let language = match ext {
+            "rs" => "rust",
+            "ts" | "tsx" => "typescript",
+            "js" | "jsx" => "javascript",
+            "py" => "python",
+            "go" => "go",
+            "java" => "java",
+            "c" | "h" => "c",
+            "cpp" | "hpp" | "cc" => "cpp",
+            "rb" => "ruby",
+            "lua" => "lua",
+            _ => return None,
+        };
+
+        Some(language.to_owned())
+    }
+
     /// List all registered servers.
     pub fn list_servers(&self) -> Vec<LspServerState> {
         let inner = self.inner.lock().expect("lsp registry lock poisoned");
-        inner.servers.values().cloned().collect()
+        inner
+            .servers
+            .values()
+            .map(|entry| entry.state.clone())
+            .collect()
     }
 
     /// Add diagnostics to a server.
@@ -184,11 +279,11 @@ impl LspRegistry {
         diagnostics: Vec<LspDiagnostic>,
     ) -> Result<(), String> {
         let mut inner = self.inner.lock().expect("lsp registry lock poisoned");
-        let server = inner
+        let entry = inner
             .servers
             .get_mut(language)
             .ok_or_else(|| format!("LSP server not found for language: {language}"))?;
-        server.diagnostics.extend(diagnostics);
+        entry.state.diagnostics.extend(diagnostics);
         Ok(())
     }
 
@@ -198,7 +293,7 @@ impl LspRegistry {
         inner
             .servers
             .values()
-            .flat_map(|s| &s.diagnostics)
+            .flat_map(|entry| &entry.state.diagnostics)
             .filter(|d| d.path == path)
             .cloned()
             .collect()
@@ -207,18 +302,18 @@ impl LspRegistry {
     /// Clear diagnostics for a language server.
     pub fn clear_diagnostics(&self, language: &str) -> Result<(), String> {
         let mut inner = self.inner.lock().expect("lsp registry lock poisoned");
-        let server = inner
+        let entry = inner
             .servers
             .get_mut(language)
             .ok_or_else(|| format!("LSP server not found for language: {language}"))?;
-        server.diagnostics.clear();
+        entry.state.diagnostics.clear();
         Ok(())
     }
 
     /// Disconnect a server.
     pub fn disconnect(&self, language: &str) -> Option<LspServerState> {
         let mut inner = self.inner.lock().expect("lsp registry lock poisoned");
-        inner.servers.remove(language)
+        inner.servers.remove(language).map(|entry| entry.state)
     }
 
     #[must_use]
@@ -232,7 +327,105 @@ impl LspRegistry {
         self.len() == 0
     }
 
+    /// Start an LSP server process for the given language.
+    /// If the process is already running, this is a no-op.
+    /// If a descriptor is available, it is used to start the process.
+    /// If no descriptor is available, the discovery system is consulted.
+    pub fn start_server(&self, language: &str) -> Result<(), String> {
+        // Check if already running
+        {
+            let inner = self.inner.lock().expect("lsp registry lock poisoned");
+            if let Some(entry) = inner.servers.get(language) {
+                if entry.process.is_some() {
+                    return Ok(());
+                }
+            }
+        }
+
+        // Try to get the descriptor
+        let descriptor = {
+            let inner = self.inner.lock().expect("lsp registry lock poisoned");
+            if let Some(entry) = inner.servers.get(language) {
+                entry.descriptor.clone()
+            } else {
+                None
+            }
+        };
+
+        // If no descriptor, try discovery
+        let descriptor = if let Some(d) = descriptor {
+            d
+        } else {
+            let available = discover_available_servers();
+            available
+                .into_iter()
+                .find(|d| d.language == language)
+                .ok_or_else(|| format!("no LSP server descriptor found for language: {language}"))?
+        };
+
+        let root_path = {
+            let inner = self.inner.lock().expect("lsp registry lock poisoned");
+            inner
+                .servers
+                .get(language)
+                .and_then(|entry| entry.state.root_path.clone())
+                .unwrap_or_else(|| {
+                    std::env::current_dir()
+                        .map_or_else(|_| ".".to_owned(), |p| p.to_string_lossy().into_owned())
+                })
+        };
+
+        let process = {
+            let rt = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .map_err(|e| format!("failed to create tokio runtime: {e}"))?;
+            rt.block_on(LspProcess::start(
+                &descriptor.command,
+                &descriptor.args,
+                Path::new(&root_path),
+            ))
+            .map_err(|e| format!("failed to start LSP server for '{language}': {e}"))?
+        };
+
+        let mut inner = self.inner.lock().expect("lsp registry lock poisoned");
+        if let Some(entry) = inner.servers.get_mut(language) {
+            entry.process = Some(Arc::new(Mutex::new(process)));
+            entry.state.status = LspServerStatus::Connected;
+        }
+
+        Ok(())
+    }
+
+    /// Stop a running LSP server process.
+    pub fn stop_server(&self, language: &str) -> Result<(), String> {
+        let process_arc = {
+            let mut inner = self.inner.lock().expect("lsp registry lock poisoned");
+            let entry = inner
+                .servers
+                .get_mut(language)
+                .ok_or_else(|| format!("LSP server not found for language: {language}"))?;
+            entry.state.status = LspServerStatus::Disconnected;
+            entry.process.take()
+        };
+
+        if let Some(process_arc) = process_arc {
+            let mut process = process_arc
+                .lock()
+                .map_err(|_| "lsp process lock poisoned")?;
+            let rt = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .map_err(|e| format!("failed to create tokio runtime: {e}"))?;
+            rt.block_on(process.shutdown())
+                .map_err(|e| format!("LSP shutdown error: {e}"))?;
+        }
+
+        Ok(())
+    }
+
     /// Dispatch an LSP action and return a structured result.
+    #[allow(clippy::too_many_lines)]
     pub fn dispatch(
         &self,
         action: &str,
@@ -244,7 +437,7 @@ impl LspRegistry {
         let lsp_action =
             LspAction::from_str(action).ok_or_else(|| format!("unknown LSP action: {action}"))?;
 
-        // For diagnostics, we can check existing cached diagnostics
+        // For diagnostics, we check existing cached diagnostics
         if lsp_action == LspAction::Diagnostics {
             if let Some(path) = path {
                 let diags = self.get_diagnostics(path);
@@ -260,7 +453,7 @@ impl LspRegistry {
             let all_diags: Vec<_> = inner
                 .servers
                 .values()
-                .flat_map(|s| &s.diagnostics)
+                .flat_map(|entry| &entry.state.diagnostics)
                 .collect();
             return Ok(serde_json::json!({
                 "action": "diagnostics",
@@ -271,28 +464,197 @@ impl LspRegistry {
 
         // For other actions, we need a connected server for the given file
         let path = path.ok_or("path is required for this LSP action")?;
-        let server = self
-            .find_server_for_path(path)
+        let language = Self::language_for_path(path)
             .ok_or_else(|| format!("no LSP server available for path: {path}"))?;
 
-        if server.status != LspServerStatus::Connected {
-            return Err(format!(
-                "LSP server for '{}' is not connected (status: {})",
-                server.language, server.status
-            ));
+        // Check the entry exists
+        {
+            let inner = self.inner.lock().expect("lsp registry lock poisoned");
+            if !inner.servers.contains_key(&language) {
+                return Err(format!("no LSP server available for path: {path}"));
+            }
         }
 
-        // Return structured placeholder — actual LSP JSON-RPC calls would
-        // go through the real LSP process here.
-        Ok(serde_json::json!({
-            "action": action,
-            "path": path,
-            "line": line,
-            "character": character,
-            "language": server.language,
-            "status": "dispatched",
-            "message": format!("LSP {} dispatched to {} server", action, server.language)
-        }))
+        // Lazy-start: if no process yet, try to start one
+        let needs_start = {
+            let inner = self.inner.lock().expect("lsp registry lock poisoned");
+            inner
+                .servers
+                .get(&language)
+                .is_none_or(|entry| entry.process.is_none())
+        };
+
+        if needs_start {
+            if let Err(e) = self.start_server(&language) {
+                // Check the status after failed start — if still not Connected,
+                // return a proper error. This preserves the existing behavior
+                // for Disconnected/Error status servers.
+                let inner = self.inner.lock().expect("lsp registry lock poisoned");
+                if let Some(entry) = inner.servers.get(&language) {
+                    if entry.state.status != LspServerStatus::Connected {
+                        return Err(format!(
+                            "LSP server for '{}' is not connected (status: {}): {}",
+                            language, entry.state.status, e
+                        ));
+                    }
+                }
+                // If somehow still marked Connected but start failed, return error JSON
+                return Ok(serde_json::json!({
+                    "action": action,
+                    "path": path,
+                    "line": line,
+                    "character": character,
+                    "language": language,
+                    "status": "error",
+                    "error": e
+                }));
+            }
+        }
+
+        // Check the server status
+        {
+            let inner = self.inner.lock().expect("lsp registry lock poisoned");
+            if let Some(entry) = inner.servers.get(&language) {
+                if entry.state.status != LspServerStatus::Connected {
+                    return Err(format!(
+                        "LSP server for '{}' is not connected (status: {})",
+                        language, entry.state.status
+                    ));
+                }
+            }
+        }
+
+        // Get the process handle (clone the Arc)
+        let process_arc = {
+            let inner = self.inner.lock().expect("lsp registry lock poisoned");
+            inner
+                .servers
+                .get(&language)
+                .and_then(|entry| entry.process.clone())
+                .ok_or_else(|| format!("no LSP process available for language: {language}"))?
+        };
+
+        // Dispatch to the real LSP process
+        let result = {
+            let mut process = process_arc
+                .lock()
+                .map_err(|_| "lsp process lock poisoned".to_owned())?;
+
+            // Create a minimal tokio runtime for async LSP calls
+            let rt = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .map_err(|e| format!("failed to create tokio runtime: {e}"))?;
+
+            rt.block_on(async {
+                let line = line.unwrap_or(0);
+                let character = character.unwrap_or(0);
+
+                match lsp_action {
+                    LspAction::Hover => {
+                        let hover = process.hover(path, line, character).await;
+                        hover.map(|opt| {
+                            opt.map_or_else(
+                                || {
+                                    serde_json::json!({
+                                        "action": "hover",
+                                        "path": path,
+                                        "line": line,
+                                        "character": character,
+                                        "language": language,
+                                        "status": "no_result",
+                                    })
+                                },
+                                |h| {
+                                    serde_json::json!({
+                                        "action": "hover",
+                                        "path": path,
+                                        "line": line,
+                                        "character": character,
+                                        "language": language,
+                                        "status": "ok",
+                                        "result": h,
+                                    })
+                                },
+                            )
+                        })
+                    }
+                    LspAction::Definition => {
+                        let locations = process.goto_definition(path, line, character).await;
+                        locations.map(|locs| {
+                            serde_json::json!({
+                                "action": "definition",
+                                "path": path,
+                                "line": line,
+                                "character": character,
+                                "language": language,
+                                "status": "ok",
+                                "locations": locs,
+                            })
+                        })
+                    }
+                    LspAction::References => {
+                        let locations = process.references(path, line, character).await;
+                        locations.map(|locs| {
+                            serde_json::json!({
+                                "action": "references",
+                                "path": path,
+                                "line": line,
+                                "character": character,
+                                "language": language,
+                                "status": "ok",
+                                "locations": locs,
+                            })
+                        })
+                    }
+                    LspAction::Completion => {
+                        let items = process.completion(path, line, character).await;
+                        items.map(|completions| {
+                            serde_json::json!({
+                                "action": "completion",
+                                "path": path,
+                                "line": line,
+                                "character": character,
+                                "language": language,
+                                "status": "ok",
+                                "items": completions,
+                            })
+                        })
+                    }
+                    LspAction::Symbols => {
+                        let symbols = process.document_symbols(path).await;
+                        symbols.map(|syms| {
+                            serde_json::json!({
+                                "action": "symbols",
+                                "path": path,
+                                "line": line,
+                                "character": character,
+                                "language": language,
+                                "status": "ok",
+                                "symbols": syms,
+                            })
+                        })
+                    }
+                    LspAction::Format => {
+                        let edits = process.format(path).await;
+                        edits.map(|text_edits| {
+                            serde_json::json!({
+                                "action": "format",
+                                "path": path,
+                                "line": line,
+                                "character": character,
+                                "language": language,
+                                "status": "ok",
+                                "edits": text_edits,
+                            })
+                        })
+                    }
+                    LspAction::Diagnostics => unreachable!(),
+                }
+            })
+        };
+
+        result.map_err(|e| format!("LSP {action} failed for '{language}': {e}"))
     }
 }
 
@@ -743,5 +1105,137 @@ mod tests {
         // then
         let error = result.expect_err("missing language should fail");
         assert!(error.contains("LSP server not found for language: missing"));
+    }
+
+    #[test]
+    fn register_with_descriptor_stores_entry() {
+        let registry = LspRegistry::new();
+        let descriptor = LspServerDescriptor {
+            language: "rust".into(),
+            command: "rust-analyzer".into(),
+            args: vec![],
+            extensions: vec!["rs".into()],
+        };
+        registry.register_with_descriptor(
+            "rust",
+            LspServerStatus::Connected,
+            Some("/project"),
+            vec!["hover".into()],
+            descriptor,
+        );
+
+        let server = registry
+            .get("rust")
+            .expect("should exist after register_with_descriptor");
+        assert_eq!(server.language, "rust");
+        assert_eq!(server.status, LspServerStatus::Connected);
+        assert_eq!(server.root_path.as_deref(), Some("/project"));
+        assert_eq!(server.capabilities, vec!["hover"]);
+    }
+
+    #[test]
+    fn stop_server_on_nonexistent_errors() {
+        let registry = LspRegistry::new();
+        let result = registry.stop_server("missing");
+        assert!(
+            result.is_err(),
+            "stopping a nonexistent server should error"
+        );
+        let error = result.unwrap_err();
+        assert!(
+            error.contains("missing"),
+            "error message should reference 'missing', got: {error}"
+        );
+    }
+
+    /// This test requires rust-analyzer to be installed on the system.
+    /// Run with: cargo test -p runtime -- --ignored
+    #[test]
+    #[ignore = "requires rust-analyzer installed on PATH"]
+    fn start_server_without_descriptor_falls_back_to_discovery() {
+        let registry = LspRegistry::new();
+        registry.register("rust", LspServerStatus::Starting, None, vec![]);
+        let result = registry.start_server("rust");
+        assert!(
+            result.is_ok(),
+            "start_server should discover and start rust-analyzer: {result:?}"
+        );
+        let server = registry.get("rust").expect("rust should be registered");
+        assert_eq!(server.status, LspServerStatus::Connected);
+        let _ = registry.stop_server("rust");
+    }
+
+    /// This test requires rust-analyzer to be installed on the system.
+    /// Run with: cargo test -p runtime -- --ignored
+    #[test]
+    #[ignore = "requires rust-analyzer installed on PATH"]
+    fn dispatch_hover_lazy_starts_server() {
+        let registry = LspRegistry::new();
+        let descriptor = crate::lsp_discovery::LspServerDescriptor {
+            language: "rust".into(),
+            command: "rust-analyzer".into(),
+            args: vec![],
+            extensions: vec!["rs".into()],
+        };
+        registry.register_with_descriptor(
+            "rust",
+            LspServerStatus::Starting,
+            None,
+            vec![],
+            descriptor,
+        );
+        // dispatch should trigger start_server because process is None
+        let result = registry.dispatch("hover", Some("src/main.rs"), Some(0), Some(0), None);
+        // Result may be Ok or Err depending on whether rust-analyzer can actually
+        // respond for this path, but it should not fail with "not connected"
+        // (which would indicate the lazy-start didn't kick in).
+        if let Err(e) = &result {
+            assert!(
+                !e.contains("not connected"),
+                "dispatch should have lazily started the server, got: {e}"
+            );
+        }
+        let _ = registry.stop_server("rust");
+    }
+
+    /// This test requires rust-analyzer to be installed on the system.
+    /// Run with: cargo test -p runtime -- --ignored
+    #[test]
+    #[ignore = "requires rust-analyzer installed on PATH"]
+    fn start_and_stop_server() {
+        let registry = LspRegistry::new();
+        let descriptor = crate::lsp_discovery::LspServerDescriptor {
+            language: "rust".into(),
+            command: "rust-analyzer".into(),
+            args: vec![],
+            extensions: vec!["rs".into()],
+        };
+        registry.register_with_descriptor(
+            "rust",
+            LspServerStatus::Starting,
+            None,
+            vec![],
+            descriptor,
+        );
+
+        let start_result = registry.start_server("rust");
+        assert!(
+            start_result.is_ok(),
+            "start_server should succeed: {start_result:?}"
+        );
+
+        let server = registry.get("rust").expect("rust should exist");
+        assert_eq!(server.status, LspServerStatus::Connected);
+
+        let stop_result = registry.stop_server("rust");
+        assert!(
+            stop_result.is_ok(),
+            "stop_server should succeed: {stop_result:?}"
+        );
+
+        let server = registry
+            .get("rust")
+            .expect("rust should still be in registry");
+        assert_eq!(server.status, LspServerStatus::Disconnected);
     }
 }

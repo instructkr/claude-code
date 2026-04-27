@@ -1041,6 +1041,13 @@ const SLASH_COMMAND_SPECS: &[SlashCommandSpec] = &[
         argument_hint: None,
         resume_supported: true,
     },
+    SlashCommandSpec {
+        name: "lsp",
+        aliases: &[],
+        summary: "Show or manage LSP server status",
+        argument_hint: Some("[start|stop|restart <language>]"),
+        resume_supported: true,
+    },
 ];
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1189,6 +1196,10 @@ pub enum SlashCommand {
     History {
         count: Option<String>,
     },
+    Lsp {
+        action: Option<String>,
+        target: Option<String>,
+    },
     Unknown(String),
 }
 
@@ -1288,6 +1299,7 @@ impl SlashCommand {
             Self::Tag { .. } => "/tag",
             Self::OutputStyle { .. } => "/output-style",
             Self::AddDir { .. } => "/add-dir",
+            Self::Lsp { .. } => "/lsp",
             Self::Sandbox => "/sandbox",
             Self::Mcp { .. } => "/mcp",
             Self::Export { .. } => "/export",
@@ -1504,6 +1516,10 @@ pub fn validate_slash_command_input(
         "tag" => SlashCommand::Tag { label: remainder },
         "output-style" => SlashCommand::OutputStyle { style: remainder },
         "add-dir" => SlashCommand::AddDir { path: remainder },
+        "lsp" => SlashCommand::Lsp {
+            action: args.first().map(|s| (*s).to_string()),
+            target: args.get(1).map(|s| (*s).to_string()),
+        },
         "history" => SlashCommand::History {
             count: optional_single_arg(command, &args, "[count]")?,
         },
@@ -4186,7 +4202,10 @@ pub fn handle_slash_command(
         | SlashCommand::OutputStyle { .. }
         | SlashCommand::AddDir { .. }
         | SlashCommand::History { .. }
+        | SlashCommand::Lsp { .. }
+        | SlashCommand::Setup
         | SlashCommand::Unknown(_) => None,
+        SlashCommand::Unknown(_) => None,
     }
 }
 
@@ -4725,7 +4744,7 @@ mod tests {
         assert!(help.contains("/skills [list|install <path>|help|<skill> [args]]"));
         assert!(help.contains("aliases: /skill"));
         assert!(!help.contains("/logout"));
-        assert_eq!(slash_command_specs().len(), 140);
+        assert_eq!(slash_command_specs().len(), 141);
         assert!(resume_supported_slash_commands().len() >= 39);
     }
 

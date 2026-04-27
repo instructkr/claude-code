@@ -32,7 +32,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 
 /// Global task registry shared across tool invocations within a session.
-fn global_lsp_registry() -> &'static LspRegistry {
+pub fn global_lsp_registry() -> &'static LspRegistry {
     use std::sync::OnceLock;
     static REGISTRY: OnceLock<LspRegistry> = OnceLock::new();
     REGISTRY.get_or_init(LspRegistry::new)
