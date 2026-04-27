@@ -322,24 +322,6 @@ const OAUTH_FIELDS: &[FieldSpec] = &[
     },
 ];
 
-const PROVIDER_FIELDS: &[FieldSpec] = &[
-    FieldSpec {
-        name: "kind",
-        expected: FieldType::String,
-    },
-    FieldSpec {
-        name: "apiKey",
-        expected: FieldType::String,
-    },
-    FieldSpec {
-        name: "baseUrl",
-        expected: FieldType::String,
-    },
-    FieldSpec {
-        name: "model",
-        expected: FieldType::String,
-    },
-];
 
 const LSP_FIELDS: &[FieldSpec] = &[
     FieldSpec {

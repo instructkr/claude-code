@@ -3463,10 +3463,8 @@ fn run_resume_command(
         | SlashCommand::Ide { .. }
         | SlashCommand::Tag { .. }
         | SlashCommand::OutputStyle { .. }
-        | SlashCommand::AddDir { .. } => Err("unsupported resumed slash command".into()),
         | SlashCommand::AddDir { .. }
-        | SlashCommand::Lsp { .. }
-        | SlashCommand::Setup => Err("unsupported resumed slash command".into()),
+        | SlashCommand::Lsp { .. } => Err("unsupported resumed slash command".into()),
     }
 }
 

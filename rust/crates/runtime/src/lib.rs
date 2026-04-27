@@ -60,7 +60,7 @@ pub use compact::{
     get_compact_continuation_message, should_compact, CompactionConfig, CompactionResult,
 };
 pub use config::{
-    clear_user_provider_settings, save_user_provider_settings, ConfigEntry, ConfigError,
+    ConfigEntry, ConfigError,
     ConfigLoader, ConfigSource, LspServerConfig, McpConfigCollection, McpManagedProxyServerConfig,
     McpOAuthConfig, McpRemoteServerConfig, McpSdkServerConfig, McpServerConfig,
     McpStdioServerConfig, McpTransport, McpWebSocketServerConfig, OAuthConfig,
