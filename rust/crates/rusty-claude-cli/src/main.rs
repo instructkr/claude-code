@@ -8305,8 +8305,41 @@ const DISPLAY_TRUNCATION_NOTICE: &str =
     "\x1b[2m… output truncated for display; full result preserved in session.\x1b[0m";
 const READ_DISPLAY_MAX_LINES: usize = 80;
 const READ_DISPLAY_MAX_CHARS: usize = 6_000;
-const TOOL_OUTPUT_DISPLAY_MAX_LINES: usize = 60;
-const TOOL_OUTPUT_DISPLAY_MAX_CHARS: usize = 4_000;
+const TOOL_OUTPUT_DISPLAY_MAX_LINES_DEFAULT: usize = 20;
+const TOOL_OUTPUT_DISPLAY_MAX_CHARS_DEFAULT: usize = 1_500;
+
+fn tool_output_display_max_lines() -> usize {
+    static VALUE: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *VALUE.get_or_init(|| {
+        read_usize_setting("toolOutputMaxLines", TOOL_OUTPUT_DISPLAY_MAX_LINES_DEFAULT)
+    })
+}
+
+fn tool_output_display_max_chars() -> usize {
+    static VALUE: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *VALUE.get_or_init(|| {
+        read_usize_setting("toolOutputMaxChars", TOOL_OUTPUT_DISPLAY_MAX_CHARS_DEFAULT)
+    })
+}
+
+fn read_usize_setting(key: &str, default: usize) -> usize {
+    let Ok(cwd) = env::current_dir() else {
+        return default;
+    };
+    let Ok(config) = ConfigLoader::default_for(&cwd).load() else {
+        return default;
+    };
+    let Some(value) = config.get(key) else {
+        return default;
+    };
+    if let Some(n) = value.as_i64() {
+        return usize::try_from(n).unwrap_or(default);
+    }
+    if let Some(s) = value.as_str() {
+        return s.parse::<usize>().unwrap_or(default);
+    }
+    default
+}
 
 fn extract_tool_path(parsed: &serde_json::Value) -> String {
     parsed
@@ -8383,8 +8416,8 @@ fn format_bash_result(icon: &str, parsed: &serde_json::Value) -> String {
         if !stdout.trim().is_empty() {
             lines.push(truncate_output_for_display(
                 stdout,
-                TOOL_OUTPUT_DISPLAY_MAX_LINES,
-                TOOL_OUTPUT_DISPLAY_MAX_CHARS,
+                tool_output_display_max_lines(),
+                tool_output_display_max_chars(),
             ));
         }
     }
@@ -8394,8 +8427,8 @@ fn format_bash_result(icon: &str, parsed: &serde_json::Value) -> String {
                 "\x1b[38;5;203m{}\x1b[0m",
                 truncate_output_for_display(
                     stderr,
-                    TOOL_OUTPUT_DISPLAY_MAX_LINES,
-                    TOOL_OUTPUT_DISPLAY_MAX_CHARS,
+                    tool_output_display_max_lines(),
+                    tool_output_display_max_chars(),
                 )
             ));
         }
@@ -8556,8 +8589,8 @@ fn format_grep_result(icon: &str, parsed: &serde_json::Value) -> String {
             "{summary}\n{}",
             truncate_output_for_display(
                 content,
-                TOOL_OUTPUT_DISPLAY_MAX_LINES,
-                TOOL_OUTPUT_DISPLAY_MAX_CHARS,
+                tool_output_display_max_lines(),
+                tool_output_display_max_chars(),
             )
         )
     } else if !filenames.is_empty() {
@@ -8578,8 +8611,8 @@ fn format_generic_tool_result(icon: &str, name: &str, parsed: &serde_json::Value
     };
     let preview = truncate_output_for_display(
         &rendered_output,
-        TOOL_OUTPUT_DISPLAY_MAX_LINES,
-        TOOL_OUTPUT_DISPLAY_MAX_CHARS,
+        tool_output_display_max_lines(),
+        tool_output_display_max_chars(),
     );
 
     if preview.is_empty() {
@@ -12596,7 +12629,8 @@ UU conflicted.rs",
         let rendered = format_tool_result("bash", &output, false);
 
         assert!(rendered.contains("stdout 000"));
-        assert!(rendered.contains("stdout 059"));
+        assert!(rendered.contains("stdout 015"));
+        assert!(!rendered.contains("stdout 060"));
         assert!(!rendered.contains("stdout 119"));
         assert!(rendered.contains("full result preserved in session"));
         assert!(output.contains("stdout 119"));
@@ -12617,7 +12651,7 @@ UU conflicted.rs",
 
         assert!(rendered.contains("plugin_echo"));
         assert!(rendered.contains("payload 000"));
-        assert!(rendered.contains("payload 040"));
+        assert!(!rendered.contains("payload 040"));
         assert!(!rendered.contains("payload 080"));
         assert!(!rendered.contains("payload 119"));
         assert!(rendered.contains("full result preserved in session"));
@@ -12635,7 +12669,8 @@ UU conflicted.rs",
 
         assert!(rendered.contains("plugin_echo"));
         assert!(rendered.contains("raw 000"));
-        assert!(rendered.contains("raw 059"));
+        assert!(rendered.contains("raw 015"));
+        assert!(!rendered.contains("raw 060"));
         assert!(!rendered.contains("raw 119"));
         assert!(rendered.contains("full result preserved in session"));
         assert!(output.contains("raw 119"));

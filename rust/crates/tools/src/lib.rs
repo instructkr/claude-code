@@ -5590,6 +5590,7 @@ enum ConfigKind {
     String,
 }
 
+#[allow(clippy::too_many_lines)]
 fn supported_config_setting(setting: &str) -> Option<ConfigSettingSpec> {
     Some(match setting {
         "theme" => ConfigSettingSpec {
@@ -5644,6 +5645,18 @@ fn supported_config_setting(setting: &str) -> Option<ConfigSettingSpec> {
             scope: ConfigScope::Global,
             kind: ConfigKind::Boolean,
             path: &["showTurnDuration"],
+            options: None,
+        },
+        "toolOutputMaxLines" => ConfigSettingSpec {
+            scope: ConfigScope::Global,
+            kind: ConfigKind::String,
+            path: &["toolOutputMaxLines"],
+            options: None,
+        },
+        "toolOutputMaxChars" => ConfigSettingSpec {
+            scope: ConfigScope::Global,
+            kind: ConfigKind::String,
+            path: &["toolOutputMaxChars"],
             options: None,
         },
         "terminalProgressBarEnabled" => ConfigSettingSpec {
