@@ -1,0 +1,53 @@
+From d0d37b62f3d947c95c3704e2f152920e88ab2400 Mon Sep 17 00:00:00 2001
+From: prcdslnc13 <prcdslnc13@gmail.com>
+Date: Mon, 27 Apr 2026 22:11:21 -0500
+Subject: [PATCH] Isolate run_claw test helper from host CLAW_CONFIG_HOME
+
+`resumed_status_command_emits_structured_json_when_requested` asserted
+`workspace.loaded_config_files == 0`, but on hosts where the developer
+has populated `~/.claw/settings.json` (e.g. a model pin set via
+`/model`), the assertion fired with `Some(1)` because the user-level
+config file was getting merged into the resolved RuntimeConfig. The
+failure surfaced cleanly across `cargo test --workspace` and was the
+only failure on otherwise-clean main, but every other test in the file
+inherited the same test-isolation gap.
+
+Fix: in `run_claw_with_env`, default `CLAW_CONFIG_HOME` to a path
+under each test's per-test temp dir (`<temp_dir>/test-config-home/.claw`).
+That isolates the discover() chain in `runtime::config::ConfigLoader`
+from the host's `~/.claw/`. Caller-supplied envs still win, so any
+test that genuinely needs a populated user-level config can override.
+
+The chosen path is intentionally one level deeper than the test cwd
+so the synthetic legacy-user-path
+(`<config_home>.parent()/.claw.json`) doesn't collide with the
+test's own project-level `.claw.json` discovery slot.
+
+Verification (from `rust/`):
+- `cargo test -p rusty-claude-cli --test resume_slash_commands`:
+  all 12 tests now pass (was 11 + 1 fail).
+- `cargo test --workspace`: clean.
+- `cargo clippy --workspace --all-targets -- -D warnings`: clean.
+---
+ rust/crates/rusty-claude-cli/tests/resume_slash_commands.rs | 5 +++++
+ 1 file changed, 5 insertions(+)
+
+diff --git a/rust/crates/rusty-claude-cli/tests/resume_slash_commands.rs b/rust/crates/rusty-claude-cli/tests/resume_slash_commands.rs
+index 4605acd..afcb2a3 100644
+--- a/rust/crates/rusty-claude-cli/tests/resume_slash_commands.rs
++++ b/rust/crates/rusty-claude-cli/tests/resume_slash_commands.rs
+@@ -540,6 +540,11 @@ fn workspace_session(root: &Path) -> Session {
+ fn run_claw_with_env(current_dir: &Path, args: &[&str], envs: &[(&str, &str)]) -> Output {
+     let mut command = Command::new(env!("CARGO_BIN_EXE_claw"));
+     command.current_dir(current_dir).args(args);
++    // Pin CLAW_CONFIG_HOME under the per-test temp dir so the host's
++    // ~/.claw/settings.json doesn't leak in and bump assertions like
++    // `loaded_config_files == 0`. Caller-supplied envs override this default.
++    let isolated_config_home = current_dir.join("test-config-home").join(".claw");
++    command.env("CLAW_CONFIG_HOME", &isolated_config_home);
+     for (key, value) in envs {
+         command.env(key, value);
+     }
+-- 
+2.43.0
+

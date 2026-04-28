@@ -540,6 +540,11 @@ fn workspace_session(root: &Path) -> Session {
 fn run_claw_with_env(current_dir: &Path, args: &[&str], envs: &[(&str, &str)]) -> Output {
     let mut command = Command::new(env!("CARGO_BIN_EXE_claw"));
     command.current_dir(current_dir).args(args);
+    // Pin CLAW_CONFIG_HOME under the per-test temp dir so the host's
+    // ~/.claw/settings.json doesn't leak in and bump assertions like
+    // `loaded_config_files == 0`. Caller-supplied envs override this default.
+    let isolated_config_home = current_dir.join("test-config-home").join(".claw");
+    command.env("CLAW_CONFIG_HOME", &isolated_config_home);
     for (key, value) in envs {
         command.env(key, value);
     }
