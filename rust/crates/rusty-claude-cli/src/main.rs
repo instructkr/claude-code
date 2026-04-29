@@ -13619,3 +13619,72 @@ mod dump_manifests_tests {
         let _ = fs::remove_dir_all(&root);
     }
 }
+
+#[cfg(test)]
+mod doctor_broad_cwd_tests {
+    //! #122b regression tests: doctor's workspace check must surface broad-cwd
+    //! as a warning, matching runtime (Prompt/REPL) refuse-to-run behavior.
+    //! Without these, `claw doctor` in ~/ or / reports "ok" while `claw prompt`
+    //! in the same dir errors out — diagnostic deception.
+
+    use super::{check_workspace_health, render_diagnostic_check, StatusContext};
+    use std::path::PathBuf;
+
+    fn make_ctx(cwd: PathBuf, project_root: Option<PathBuf>) -> StatusContext {
+        use super::{SessionLifecycleKind, SessionLifecycleSummary};
+        use runtime::SandboxStatus;
+        StatusContext {
+            cwd,
+            session_path: None,
+            loaded_config_files: 0,
+            discovered_config_files: 0,
+            memory_file_count: 0,
+            project_root,
+            git_branch: None,
+            git_summary: super::parse_git_workspace_summary(None),
+            sandbox_status: SandboxStatus::default(),
+            config_load_error: None,
+            session_lifecycle: SessionLifecycleSummary {
+                kind: SessionLifecycleKind::SavedOnly,
+                pane_id: None,
+                pane_command: None,
+                pane_path: None,
+                workspace_dirty: false,
+                abandoned: false,
+            },
+        }
+    }
+
+    #[test]
+    fn workspace_check_in_project_dir_reports_ok() {
+        // #122b non-regression: non-broad project dir should stay OK.
+        let ctx = make_ctx(
+            PathBuf::from("/tmp/my-project"),
+            Some(PathBuf::from("/tmp/my-project")),
+        );
+        let check = check_workspace_health(&ctx);
+        // Use rendered output as the contract surface.
+        let rendered = render_diagnostic_check(&check);
+        assert!(
+            rendered.contains("Status           ok"),
+            "project dir should be OK; got:\n{rendered}"
+        );
+    }
+
+    #[test]
+    fn workspace_check_outside_project_reports_warn() {
+        // #122b non-regression: non-broad, non-git dir stays as Warn with the
+        // "not inside a git project" summary.
+        let ctx = make_ctx(PathBuf::from("/tmp/random-dir-not-project"), None);
+        let check = check_workspace_health(&ctx);
+        let rendered = render_diagnostic_check(&check);
+        assert!(
+            rendered.contains("Status           warn"),
+            "non-git dir should warn; got:\n{rendered}"
+        );
+        assert!(
+            rendered.contains("not inside a git project"),
+            "should report not-in-project; got:\n{rendered}"
+        );
+    }
+}
