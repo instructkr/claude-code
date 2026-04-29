@@ -7539,6 +7539,13 @@ struct AnthropicRuntimeClient {
     model: String,
     enable_tools: bool,
     emit_output: bool,
+    /// When `false`, claw skips the streaming SSE attempt and uses the
+    /// non-streaming `send_message` + `response_to_events` path directly.
+    /// Set via the `CLAW_DISABLE_STREAM` env var at construction time.
+    /// Workaround for ccproxy 0.2.9's OpenAI-compat SSE translator which
+    /// silently drops `tool_calls` deltas (see brain memo
+    /// `ccproxy-openai-compat-streaming-tools-bug`).
+    enable_streaming: bool,
     allowed_tools: Option<AllowedToolSet>,
     tool_registry: GlobalToolRegistry,
     progress_reporter: Option<InternalPromptProgressReporter>,
@@ -7604,6 +7611,7 @@ impl AnthropicRuntimeClient {
             model,
             enable_tools,
             emit_output,
+            enable_streaming: streaming_enabled_from_env(),
             allowed_tools,
             tool_registry,
             progress_reporter,
@@ -7618,6 +7626,25 @@ impl AnthropicRuntimeClient {
 
 fn resolve_cli_auth_source() -> Result<AuthSource, Box<dyn std::error::Error>> {
     Ok(resolve_cli_auth_source_for_cwd()?)
+}
+
+/// Returns `false` when `CLAW_DISABLE_STREAM` is set to a truthy value
+/// (any non-empty value other than `0`/`false`/`no`). Default: streaming on.
+///
+/// Workaround knob for upstream proxies whose SSE translator drops
+/// information (e.g. ccproxy 0.2.9 dropping `tool_calls` deltas in
+/// OpenAI-compat streaming mode). When disabled, `consume_stream` skips
+/// the streaming attempt and uses `send_message` + `response_to_events`.
+fn streaming_enabled_from_env() -> bool {
+    match std::env::var("CLAW_DISABLE_STREAM") {
+        Ok(value) => {
+            let normalized = value.trim().to_ascii_lowercase();
+            // Empty string or explicit falsy values keep streaming on so
+            // operators can `unset`-or-`=`-zero to opt back in.
+            normalized.is_empty() || matches!(normalized.as_str(), "0" | "false" | "no" | "off")
+        }
+        Err(_) => true,
+    }
 }
 
 // `api::ApiError` is ~128 bytes; boxing the Err variant would ripple
@@ -7687,6 +7714,35 @@ impl AnthropicRuntimeClient {
         message_request: &MessageRequest,
         apply_stall_timeout: bool,
     ) -> Result<Vec<AssistantEvent>, RuntimeError> {
+        // Streaming-disabled escape hatch (CLAW_DISABLE_STREAM=1). Used to
+        // sidestep upstream-proxy SSE translation bugs — currently ccproxy
+        // 0.2.9's chat_completions adapter drops `tool_calls` deltas, so
+        // tool-using turns silently no-op when streamed. Bypass the SSE
+        // path entirely and use the same send_message + response_to_events
+        // recovery the streaming path already falls back to at its tail.
+        if !self.enable_streaming {
+            let mut stdout = io::stdout();
+            let mut sink = io::sink();
+            let out: &mut dyn Write = if self.emit_output {
+                &mut stdout
+            } else {
+                &mut sink
+            };
+            let response = self
+                .client
+                .send_message(&MessageRequest {
+                    stream: false,
+                    ..message_request.clone()
+                })
+                .await
+                .map_err(|error| {
+                    RuntimeError::new(format_user_visible_api_error(&self.session_id, &error))
+                })?;
+            let mut events = response_to_events(response, out)?;
+            push_prompt_cache_record(&self.client, &mut events);
+            return Ok(events);
+        }
+
         let mut stream = self
             .client
             .stream_message(message_request)
@@ -9458,6 +9514,39 @@ mod tests {
         LOCK.get_or_init(|| Mutex::new(()))
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    #[test]
+    fn streaming_enabled_from_env_default_is_on() {
+        let _guard = env_lock();
+        std::env::remove_var("CLAW_DISABLE_STREAM");
+        assert!(super::streaming_enabled_from_env());
+    }
+
+    #[test]
+    fn streaming_enabled_from_env_truthy_values_disable() {
+        let _guard = env_lock();
+        for value in ["1", "yes", "on", "true", "anything"] {
+            std::env::set_var("CLAW_DISABLE_STREAM", value);
+            assert!(
+                !super::streaming_enabled_from_env(),
+                "expected CLAW_DISABLE_STREAM={value} to disable streaming"
+            );
+        }
+        std::env::remove_var("CLAW_DISABLE_STREAM");
+    }
+
+    #[test]
+    fn streaming_enabled_from_env_falsy_values_keep_streaming() {
+        let _guard = env_lock();
+        for value in ["0", "false", "no", "off", ""] {
+            std::env::set_var("CLAW_DISABLE_STREAM", value);
+            assert!(
+                super::streaming_enabled_from_env(),
+                "expected CLAW_DISABLE_STREAM={value} to keep streaming on"
+            );
+        }
+        std::env::remove_var("CLAW_DISABLE_STREAM");
     }
 
     fn with_current_dir<T>(cwd: &Path, f: impl FnOnce() -> T) -> T {
