@@ -1497,11 +1497,11 @@ pub fn validate_slash_command_input(
         }
         "plan" => SlashCommand::Plan { mode: remainder },
         "review" => SlashCommand::Review { scope: remainder },
+        "team" => SlashCommand::Team { action: remainder },
         "tasks" => SlashCommand::Tasks { args: remainder },
         "theme" => SlashCommand::Theme { name: remainder },
         "voice" => SlashCommand::Voice { mode: remainder },
         "usage" => SlashCommand::Usage { scope: remainder },
-        "team" => SlashCommand::Team { action: remainder },
         "setup" => SlashCommand::Setup,
         "rename" => SlashCommand::Rename { name: remainder },
         "copy" => SlashCommand::Copy { target: remainder },
