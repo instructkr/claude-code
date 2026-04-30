@@ -753,6 +753,7 @@ struct ChatCompletionChunk {
 
 #[derive(Debug, Deserialize)]
 struct ChunkChoice {
+    #[serde(default)]
     delta: ChunkDelta,
     #[serde(default)]
     finish_reason: Option<String>,
