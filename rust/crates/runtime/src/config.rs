@@ -995,7 +995,10 @@ fn parse_optional_model_providers(
         let provider_type = optional_string(provider, "type", &context)?
             .unwrap_or("openai-compatible")
             .to_string();
-        if !matches!(provider_type.as_str(), "openai-compatible" | "openai") {
+        if !matches!(
+            provider_type.as_str(),
+            "openai-compatible" | "openai" | "anthropic-compatible" | "anthropic"
+        ) {
             return Err(ConfigError::Parse(format!(
                 "{context}: unsupported provider type {provider_type}"
             )));
