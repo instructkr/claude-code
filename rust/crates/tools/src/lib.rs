@@ -2175,17 +2175,6 @@ fn spawn_team_watcher(team_id: &str, agent_ids: &[String]) {
         .ok();
 }
 
-fn get_agent_result_preview(store_dir: &std::path::Path, agent_id: &str) -> String {
-    let md_path = store_dir.join(format!("{agent_id}.md"));
-    if let Ok(content) = std::fs::read_to_string(&md_path) {
-        let lines: Vec<&str> = content.lines().collect();
-        let start = lines.iter().position(|l| l.starts_with("## Result")).map(|i| i + 1).unwrap_or(0);
-        lines[start..].iter().take(5).cloned().collect::<Vec<&str>>().join(" ").chars().take(200).collect()
-    } else {
-        String::new()
-    }
-}
-
 fn append_team_event(events_path: &std::path::Path, team_id: &str, agent_id: &str, event_type: &str, name: &str, detail: Option<&str>) {
     let entry = json!({
         "timestamp": std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_millis(),
@@ -2632,10 +2621,6 @@ fn release_claim(task_id: &str) -> Result<(), String> {
     } else {
         Ok(())
     }
-}
-
-fn is_task_claimed(task_id: &str) -> bool {
-    claims_dir().join(format!("{task_id}.lock")).exists()
 }
 
 fn list_claims(team_id: Option<&str>) -> Vec<serde_json::Value> {
@@ -5093,70 +5078,6 @@ fn spawn_agent_job(job: AgentJob) -> Result<(), String> {
         })
         .map(|_| ())
         .map_err(|error| error.to_string())
-}
-
-fn setup_agent_worktree(agent_id: &str) -> Result<std::path::PathBuf, String> {
-    let cwd = std::env::current_dir().map_err(|e| e.to_string())?;
-    // Check if we're in a git repo
-    let git_check = std::process::Command::new("git")
-        .args(["rev-parse", "--is-inside-work-tree"])
-        .current_dir(&cwd)
-        .output()
-        .map_err(|e| e.to_string())?;
-    if !git_check.status.success() {
-        return Ok(cwd); // Not a git repo, work in current dir
-    }
-    let worktree_dir = cwd.join(".clawd-agents").join("worktrees").join(agent_id);
-    // Create worktree on a new branch
-    let branch_name = format!("agent/{agent_id}");
-    let output = std::process::Command::new("git")
-        .args(["worktree", "add", worktree_dir.to_str().unwrap_or(""), "-b", &branch_name])
-        .current_dir(&cwd)
-        .output()
-        .map_err(|e| e.to_string())?;
-    if !output.status.success() {
-        // Branch might already exist, try with existing branch
-        let output2 = std::process::Command::new("git")
-            .args(["worktree", "add", worktree_dir.to_str().unwrap_or(""), &branch_name])
-            .current_dir(&cwd)
-            .output()
-            .map_err(|e| e.to_string())?;
-        if !output2.status.success() {
-            // Fall back to working in current directory
-            return Ok(cwd);
-        }
-    }
-    Ok(worktree_dir)
-}
-
-fn teardown_agent_worktree(agent_id: &str, worktree_path: &std::path::Path) -> Result<(), String> {
-    let cwd = std::env::current_dir().map_err(|e| e.to_string())?;
-    // Stage and commit any changes in the worktree
-    let _ = std::process::Command::new("git")
-        .args(["add", "-A"])
-        .current_dir(worktree_path)
-        .output();
-    let commit_check = std::process::Command::new("git")
-        .args(["diff", "--cached", "--quiet"])
-        .current_dir(worktree_path)
-        .output();
-    if commit_check.map_or(true, |o| !o.status.success()) {
-        let _ = std::process::Command::new("git")
-            .args(["commit", "-m", &format!("agent {agent_id}: completed task")])
-            .current_dir(worktree_path)
-            .output();
-    }
-    // Remove the worktree
-    let _ = std::process::Command::new("git")
-        .args(["worktree", "remove", worktree_path.to_str().unwrap_or(""), "--force"])
-        .current_dir(&cwd)
-        .output();
-    // Delete the branch
-    let _ = std::process::Command::new("git")
-        .args(["branch", "-D", &format!("agent/{agent_id}")])
-        .current_dir(&cwd)
-        .output();
-    Ok(())
 }
 
 fn run_agent_job(job: &AgentJob) -> Result<(), String> {
