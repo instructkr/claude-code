@@ -106,6 +106,7 @@ struct ModelProvenance {
 #[derive(Debug, Clone)]
 struct ConfiguredModelProvider {
     wire_model: String,
+    provider_type: String,
     api_key: String,
     base_url: String,
 }
@@ -1554,7 +1555,10 @@ fn configured_provider_for_model(
     let Some(provider) = config.model_providers().get(provider_name) else {
         return Ok(None);
     };
-    if !matches!(provider.provider_type(), "openai-compatible" | "openai") {
+    if !matches!(
+        provider.provider_type(),
+        "openai-compatible" | "openai" | "anthropic-compatible" | "anthropic"
+    ) {
         return Err(format!(
             "model provider '{provider_name}' uses unsupported type '{}'",
             provider.provider_type()
@@ -1586,6 +1590,7 @@ fn configured_provider_for_model(
     };
     Ok(Some(ConfiguredModelProvider {
         wire_model: wire_model.to_string(),
+        provider_type: provider.provider_type().to_string(),
         api_key,
         base_url: provider.base_url().to_string(),
     }))
@@ -1594,6 +1599,7 @@ fn configured_provider_for_model(
 struct LoginProviderTemplate {
     id: &'static str,
     label: &'static str,
+    provider_type: &'static str,
     base_url: &'static str,
     api_key_env: &'static str,
     models: &'static [&'static str],
@@ -1604,42 +1610,113 @@ const LOGIN_PROVIDER_TEMPLATES: &[LoginProviderTemplate] = &[
     LoginProviderTemplate {
         id: "zai",
         label: "Z.AI",
+        provider_type: "openai-compatible",
         base_url: "https://api.z.ai/api/paas/v4",
         api_key_env: "Z_AI_API_KEY",
-        models: &["glm-5.1", "glm-5", "glm-4.7", "glm-4.6"],
+        models: &[
+            "glm-5.1",
+            "glm-5",
+            "glm-5-turbo",
+            "glm-4.7",
+            "glm-4.7-flashx",
+            "glm-4.7-flash",
+            "glm-4.6",
+            "glm-4.5",
+            "glm-4.5-x",
+            "glm-4.5-air",
+            "glm-4.5-airx",
+            "glm-4.5-flash",
+            "glm-4-32b-0414-128k",
+        ],
         default_model: "glm-5.1",
     },
     LoginProviderTemplate {
-        id: "zai-coding",
+        id: "zai-coding-plan",
         label: "Z.AI Coding Plan",
+        provider_type: "openai-compatible",
         base_url: "https://api.z.ai/api/coding/paas/v4",
         api_key_env: "Z_AI_API_KEY",
-        models: &["glm-5.1", "glm-5", "glm-4.7", "glm-4.6"],
+        models: &[
+            "glm-4.5-air",
+            "glm-4.7",
+            "glm-5-turbo",
+            "glm-5.1",
+            "glm-5v-turbo",
+        ],
         default_model: "glm-5.1",
     },
     LoginProviderTemplate {
-        id: "minimax",
-        label: "MiniMax",
-        base_url: "https://api.minimax.io/v1",
+        id: "minimax-coding-plan",
+        label: "MiniMax Coding Plan",
+        provider_type: "anthropic-compatible",
+        base_url: "https://api.minimax.io/anthropic/v1",
         api_key_env: "MINIMAX_API_KEY",
-        models: &["MiniMax-M2.7", "MiniMax-M2.7-highspeed"],
+        models: &[
+            "MiniMax-M2",
+            "MiniMax-M2.1",
+            "MiniMax-M2.5",
+            "MiniMax-M2.5-highspeed",
+            "MiniMax-M2.7",
+            "MiniMax-M2.7-highspeed",
+        ],
         default_model: "MiniMax-M2.7-highspeed",
     },
     LoginProviderTemplate {
         id: "openai",
         label: "OpenAI",
+        provider_type: "openai-compatible",
         base_url: "https://api.openai.com/v1",
         api_key_env: "OPENAI_API_KEY",
-        models: &["gpt-5.1", "gpt-5.1-codex", "gpt-4.1"],
-        default_model: "gpt-5.1",
+        models: &[
+            "gpt-5-codex",
+            "gpt-5.1-codex",
+            "gpt-5.1-codex-max",
+            "gpt-5.1-codex-mini",
+            "gpt-5.2",
+            "gpt-5.2-codex",
+            "gpt-5.3-codex",
+            "gpt-5.3-codex-spark",
+            "gpt-5.4",
+            "gpt-5.4-fast",
+            "gpt-5.4-mini",
+            "gpt-5.4-mini-fast",
+            "gpt-5.5",
+            "gpt-5.5-fast",
+            "gpt-5.5-pro",
+        ],
+        default_model: "gpt-5.5",
+    },
+    LoginProviderTemplate {
+        id: "kimi-for-coding",
+        label: "Kimi For Coding",
+        provider_type: "anthropic-compatible",
+        base_url: "https://api.kimi.com/coding/v1",
+        api_key_env: "KIMI_API_KEY",
+        models: &["k2p5", "k2p6", "kimi-k2-thinking"],
+        default_model: "k2p6",
     },
     LoginProviderTemplate {
         id: "moonshot",
         label: "Moonshot / Kimi",
+        provider_type: "openai-compatible",
         base_url: "https://api.moonshot.ai/v1",
         api_key_env: "MOONSHOT_API_KEY",
-        models: &["kimi-k2.5", "kimi-k2-turbo-preview", "kimi-k2-thinking"],
-        default_model: "kimi-k2.5",
+        models: &[
+            "kimi-k2.6",
+            "kimi-k2.5",
+            "kimi-k2-0905-preview",
+            "kimi-k2-0711-preview",
+            "kimi-k2-turbo-preview",
+            "kimi-k2-thinking",
+            "kimi-k2-thinking-turbo",
+            "moonshot-v1-8k",
+            "moonshot-v1-32k",
+            "moonshot-v1-128k",
+            "moonshot-v1-8k-vision-preview",
+            "moonshot-v1-32k-vision-preview",
+            "moonshot-v1-128k-vision-preview",
+        ],
+        default_model: "kimi-k2.6",
     },
 ];
 
@@ -1650,7 +1727,7 @@ fn run_login_wizard() -> Result<Option<String>, Box<dyn std::error::Error>> {
 
     println!();
     println!("Claw provider login");
-    println!("Configure an OpenAI-compatible model provider profile.");
+    println!("Configure a model provider profile.");
     println!("Press Enter to accept defaults.");
     println!();
 
@@ -1658,7 +1735,7 @@ fn run_login_wizard() -> Result<Option<String>, Box<dyn std::error::Error>> {
         println!("  [{}] {}", index + 1, provider.label);
     }
     println!(
-        "  [{}] Custom OpenAI-compatible",
+        "  [{}] Custom compatible endpoint",
         LOGIN_PROVIDER_TEMPLATES.len() + 1
     );
 
@@ -1669,44 +1746,68 @@ fn run_login_wizard() -> Result<Option<String>, Box<dyn std::error::Error>> {
         choice.trim().parse::<usize>()?
     };
 
-    let (provider_id, label, default_base_url, default_api_key_env, default_models, default_model) =
-        if choice == LOGIN_PROVIDER_TEMPLATES.len() + 1 {
-            let id = read_required_prompt("Provider id (e.g. openrouter): ")?;
-            let base_url = read_required_prompt("Base URL: ")?;
-            let api_key_env = read_prompt("API key env var [OPENAI_API_KEY]: ")?;
-            let model = read_required_prompt("Default model: ")?;
-            (
-                id,
-                "Custom".to_string(),
-                base_url,
-                if api_key_env.trim().is_empty() {
-                    "OPENAI_API_KEY".to_string()
-                } else {
-                    api_key_env.trim().to_string()
-                },
-                vec![model.clone()],
-                model,
-            )
+    let (
+        provider_id,
+        label,
+        provider_type,
+        default_base_url,
+        default_api_key_env,
+        default_models,
+        default_model,
+    ) = if choice == LOGIN_PROVIDER_TEMPLATES.len() + 1 {
+        let id = read_required_prompt("Provider id (e.g. openrouter): ")?;
+        let provider_type = read_prompt(
+            "Provider type [openai-compatible, anthropic-compatible] [openai-compatible]: ",
+        )?;
+        let provider_type = if provider_type.trim().is_empty() {
+            "openai-compatible".to_string()
         } else {
-            let template = LOGIN_PROVIDER_TEMPLATES
-                .get(choice.saturating_sub(1))
-                .ok_or_else(|| format!("invalid provider choice: {choice}"))?;
-            (
-                template.id.to_string(),
-                template.label.to_string(),
-                template.base_url.to_string(),
-                template.api_key_env.to_string(),
-                template
-                    .models
-                    .iter()
-                    .map(|model| (*model).to_string())
-                    .collect::<Vec<_>>(),
-                template.default_model.to_string(),
-            )
+            provider_type.trim().to_string()
         };
+        if !matches!(
+            provider_type.as_str(),
+            "openai-compatible" | "openai" | "anthropic-compatible" | "anthropic"
+        ) {
+            return Err(format!("unsupported provider type: {provider_type}").into());
+        }
+        let base_url = read_required_prompt("Base URL: ")?;
+        let api_key_env = read_prompt("API key env var [OPENAI_API_KEY]: ")?;
+        let model = read_required_prompt("Default model: ")?;
+        (
+            id,
+            "Custom".to_string(),
+            provider_type,
+            base_url,
+            if api_key_env.trim().is_empty() {
+                "OPENAI_API_KEY".to_string()
+            } else {
+                api_key_env.trim().to_string()
+            },
+            vec![model.clone()],
+            model,
+        )
+    } else {
+        let template = LOGIN_PROVIDER_TEMPLATES
+            .get(choice.saturating_sub(1))
+            .ok_or_else(|| format!("invalid provider choice: {choice}"))?;
+        (
+            template.id.to_string(),
+            template.label.to_string(),
+            template.provider_type.to_string(),
+            template.base_url.to_string(),
+            template.api_key_env.to_string(),
+            template
+                .models
+                .iter()
+                .map(|model| (*model).to_string())
+                .collect::<Vec<_>>(),
+            template.default_model.to_string(),
+        )
+    };
 
     println!();
     println!("{label}");
+    println!("Provider type: {provider_type}");
     let base_url = read_prompt(&format!("Base URL [{default_base_url}]: "))?;
     let base_url = if base_url.trim().is_empty() {
         default_base_url
@@ -1737,6 +1838,7 @@ fn run_login_wizard() -> Result<Option<String>, Box<dyn std::error::Error>> {
 
     save_model_provider_profile(
         &provider_id,
+        &provider_type,
         &base_url,
         &api_key_env,
         api_key.as_deref(),
@@ -1765,6 +1867,7 @@ fn read_required_prompt(prompt: &str) -> Result<String, Box<dyn std::error::Erro
 
 fn save_model_provider_profile(
     provider_id: &str,
+    provider_type: &str,
     base_url: &str,
     api_key_env: &str,
     api_key: Option<&str>,
@@ -1796,10 +1899,7 @@ fn save_model_provider_profile(
         .expect("modelProviders object initialized");
 
     let mut provider = Map::new();
-    provider.insert(
-        "type".to_string(),
-        Value::String("openai-compatible".to_string()),
-    );
+    provider.insert("type".to_string(), Value::String(provider_type.to_string()));
     provider.insert("baseUrl".to_string(), Value::String(base_url.to_string()));
     provider.insert(
         "apiKeyEnv".to_string(),
@@ -8448,7 +8548,24 @@ impl AnthropicRuntimeClient {
         // skip it.
         let resolved_model = api::resolve_model_alias(&model);
         let client = if let Some(provider) = configured_provider {
-            ApiProviderClient::from_openai_compatible_profile(provider.api_key, provider.base_url)
+            match provider.provider_type.as_str() {
+                "anthropic-compatible" | "anthropic" => {
+                    ApiProviderClient::from_anthropic_compatible_profile(
+                        provider.api_key,
+                        provider.base_url,
+                    )
+                    .with_prompt_cache(PromptCache::new(session_id))
+                }
+                "openai-compatible" | "openai" => {
+                    ApiProviderClient::from_openai_compatible_profile(
+                        provider.api_key,
+                        provider.base_url,
+                    )
+                }
+                other => {
+                    return Err(format!("unsupported provider type: {other}").into());
+                }
+            }
         } else {
             match detect_provider_kind(&resolved_model) {
                 ProviderKind::Anthropic => {
@@ -10739,7 +10856,7 @@ mod tests {
         std::fs::create_dir_all(&config_home).expect("config home should exist");
         std::fs::write(
             cwd.join(".claw").join("settings.json"),
-            r#"{"modelProviders":{"minimax":{"baseUrl":"https://api.minimax.io/v1","apiKeyEnv":"MINIMAX_API_KEY","models":["MiniMax-M2.7-highspeed"]}}}"#,
+            r#"{"modelProviders":{"minimax-coding-plan":{"type":"anthropic-compatible","baseUrl":"https://api.minimax.io/anthropic/v1","apiKeyEnv":"MINIMAX_API_KEY","models":["MiniMax-M2.7-highspeed"]}}}"#,
         )
         .expect("project config should write");
 
@@ -10750,7 +10867,7 @@ mod tests {
 
         // when
         let provider = with_current_dir(&cwd, || {
-            configured_provider_for_model("minimax/MiniMax-M2.7-highspeed")
+            configured_provider_for_model("minimax-coding-plan/MiniMax-M2.7-highspeed")
         })
         .expect("provider lookup should succeed")
         .expect("provider should exist");
@@ -10767,8 +10884,9 @@ mod tests {
 
         // then
         assert_eq!(provider.wire_model, "MiniMax-M2.7-highspeed");
+        assert_eq!(provider.provider_type, "anthropic-compatible");
         assert_eq!(provider.api_key, "test-minimax-key");
-        assert_eq!(provider.base_url, "https://api.minimax.io/v1");
+        assert_eq!(provider.base_url, "https://api.minimax.io/anthropic/v1");
     }
 
     #[test]
@@ -10787,6 +10905,7 @@ mod tests {
         with_current_dir(&cwd, || {
             save_model_provider_profile(
                 "moonshot",
+                "openai-compatible",
                 "https://api.moonshot.ai/v1",
                 "MOONSHOT_API_KEY",
                 Some("test-token"),
