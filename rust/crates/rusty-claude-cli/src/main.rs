@@ -181,6 +181,8 @@ const BUILD_TARGET: Option<&str> = option_env!("TARGET");
 const GIT_SHA: Option<&str> = option_env!("GIT_SHA");
 const INTERNAL_PROGRESS_HEARTBEAT_INTERVAL: Duration = Duration::from_secs(3);
 const POST_TOOL_STALL_TIMEOUT: Duration = Duration::from_secs(10);
+const UPDATE_CHECK_INITIAL_DELAY: Duration = Duration::from_secs(10);
+const UPDATE_CHECK_INTERVAL: Duration = Duration::from_secs(60 * 60 * 6);
 const PRIMARY_SESSION_EXTENSION: &str = "jsonl";
 const LEGACY_SESSION_EXTENSION: &str = "json";
 const OFFICIAL_REPO_URL: &str = "https://github.com/ultraworkers/claw-code";
@@ -1234,6 +1236,137 @@ fn run_update() -> Result<(), Box<dyn std::error::Error>> {
     fs::remove_dir_all(&update_dir).ok();
     println!("Update complete. Installed claw-code at {latest_sha}.");
     Ok(())
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct UpdateNotice {
+    current_sha: String,
+    latest_sha: String,
+}
+
+impl UpdateNotice {
+    fn render(&self) -> String {
+        format!(
+            "Update available\n  Current          {}\n  Latest           {}\n  Install          claw update",
+            short_sha(&self.current_sha),
+            short_sha(&self.latest_sha)
+        )
+    }
+}
+
+struct UpdateCheckMonitor {
+    stop_tx: Option<Sender<()>>,
+    join_handle: Option<JoinHandle<()>>,
+}
+
+impl UpdateCheckMonitor {
+    fn spawn() -> Option<Self> {
+        if update_check_disabled() {
+            return None;
+        }
+        let current_sha = GIT_SHA
+            .map(str::trim)
+            .filter(|sha| !sha.is_empty() && *sha != "unknown")?
+            .to_string();
+        let (stop_tx, stop_rx) = mpsc::channel();
+        let join_handle = thread::spawn(move || {
+            run_update_check_loop(current_sha, stop_rx);
+        });
+        Some(Self {
+            stop_tx: Some(stop_tx),
+            join_handle: Some(join_handle),
+        })
+    }
+
+    fn stop(mut self) {
+        self.stop_inner();
+    }
+
+    fn stop_inner(&mut self) {
+        if let Some(stop_tx) = self.stop_tx.take() {
+            let _ = stop_tx.send(());
+        }
+        self.join_handle.take();
+    }
+}
+
+impl Drop for UpdateCheckMonitor {
+    fn drop(&mut self) {
+        self.stop_inner();
+    }
+}
+
+fn run_update_check_loop(current_sha: String, stop_rx: Receiver<()>) {
+    if stop_rx.recv_timeout(UPDATE_CHECK_INITIAL_DELAY).is_ok() {
+        return;
+    }
+    let mut last_notified_sha: Option<String> = None;
+    loop {
+        if let Ok(Some(notice)) = check_for_update(&current_sha) {
+            if last_notified_sha.as_deref() != Some(notice.latest_sha.as_str()) {
+                eprintln!("\n{}", notice.render());
+                last_notified_sha = Some(notice.latest_sha);
+            }
+        }
+        if stop_rx.recv_timeout(update_check_interval()).is_ok() {
+            break;
+        }
+    }
+}
+
+fn update_check_interval() -> Duration {
+    env::var("CLAW_UPDATE_CHECK_INTERVAL_SECONDS")
+        .ok()
+        .and_then(|value| value.parse::<u64>().ok())
+        .filter(|seconds| *seconds > 0)
+        .map(Duration::from_secs)
+        .unwrap_or(UPDATE_CHECK_INTERVAL)
+}
+
+fn update_check_disabled() -> bool {
+    env::var("CLAW_DISABLE_UPDATE_CHECK")
+        .ok()
+        .map(|value| matches!(value.as_str(), "1" | "true" | "TRUE" | "yes" | "YES"))
+        .unwrap_or(false)
+}
+
+fn check_for_update(current_sha: &str) -> Result<Option<UpdateNotice>, Box<dyn std::error::Error>> {
+    let latest_sha = latest_canonical_sha()?;
+    if sha_matches(current_sha, &latest_sha) {
+        return Ok(None);
+    }
+    Ok(Some(UpdateNotice {
+        current_sha: current_sha.to_string(),
+        latest_sha,
+    }))
+}
+
+fn latest_canonical_sha() -> Result<String, Box<dyn std::error::Error>> {
+    let output = Command::new("git")
+        .args(["ls-remote", OFFICIAL_REPO_URL, "HEAD"])
+        .output()?;
+    if !output.status.success() {
+        return Err(format!("git ls-remote failed with status {}", output.status).into());
+    }
+    let stdout = String::from_utf8(output.stdout)?;
+    let sha = stdout
+        .split_whitespace()
+        .next()
+        .filter(|value| !value.is_empty())
+        .ok_or("git ls-remote did not return a HEAD sha")?;
+    Ok(sha.to_string())
+}
+
+fn sha_matches(current: &str, latest: &str) -> bool {
+    let current = current.trim();
+    let latest = latest.trim();
+    !current.is_empty()
+        && !latest.is_empty()
+        && (current == latest || current.starts_with(latest) || latest.starts_with(current))
+}
+
+fn short_sha(sha: &str) -> String {
+    sha.chars().take(7).collect()
 }
 
 fn git_rev_parse(repo: &Path, rev: &str) -> Result<String, Box<dyn std::error::Error>> {
@@ -4341,6 +4474,7 @@ fn run_repl(
         input::LineEditor::new("> ", cli.repl_completion_candidates().unwrap_or_default());
     println!("{}", cli.startup_banner());
     println!("{}", format_connected_line(&cli.model));
+    let _update_check_monitor = UpdateCheckMonitor::spawn();
 
     // Discover and register LSP servers
     let lsp_servers = runtime::lsp_discovery::discover_available_servers();
@@ -10102,14 +10236,14 @@ mod tests {
         render_session_list, render_session_markdown, resolve_model_alias,
         resolve_model_alias_with_config, resolve_repl_model, resolve_session_reference,
         response_to_events, resume_supported_slash_commands, run_resume_command,
-        save_model_provider_profile, short_tool_id,
+        save_model_provider_profile, sha_matches, short_tool_id,
         slash_command_completion_candidates_with_sessions, split_error_hint, status_context,
         status_json_value, summarize_tool_payload_for_markdown, try_resolve_bare_skill_prompt,
         validate_no_args, write_mcp_server_fixture, CliAction, CliOutputFormat, CliToolExecutor,
         GitWorkspaceSummary, InternalPromptProgressEvent, InternalPromptProgressState, LiveCli,
         LocalHelpTopic, PromptHistoryEntry, SessionLifecycleKind, SessionLifecycleSummary,
-        SlashCommand, StatusUsage, TmuxPaneSnapshot, DEFAULT_MODEL, LATEST_SESSION_REFERENCE,
-        STUB_COMMANDS,
+        SlashCommand, StatusUsage, TmuxPaneSnapshot, UpdateNotice, DEFAULT_MODEL,
+        LATEST_SESSION_REFERENCE, STUB_COMMANDS,
     };
     use crate::configured_provider_for_model;
     use api::{ApiError, MessageResponse, OutputContentBlock, Usage};
@@ -11342,6 +11476,27 @@ mod tests {
             CliAction::Update
         );
         assert!(parse_args(&["update".to_string(), "--repo".to_string()]).is_err());
+    }
+
+    #[test]
+    fn update_checker_matches_full_and_short_shas() {
+        assert!(sha_matches("abcdef123456", "abcdef123456"));
+        assert!(sha_matches("abcdef1", "abcdef123456"));
+        assert!(sha_matches("abcdef123456", "abcdef1"));
+        assert!(!sha_matches("abcdef1", "1234567"));
+    }
+
+    #[test]
+    fn update_checker_notice_points_to_update_command() {
+        let notice = UpdateNotice {
+            current_sha: "abcdef123456".to_string(),
+            latest_sha: "123456abcdef".to_string(),
+        };
+        let rendered = notice.render();
+        assert!(rendered.contains("Update available"));
+        assert!(rendered.contains("abcdef1"));
+        assert!(rendered.contains("123456a"));
+        assert!(rendered.contains("claw update"));
     }
 
     #[test]

@@ -457,6 +457,8 @@ Use `claw update` to install the latest `claw-code` from the canonical source re
 claw update
 ```
 
+During an interactive session, `claw` also checks the canonical source repository periodically and prints a notice when a newer commit is available. The checker is best-effort and never installs updates automatically. Set `CLAW_DISABLE_UPDATE_CHECK=1` to disable it, or `CLAW_UPDATE_CHECK_INTERVAL_SECONDS=<seconds>` to change the interval.
+
 ### Tested models and aliases
 
 These are the models registered in the built-in alias table with known token limits:
