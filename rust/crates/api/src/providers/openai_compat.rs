@@ -511,7 +511,14 @@ impl StreamState {
         }
 
         for choice in chunk.choices {
-            if let Some(content) = choice.delta.content.filter(|value| !value.is_empty()) {
+            // Handle content from various fields (content, reasoning_content, thinking.content)
+            let content = choice
+                .delta
+                .content
+                .or(choice.delta.reasoning_content)
+                .or(choice.delta.thinking.and_then(|t| t.content))
+                .filter(|value| !value.is_empty());
+            if let Some(text) = content {
                 if !self.text_started {
                     self.text_started = true;
                     events.push(StreamEvent::ContentBlockStart(ContentBlockStartEvent {
@@ -523,7 +530,7 @@ impl StreamState {
                 }
                 events.push(StreamEvent::ContentBlockDelta(ContentBlockDeltaEvent {
                     index: 0,
-                    delta: ContentBlockDelta::TextDelta { text: content },
+                    delta: ContentBlockDelta::TextDelta { text },
                 }));
             }
 
@@ -755,8 +762,19 @@ struct ChunkChoice {
 struct ChunkDelta {
     #[serde(default)]
     content: Option<String>,
+    /// Some providers (GLM, DeepSeek) emit reasoning in `reasoning_content`
+    #[serde(default)]
+    reasoning_content: Option<String>,
+    #[serde(default)]
+    thinking: Option<ThinkingDelta>,
     #[serde(default, deserialize_with = "deserialize_null_as_empty_vec")]
     tool_calls: Vec<DeltaToolCall>,
+}
+
+#[derive(Debug, Default, Deserialize)]
+struct ThinkingDelta {
+    #[serde(default)]
+    content: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
