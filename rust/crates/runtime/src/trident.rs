@@ -670,7 +670,7 @@ fn truncate_text(text: &str, max_chars: usize) -> String {
 mod tests {
     use super::*;
     use crate::compact::CompactionConfig;
-    use crate::session::{ContentBlock, ConversationMessage, MessageRole, Session};
+    use crate::session::{ContentBlock, ConversationMessage, Session};
 
     #[test]
     fn stage1_removes_obsolete_file_reads() {

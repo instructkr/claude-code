@@ -425,10 +425,7 @@ impl LspTransport {
         Self::connect_tcp_with_timeout(address, DEFAULT_REQUEST_TIMEOUT)
     }
 
-    pub fn connect_tcp_with_timeout(
-        address: &str,
-        request_timeout: Duration,
-    ) -> io::Result<Self> {
+    pub fn connect_tcp_with_timeout(address: &str, request_timeout: Duration) -> io::Result<Self> {
         let addr = address.trim_start_matches("tcp://");
 
         // Try socat first (reliable bidirectional bridge)
@@ -480,9 +477,6 @@ impl LspTransport {
         })
     }
 }
-
-
-
 
 #[cfg(test)]
 mod tests;

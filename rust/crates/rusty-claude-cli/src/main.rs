@@ -4313,7 +4313,9 @@ fn run_repl(
         } else {
             let names: Vec<&str> = lsp_servers.iter().map(|s| s.language.as_str()).collect();
             eprintln!("  Available but not started: {}", names.join(", "));
-            eprintln!("  Start with: /lsp start <language> or set lspAutoStart=true in settings.json");
+            eprintln!(
+                "  Start with: /lsp start <language> or set lspAutoStart=true in settings.json"
+            );
         }
     }
 

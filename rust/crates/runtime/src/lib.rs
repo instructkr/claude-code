@@ -61,13 +61,12 @@ pub use compact::{
     get_compact_continuation_message, should_compact, CompactionConfig, CompactionResult,
 };
 pub use config::{
-    clear_user_provider_settings, save_user_provider_settings, ApiTimeoutConfig, ConfigEntry,
-    ConfigError, ConfigLoader, ConfigSource, LspServerConfig, McpConfigCollection,
-    McpManagedProxyServerConfig, McpOAuthConfig, McpRemoteServerConfig, McpSdkServerConfig,
-    McpServerConfig, McpStdioServerConfig, McpTransport, McpWebSocketServerConfig, OAuthConfig,
-    ProviderFallbackConfig, ResolvedPermissionMode, RuntimeConfig, RuntimeFeatureConfig,
-    RuntimeHookConfig, RuntimePermissionRuleConfig, RuntimePluginConfig, ScopedMcpServerConfig,
-    CLAW_SETTINGS_SCHEMA_NAME,
+    ApiTimeoutConfig, ConfigEntry, ConfigError, ConfigLoader, ConfigSource, LspServerConfig,
+    McpConfigCollection, McpManagedProxyServerConfig, McpOAuthConfig, McpRemoteServerConfig,
+    McpSdkServerConfig, McpServerConfig, McpStdioServerConfig, McpTransport,
+    McpWebSocketServerConfig, OAuthConfig, ProviderFallbackConfig, ResolvedPermissionMode,
+    RuntimeConfig, RuntimeFeatureConfig, RuntimeHookConfig, RuntimePermissionRuleConfig,
+    RuntimePluginConfig, ScopedMcpServerConfig, CLAW_SETTINGS_SCHEMA_NAME,
 };
 pub use config_validate::{
     check_unsupported_format, format_diagnostics, validate_config_file, ConfigDiagnostic,
