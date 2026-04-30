@@ -96,6 +96,13 @@ struct ModelProvenance {
     source: ModelSource,
 }
 
+#[derive(Debug, Clone)]
+struct ConfiguredModelProvider {
+    wire_model: String,
+    api_key: String,
+    base_url: String,
+}
+
 impl ModelProvenance {
     fn default_fallback() -> Self {
         Self {
@@ -1443,7 +1450,83 @@ fn resolve_model_alias_with_config(model: &str) -> String {
     if let Some(resolved) = config_alias_for_current_dir(trimmed) {
         return resolve_model_alias(&resolved).to_string();
     }
+    if let Some(resolved) = config_provider_default_model_for_current_dir(trimmed) {
+        return resolved;
+    }
     resolve_model_alias(trimmed).to_string()
+}
+
+fn config_provider_default_model_for_current_dir(provider_name: &str) -> Option<String> {
+    if provider_name.is_empty() || provider_name.contains('/') {
+        return None;
+    }
+    let cwd = env::current_dir().ok()?;
+    let loader = ConfigLoader::default_for(&cwd);
+    let config = loader.load().ok()?;
+    let provider = config.model_providers().get(provider_name)?;
+    let model = provider
+        .default_model()
+        .or_else(|| provider.models().first().map(String::as_str))?;
+    Some(format!("{provider_name}/{model}"))
+}
+
+fn configured_provider_names_for_current_dir() -> Vec<String> {
+    let Ok(cwd) = env::current_dir() else {
+        return Vec::new();
+    };
+    let loader = ConfigLoader::default_for(&cwd);
+    loader
+        .load()
+        .map(|config| config.model_providers().keys().cloned().collect())
+        .unwrap_or_default()
+}
+
+fn configured_provider_for_model(
+    model: &str,
+) -> Result<Option<ConfiguredModelProvider>, Box<dyn std::error::Error>> {
+    let Some((provider_name, requested_model)) = model.split_once('/') else {
+        return Ok(None);
+    };
+    let cwd = env::current_dir()?;
+    let config = ConfigLoader::default_for(&cwd).load()?;
+    let Some(provider) = config.model_providers().get(provider_name) else {
+        return Ok(None);
+    };
+    if !matches!(provider.provider_type(), "openai-compatible" | "openai") {
+        return Err(format!(
+            "model provider '{provider_name}' uses unsupported type '{}'",
+            provider.provider_type()
+        )
+        .into());
+    }
+    let wire_model = if requested_model.is_empty() {
+        provider.default_model().ok_or_else(|| {
+            format!("model provider '{provider_name}' does not define defaultModel")
+        })?
+    } else {
+        requested_model
+    };
+    if !provider.models().is_empty() && !provider.models().iter().any(|model| model == wire_model) {
+        return Err(format!(
+            "model '{wire_model}' is not listed in modelProviders.{provider_name}.models"
+        )
+        .into());
+    }
+    let api_key = if let Some(api_key) = provider.api_key().filter(|value| !value.is_empty()) {
+        api_key.to_string()
+    } else if let Some(env_name) = provider.api_key_env() {
+        env::var(env_name)
+            .map_err(|_| format!("model provider '{provider_name}' requires env var {env_name}"))?
+    } else {
+        return Err(
+            format!("model provider '{provider_name}' requires apiKeyEnv or apiKey").into(),
+        );
+    };
+    Ok(Some(ConfiguredModelProvider {
+        wire_model: wire_model.to_string(),
+        api_key,
+        base_url: provider.base_url().to_string(),
+    }))
 }
 
 /// Validate model syntax at parse time.
@@ -1458,6 +1541,12 @@ fn validate_model_syntax(model: &str) -> Result<(), String> {
     match trimmed {
         "opus" | "sonnet" | "haiku" => return Ok(()),
         _ => {}
+    }
+    if configured_provider_names_for_current_dir()
+        .iter()
+        .any(|name| name == trimmed)
+    {
+        return Ok(());
     }
     // Check for spaces (malformed)
     if trimmed.contains(' ') {
@@ -7527,6 +7616,10 @@ fn build_runtime_with_plugin_state(
         plugin_registry,
         mcp_state,
     } = runtime_plugin_state;
+    let configured_provider = configured_provider_for_model(&model)?;
+    let request_model = configured_provider
+        .as_ref()
+        .map_or_else(|| model.clone(), |provider| provider.wire_model.clone());
     plugin_registry.initialize()?;
     let policy = permission_policy(permission_mode, &feature_config, &tool_registry)
         .map_err(std::io::Error::other)?;
@@ -7534,7 +7627,8 @@ fn build_runtime_with_plugin_state(
         session,
         AnthropicRuntimeClient::new(
             session_id,
-            model,
+            request_model,
+            configured_provider,
             enable_tools,
             emit_output,
             allowed_tools.clone(),
@@ -7662,6 +7756,7 @@ impl AnthropicRuntimeClient {
     fn new(
         session_id: &str,
         model: String,
+        configured_provider: Option<ConfiguredModelProvider>,
         enable_tools: bool,
         emit_output: bool,
         allowed_tools: Option<AllowedToolSet>,
@@ -7688,26 +7783,30 @@ impl AnthropicRuntimeClient {
         // prompt cache is Anthropic-only so non-Anthropic variants
         // skip it.
         let resolved_model = api::resolve_model_alias(&model);
-        let client = match detect_provider_kind(&resolved_model) {
-            ProviderKind::Anthropic => {
-                let auth = resolve_cli_auth_source()?;
-                let inner = AnthropicClient::from_auth(auth)
-                    .with_base_url(api::read_base_url())
-                    .with_prompt_cache(PromptCache::new(session_id));
-                ApiProviderClient::Anthropic(inner)
-            }
-            ProviderKind::Xai | ProviderKind::OpenAi => {
-                // The api crate's `ProviderClient::from_model_with_anthropic_auth`
-                // with `None` for the anthropic auth routes via
-                // `detect_provider_kind` and builds an
-                // `OpenAiCompatClient::from_env` with the matching
-                // `OpenAiCompatConfig` (openai / xai / dashscope).
-                // That reads the correct API-key env var and BASE_URL
-                // override internally, so this one call covers OpenAI,
-                // OpenRouter, xAI, DashScope, Ollama, and any other
-                // OpenAI-compat endpoint users configure via
-                // `OPENAI_BASE_URL` / `XAI_BASE_URL` / `DASHSCOPE_BASE_URL`.
-                ApiProviderClient::from_model_with_anthropic_auth(&resolved_model, None)?
+        let client = if let Some(provider) = configured_provider {
+            ApiProviderClient::from_openai_compatible_profile(provider.api_key, provider.base_url)
+        } else {
+            match detect_provider_kind(&resolved_model) {
+                ProviderKind::Anthropic => {
+                    let auth = resolve_cli_auth_source()?;
+                    let inner = AnthropicClient::from_auth(auth)
+                        .with_base_url(api::read_base_url())
+                        .with_prompt_cache(PromptCache::new(session_id));
+                    ApiProviderClient::Anthropic(inner)
+                }
+                ProviderKind::Xai | ProviderKind::OpenAi => {
+                    // The api crate's `ProviderClient::from_model_with_anthropic_auth`
+                    // with `None` for the anthropic auth routes via
+                    // `detect_provider_kind` and builds an
+                    // `OpenAiCompatClient::from_env` with the matching
+                    // `OpenAiCompatConfig` (openai / xai / dashscope).
+                    // That reads the correct API-key env var and BASE_URL
+                    // override internally, so this one call covers OpenAI,
+                    // OpenRouter, xAI, DashScope, Ollama, and any other
+                    // OpenAI-compat endpoint users configure via
+                    // `OPENAI_BASE_URL` / `XAI_BASE_URL` / `DASHSCOPE_BASE_URL`.
+                    ApiProviderClient::from_model_with_anthropic_auth(&resolved_model, None)?
+                }
             }
         };
         Ok(Self {
@@ -9261,6 +9360,7 @@ mod tests {
         SlashCommand, StatusUsage, TmuxPaneSnapshot, DEFAULT_MODEL, LATEST_SESSION_REFERENCE,
         STUB_COMMANDS,
     };
+    use crate::configured_provider_for_model;
     use api::{ApiError, MessageResponse, OutputContentBlock, Usage};
     use plugins::{
         PluginManager, PluginManagerConfig, PluginTool, PluginToolDefinition, PluginToolPermission,
@@ -9917,6 +10017,80 @@ mod tests {
         assert_eq!(cross_provider, "grok-3-mini");
         assert_eq!(unknown, "unknown-model");
         assert_eq!(builtin, "claude-haiku-4-5-20251213");
+    }
+
+    #[test]
+    fn configured_model_provider_default_resolves_to_provider_model_ref() {
+        // given
+        let _guard = env_lock();
+        let root = temp_dir();
+        let cwd = root.join("project");
+        let config_home = root.join("config-home");
+        std::fs::create_dir_all(cwd.join(".claw")).expect("project config dir should exist");
+        std::fs::create_dir_all(&config_home).expect("config home should exist");
+        std::fs::write(
+            cwd.join(".claw").join("settings.json"),
+            r#"{"modelProviders":{"zai":{"type":"openai-compatible","baseUrl":"https://api.z.ai/api/paas/v4","apiKeyEnv":"Z_AI_API_KEY","models":["glm-5.1","glm-4.6"],"defaultModel":"glm-5.1"}}}"#,
+        )
+        .expect("project config should write");
+
+        let original_config_home = std::env::var("CLAW_CONFIG_HOME").ok();
+        std::env::set_var("CLAW_CONFIG_HOME", &config_home);
+
+        // when
+        let resolved = with_current_dir(&cwd, || resolve_model_alias_with_config("zai"));
+
+        match original_config_home {
+            Some(value) => std::env::set_var("CLAW_CONFIG_HOME", value),
+            None => std::env::remove_var("CLAW_CONFIG_HOME"),
+        }
+        std::fs::remove_dir_all(root).expect("temp config root should clean up");
+
+        // then
+        assert_eq!(resolved, "zai/glm-5.1");
+    }
+
+    #[test]
+    fn configured_model_provider_resolves_runtime_connection_details() {
+        // given
+        let _guard = env_lock();
+        let root = temp_dir();
+        let cwd = root.join("project");
+        let config_home = root.join("config-home");
+        std::fs::create_dir_all(cwd.join(".claw")).expect("project config dir should exist");
+        std::fs::create_dir_all(&config_home).expect("config home should exist");
+        std::fs::write(
+            cwd.join(".claw").join("settings.json"),
+            r#"{"modelProviders":{"minimax":{"baseUrl":"https://api.minimax.io/v1","apiKeyEnv":"MINIMAX_API_KEY","models":["MiniMax-M2.7-highspeed"]}}}"#,
+        )
+        .expect("project config should write");
+
+        let original_config_home = std::env::var("CLAW_CONFIG_HOME").ok();
+        let original_key = std::env::var("MINIMAX_API_KEY").ok();
+        std::env::set_var("CLAW_CONFIG_HOME", &config_home);
+        std::env::set_var("MINIMAX_API_KEY", "test-minimax-key");
+
+        // when
+        let provider = with_current_dir(&cwd, || {
+            configured_provider_for_model("minimax/MiniMax-M2.7-highspeed")
+        })
+        .expect("provider lookup should succeed")
+        .expect("provider should exist");
+
+        match original_config_home {
+            Some(value) => std::env::set_var("CLAW_CONFIG_HOME", value),
+            None => std::env::remove_var("CLAW_CONFIG_HOME"),
+        }
+        match original_key {
+            Some(value) => std::env::set_var("MINIMAX_API_KEY", value),
+            None => std::env::remove_var("MINIMAX_API_KEY"),
+        }
+        std::fs::remove_dir_all(root).expect("temp config root should clean up");
+
+        // then
+        assert_eq!(provider.wire_model, "MiniMax-M2.7-highspeed");
+        assert_eq!(provider.api_key, "test-minimax-key");
+        assert_eq!(provider.base_url, "https://api.minimax.io/v1");
     }
 
     #[test]

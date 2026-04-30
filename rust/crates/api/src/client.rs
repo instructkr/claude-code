@@ -47,6 +47,16 @@ impl ProviderClient {
     }
 
     #[must_use]
+    pub fn from_openai_compatible_profile(
+        api_key: impl Into<String>,
+        base_url: impl Into<String>,
+    ) -> Self {
+        Self::OpenAi(
+            OpenAiCompatClient::new(api_key, OpenAiCompatConfig::openai()).with_base_url(base_url),
+        )
+    }
+
+    #[must_use]
     pub const fn provider_kind(&self) -> ProviderKind {
         match self {
             Self::Anthropic(_) => ProviderKind::Anthropic,

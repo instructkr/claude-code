@@ -308,6 +308,55 @@ The OpenAI-compatible backend also serves as the gateway for **OpenRouter**, **O
 
 **Model-name prefix routing:** If a model name starts with `openai/`, `gpt-`, `qwen/`, or `qwen-`, the provider is selected by the prefix regardless of which env vars are set. This prevents accidental misrouting to Anthropic when multiple credentials exist in the environment.
 
+### Configured OpenAI-compatible providers
+
+If you use several OpenAI-compatible providers, define named provider profiles in `settings.json` instead of changing `OPENAI_BASE_URL` before every run. Each profile gets its own base URL, credential env var, and model allow-list:
+
+```json
+{
+  "model": "zai/glm-5.1",
+  "modelProviders": {
+    "zai": {
+      "type": "openai-compatible",
+      "baseUrl": "https://api.z.ai/api/paas/v4",
+      "apiKeyEnv": "Z_AI_API_KEY",
+      "models": ["glm-5.1", "glm-4.6"],
+      "defaultModel": "glm-5.1"
+    },
+    "minimax": {
+      "type": "openai-compatible",
+      "baseUrl": "https://api.minimax.io/v1",
+      "apiKeyEnv": "MINIMAX_API_KEY",
+      "models": ["MiniMax-M2.7", "MiniMax-M2.7-highspeed"],
+      "defaultModel": "MiniMax-M2.7-highspeed"
+    },
+    "moonshot": {
+      "type": "openai-compatible",
+      "baseUrl": "https://api.moonshot.ai/v1",
+      "apiKeyEnv": "MOONSHOT_API_KEY",
+      "models": ["kimi-k2.5"],
+      "defaultModel": "kimi-k2.5"
+    }
+  }
+}
+```
+
+Use `/model provider/model` in the REPL to switch without restarting:
+
+```text
+/model zai/glm-5.1
+/model minimax/MiniMax-M2.7-highspeed
+/model moonshot/kimi-k2.5
+```
+
+You can also use the provider name alone when it has `defaultModel` configured:
+
+```text
+/model minimax
+```
+
+Prefer `apiKeyEnv` so secrets stay out of source-controlled project settings. `apiKey` is supported for local-only files when an environment variable is not practical.
+
 ### Tested models and aliases
 
 These are the models registered in the built-in alias table with known token limits:
