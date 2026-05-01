@@ -41,7 +41,14 @@ impl ProviderClient {
                     }
                     _ => OpenAiCompatConfig::openai(),
                 };
-                Ok(Self::OpenAi(OpenAiCompatClient::from_env(config)?))
+                // Try OAuth for OpenAI if env var is not set
+                if config.provider_name == "OpenAI" {
+                    Ok(Self::OpenAi(OpenAiCompatClient::from_env_or_oauth(
+                        config, "openai",
+                    )?))
+                } else {
+                    Ok(Self::OpenAi(OpenAiCompatClient::from_env(config)?))
+                }
             }
         }
     }

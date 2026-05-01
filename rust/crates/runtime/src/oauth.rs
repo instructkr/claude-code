@@ -298,6 +298,343 @@ pub fn clear_oauth_credentials() -> io::Result<()> {
     write_credentials_root(&path, &root)
 }
 
+// ---------------------------------------------------------------------------
+// Per-provider OAuth token storage
+// ---------------------------------------------------------------------------
+
+/// Load OAuth credentials for a specific provider from `credentials.json`.
+/// Credentials are stored under the `oauth_providers.{provider_id}` key.
+pub fn load_provider_oauth(provider_id: &str) -> io::Result<Option<OAuthTokenSet>> {
+    let path = credentials_path()?;
+    let root = read_credentials_root(&path)?;
+    let Some(oauth_providers) = root.get("oauth_providers") else {
+        return Ok(None);
+    };
+    let Some(provider_value) = oauth_providers.get(provider_id) else {
+        return Ok(None);
+    };
+    if provider_value.is_null() {
+        return Ok(None);
+    }
+    let stored = serde_json::from_value::<StoredOAuthCredentials>(provider_value.clone())
+        .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
+    Ok(Some(stored.into()))
+}
+
+/// Save OAuth credentials for a specific provider to `credentials.json`.
+/// Preserves other providers and the legacy `"oauth"` key.
+pub fn save_provider_oauth(provider_id: &str, token_set: &OAuthTokenSet) -> io::Result<()> {
+    let path = credentials_path()?;
+    let mut root = read_credentials_root(&path)?;
+    let oauth_providers = root
+        .entry("oauth_providers")
+        .or_insert_with(|| Value::Object(Map::new()));
+    let provider_map = oauth_providers
+        .as_object_mut()
+        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "oauth_providers must be an object"))?;
+    provider_map.insert(
+        provider_id.to_string(),
+        serde_json::to_value(StoredOAuthCredentials::from(token_set.clone()))
+            .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?,
+    );
+    write_credentials_root(&path, &root)
+}
+
+/// Clear OAuth credentials for a specific provider.
+pub fn clear_provider_oauth(provider_id: &str) -> io::Result<()> {
+    let path = credentials_path()?;
+    let mut root = read_credentials_root(&path)?;
+    let Some(oauth_providers) = root.get_mut("oauth_providers") else {
+        return Ok(());
+    };
+    let Some(provider_map) = oauth_providers.as_object_mut() else {
+        return Ok(());
+    };
+    provider_map.remove(provider_id);
+    if provider_map.is_empty() {
+        root.remove("oauth_providers");
+    }
+    write_credentials_root(&path, &root)
+}
+
+// ---------------------------------------------------------------------------
+// Browser launcher
+// ---------------------------------------------------------------------------
+
+/// Open a URL in the user's default browser.
+/// Falls back to printing the URL if the platform command fails.
+pub fn open_browser(url: &str) -> io::Result<()> {
+    let (cmd, args): (&str, Vec<&str>) = if cfg!(target_os = "macos") {
+        ("open", vec![url])
+    } else if cfg!(target_os = "linux") {
+        ("xdg-open", vec![url])
+    } else if cfg!(target_os = "windows") {
+        ("cmd", vec!["/C", "start", "", url])
+    } else {
+        eprintln!("Please open this URL in your browser:");
+        eprintln!("  {url}");
+        return Ok(());
+    };
+    match std::process::Command::new(cmd).args(&args).output() {
+        Ok(output) if output.status.success() => Ok(()),
+        _ => {
+            eprintln!("Could not open browser automatically. Please open this URL:");
+            eprintln!("  {url}");
+            Ok(())
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Local HTTP callback server (blocking, single-request)
+// ---------------------------------------------------------------------------
+
+/// Result of a successful OAuth callback.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct OAuthCallbackResult {
+    pub code: String,
+    pub state: String,
+}
+
+/// Run a blocking local HTTP server that waits for a single `/callback` request.
+/// Returns the authorization code and state on success.
+/// Times out after `timeout` duration.
+pub fn run_oauth_callback_server(
+    port: u16,
+    timeout: std::time::Duration,
+) -> io::Result<OAuthCallbackResult> {
+    use std::io::{BufRead, BufReader, Write};
+    use std::net::{SocketAddr, TcpListener};
+
+    let addr: SocketAddr = format!("127.0.0.1:{port}").parse().map_err(|e| {
+        io::Error::new(io::ErrorKind::InvalidInput, format!("invalid address: {e}"))
+    })?;
+    let listener = TcpListener::bind(addr)?;
+    listener.set_nonblocking(false)?;
+
+    let start = std::time::Instant::now();
+
+    loop {
+        if start.elapsed() > timeout {
+            return Err(io::Error::new(
+                io::ErrorKind::TimedOut,
+                "OAuth callback timed out waiting for browser redirect",
+            ));
+        }
+
+        let (mut stream, _) = match listener.accept() {
+            Ok(conn) => conn,
+            Err(e) if e.kind() == io::ErrorKind::WouldBlock => {
+                std::thread::sleep(std::time::Duration::from_millis(100));
+                continue;
+            }
+            Err(e) => return Err(e),
+        };
+
+        let mut reader = BufReader::new(&mut stream);
+        let mut first_line = String::new();
+        reader.read_line(&mut first_line)?;
+
+        // Parse "GET /callback?code=...&state=... HTTP/1.1"
+        let target = first_line
+            .split_whitespace()
+            .nth(1)
+            .unwrap_or("");
+
+        // Consume remaining headers so browser doesn't reset connection
+        loop {
+            let mut line = String::new();
+            if reader.read_line(&mut line)? == 0 {
+                break;
+            }
+            if line == "\r\n" || line == "\n" {
+                break;
+            }
+        }
+
+        match parse_oauth_callback_request_target(target) {
+            Ok(params) => {
+                if let (Some(code), Some(state)) = (&params.code, &params.state) {
+                    // Success page
+                    let body = r#"<!DOCTYPE html>
+<html><head><title>Authentication Successful</title></head>
+<body style="font-family:sans-serif;text-align:center;padding:40px;">
+<h1>✅ Authentication Successful</h1>
+<p>You can close this tab and return to the terminal.</p>
+</body></html>"#;
+                    let response = format!(
+                        "HTTP/1.1 200 OK\r\nContent-Type: text/html; charset=utf-8\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                        body.len(),
+                        body
+                    );
+                    stream.write_all(response.as_bytes())?;
+                    return Ok(OAuthCallbackResult {
+                        code: code.clone(),
+                        state: state.clone(),
+                    });
+                }
+                if let Some(error) = &params.error {
+                    let err_desc = params.error_description.as_deref().unwrap_or(error);
+                    let body = format!(
+                        r#"<!DOCTYPE html>
+<html><head><title>Authentication Failed</title></head>
+<body style="font-family:sans-serif;text-align:center;padding:40px;">
+<h1>❌ Authentication Failed</h1>
+<p>{}</p>
+<p>You can close this tab and return to the terminal.</p>
+</body></html>"#,
+                        html_escape(err_desc)
+                    );
+                    let response = format!(
+                        "HTTP/1.1 400 Bad Request\r\nContent-Type: text/html; charset=utf-8\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                        body.len(),
+                        body
+                    );
+                    stream.write_all(response.as_bytes())?;
+                    return Err(io::Error::new(
+                        io::ErrorKind::Other,
+                        format!("OAuth error: {error} - {err_desc}"),
+                    ));
+                }
+            }
+            Err(e) => {
+                let body = format!(
+                    r#"<!DOCTYPE html>
+<html><head><title>Authentication Failed</title></head>
+<body style="font-family:sans-serif;text-align:center;padding:40px;">
+<h1>❌ Invalid Callback</h1>
+<p>{}</p>
+</body></html>"#,
+                    html_escape(&e)
+                );
+                let response = format!(
+                    "HTTP/1.1 400 Bad Request\r\nContent-Type: text/html; charset=utf-8\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                    body.len(),
+                    body
+                );
+                stream.write_all(response.as_bytes())?;
+                return Err(io::Error::new(io::ErrorKind::Other, e));
+            }
+        }
+    }
+}
+
+#[must_use]
+fn html_escape(input: &str) -> String {
+    input
+        .replace('&', "&amp;")
+        .replace('<', "&lt;")
+        .replace('>', "&gt;")
+        .replace('"', "&quot;")
+}
+
+// ---------------------------------------------------------------------------
+// Device Authorization Flow (RFC 8628)
+// ---------------------------------------------------------------------------
+
+/// Request body for starting a device authorization flow.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DeviceAuthRequest {
+    pub client_id: String,
+    pub scope: String,
+}
+
+/// Response from a device authorization endpoint.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+pub struct DeviceAuthResponse {
+    pub device_code: String,
+    pub user_code: String,
+    pub verification_uri: String,
+    #[serde(default)]
+    pub verification_uri_complete: Option<String>,
+    pub expires_in: u64,
+    pub interval: u64,
+}
+
+/// Poll a device token endpoint until the user authorizes or the flow expires.
+/// Returns `Ok(None)` if the user hasn't authorized yet but we should keep polling.
+/// Returns `Ok(Some(token_set))` on success.
+/// Returns `Err` on fatal errors.
+pub async fn poll_device_token(
+    client: &reqwest::Client,
+    device_code: &str,
+    client_id: &str,
+    token_url: &str,
+) -> io::Result<Option<OAuthTokenSet>> {
+    let params = [
+        ("grant_type", "urn:ietf:params:oauth:grant-type:device_code"),
+        ("device_code", device_code),
+        ("client_id", client_id),
+    ];
+
+    let response = client
+        .post(token_url)
+        .form(&params)
+        .send()
+        .await
+        .map_err(|e| io::Error::new(io::ErrorKind::Other, format!("HTTP request failed: {e}")))?;
+    let status = response.status();
+    let body = response.text().await.map_err(|e| {
+        io::Error::new(io::ErrorKind::Other, format!("Failed to read response body: {e}"))
+    })?;
+
+    if status.is_success() {
+        let token: serde_json::Value = serde_json::from_str(&body)
+            .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
+        let access_token = token["access_token"]
+            .as_str()
+            .ok_or_else(|| {
+                io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "access_token missing from device token response",
+                )
+            })?
+            .to_string();
+        let refresh_token = token["refresh_token"].as_str().map(String::from);
+        let expires_at = token["expires_in"].as_u64().map(|secs| {
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_secs()
+                + secs
+        });
+        let scopes = token["scope"]
+            .as_str()
+            .map(|s| s.split(' ').map(String::from).collect())
+            .unwrap_or_default();
+        return Ok(Some(OAuthTokenSet {
+            access_token,
+            refresh_token,
+            expires_at,
+            scopes,
+        }));
+    }
+
+    // Parse OAuth error response
+    let error_json: serde_json::Value = serde_json::from_str(&body).unwrap_or_default();
+    let error = error_json["error"].as_str().unwrap_or("unknown");
+
+    match error {
+        "authorization_pending" => Ok(None),
+        "slow_down" => {
+            tokio::time::sleep(std::time::Duration::from_secs(5)).await;
+            Ok(None)
+        }
+        "expired_token" => Err(io::Error::new(
+            io::ErrorKind::Other,
+            "Device authorization expired. Please try again.",
+        )),
+        "access_denied" => Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            "User denied authorization.",
+        )),
+        _ => Err(io::Error::new(
+            io::ErrorKind::Other,
+            format!("Device token error: {error}: {body}"),
+        )),
+    }
+}
+
 pub fn parse_oauth_callback_request_target(target: &str) -> Result<OAuthCallbackParams, String> {
     let (path, query) = target
         .split_once('?')

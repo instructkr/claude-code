@@ -1578,6 +1578,7 @@ struct LoginProviderTemplate {
     api_key_env: &'static str,
     models: &'static [&'static str],
     default_model: &'static str,
+    oauth: Option<ProviderOAuthConfig>,
 }
 
 const LOGIN_PROVIDER_TEMPLATES: &[LoginProviderTemplate] = &[
@@ -1603,6 +1604,7 @@ const LOGIN_PROVIDER_TEMPLATES: &[LoginProviderTemplate] = &[
             "glm-4-32b-0414-128k",
         ],
         default_model: "glm-5.1",
+        oauth: None,
     },
     LoginProviderTemplate {
         id: "zai-coding-plan",
@@ -1618,6 +1620,7 @@ const LOGIN_PROVIDER_TEMPLATES: &[LoginProviderTemplate] = &[
             "glm-5v-turbo",
         ],
         default_model: "glm-5.1",
+        oauth: None,
     },
     LoginProviderTemplate {
         id: "minimax-coding-plan",
@@ -1634,6 +1637,7 @@ const LOGIN_PROVIDER_TEMPLATES: &[LoginProviderTemplate] = &[
             "MiniMax-M2.7-highspeed",
         ],
         default_model: "MiniMax-M2.7-highspeed",
+        oauth: None,
     },
     LoginProviderTemplate {
         id: "openai",
@@ -1659,6 +1663,15 @@ const LOGIN_PROVIDER_TEMPLATES: &[LoginProviderTemplate] = &[
             "gpt-5.5-pro",
         ],
         default_model: "gpt-5.5",
+        oauth: Some(ProviderOAuthConfig {
+            client_id: "app_EMoamEEZ73f0CkXaXp7hrann",
+            callback_port: 1455,
+            flow: OAuthFlowType::Pkce {
+                authorize_url: "https://auth.openai.com/oauth/authorize",
+                token_url: "https://auth.openai.com/oauth/token",
+                scopes: &["openid", "profile", "email", "offline_access"],
+            },
+        }),
     },
     LoginProviderTemplate {
         id: "kimi-for-coding",
@@ -1668,6 +1681,7 @@ const LOGIN_PROVIDER_TEMPLATES: &[LoginProviderTemplate] = &[
         api_key_env: "KIMI_API_KEY",
         models: &["k2p5", "k2p6", "kimi-k2-thinking"],
         default_model: "k2p6",
+        oauth: None,
     },
     LoginProviderTemplate {
         id: "moonshot",
@@ -1691,6 +1705,15 @@ const LOGIN_PROVIDER_TEMPLATES: &[LoginProviderTemplate] = &[
             "moonshot-v1-128k-vision-preview",
         ],
         default_model: "kimi-k2.6",
+        oauth: Some(ProviderOAuthConfig {
+            client_id: "17e5f671-d194-4dfb-9706-5516cb48c098",
+            callback_port: 4546,
+            flow: OAuthFlowType::Device {
+                device_auth_url: "https://auth.kimi.com/api/oauth/device_authorization",
+                token_url: "https://auth.kimi.com/api/oauth/token",
+                scopes: &["openid", "profile", "email"],
+            },
+        }),
     },
 ];
 
@@ -8258,11 +8281,33 @@ fn resolve_cli_auth_source_for_cwd() -> Result<AuthSource, api::ApiError> {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum OAuthFlowType {
+    Pkce {
+        authorize_url: &'static str,
+        token_url: &'static str,
+        scopes: &'static [&'static str],
+    },
+    Device {
+        device_auth_url: &'static str,
+        token_url: &'static str,
+        scopes: &'static [&'static str],
+    },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct ProviderOAuthConfig {
+    client_id: &'static str,
+    callback_port: u16,
+    flow: OAuthFlowType,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct BuiltinProvider {
     id: &'static str,
     label: &'static str,
     env_var: &'static str,
     default_model: &'static str,
+    oauth: Option<ProviderOAuthConfig>,
 }
 
 const BUILTIN_PROVIDERS: &[BuiltinProvider] = &[
@@ -8271,18 +8316,29 @@ const BUILTIN_PROVIDERS: &[BuiltinProvider] = &[
         label: "Anthropic (Claude)",
         env_var: "ANTHROPIC_API_KEY",
         default_model: "claude-opus-4-6",
+        oauth: None,
     },
     BuiltinProvider {
         id: "openai",
         label: "OpenAI",
         env_var: "OPENAI_API_KEY",
         default_model: "gpt-4o",
+        oauth: Some(ProviderOAuthConfig {
+            client_id: "app_EMoamEEZ73f0CkXaXp7hrann",
+            callback_port: 1455,
+            flow: OAuthFlowType::Pkce {
+                authorize_url: "https://auth.openai.com/oauth/authorize",
+                token_url: "https://auth.openai.com/oauth/token",
+                scopes: &["openid", "profile", "email", "offline_access"],
+            },
+        }),
     },
     BuiltinProvider {
         id: "xai",
         label: "xAI (Grok)",
         env_var: "XAI_API_KEY",
         default_model: "grok-3",
+        oauth: None,
     },
 ];
 
@@ -8291,8 +8347,14 @@ fn check_model_auth_available(model: &str) -> Result<bool, Box<dyn std::error::E
     let provider = detect_provider_kind(&resolved);
     let available = match provider {
         ProviderKind::Anthropic => anthropic_has_auth().unwrap_or(false),
-        ProviderKind::Xai => has_api_key("XAI_API_KEY"),
-        ProviderKind::OpenAi => has_api_key("OPENAI_API_KEY") || has_api_key("DASHSCOPE_API_KEY"),
+        ProviderKind::Xai => {
+            has_api_key("XAI_API_KEY")
+        }
+        ProviderKind::OpenAi => {
+            has_api_key("OPENAI_API_KEY")
+                || has_api_key("DASHSCOPE_API_KEY")
+                || runtime::load_provider_oauth("openai").ok().flatten().is_some()
+        }
     };
     Ok(available)
 }
@@ -8318,22 +8380,101 @@ fn run_provider_welcome(
          Choose a provider to authenticate with:\n"
     );
 
+    let builtin_count = BUILTIN_PROVIDERS.len();
+    let template_count = LOGIN_PROVIDER_TEMPLATES.len();
+    let total = builtin_count + template_count;
+
+    println!("  Built-in:");
     for (i, provider) in BUILTIN_PROVIDERS.iter().enumerate() {
-        println!("  {}. {} ({})", i + 1, provider.label, provider.env_var);
+        let oauth_tag = if provider.oauth.is_some() { " [OAuth]" } else { "" };
+        println!("  {}. {}{}", i + 1, provider.label, oauth_tag);
     }
 
-    print!("\nEnter number (1-{}): ", BUILTIN_PROVIDERS.len());
+    println!("\n  Additional providers:");
+    for (i, template) in LOGIN_PROVIDER_TEMPLATES.iter().enumerate() {
+        let oauth_tag = if template.oauth.is_some() { " [OAuth]" } else { "" };
+        println!(
+            "  {}. {}{}",
+            builtin_count + i + 1,
+            template.label,
+            oauth_tag
+        );
+    }
+
+    print!("\nEnter number (1-{total}): ");
     std::io::stdout().flush()?;
     let mut choice = String::new();
     std::io::stdin().read_line(&mut choice)?;
     let choice = choice.trim();
 
     let index: usize = choice.parse().map_err(|_| "invalid selection")?;
-    let provider = BUILTIN_PROVIDERS
-        .get(index.wrapping_sub(1))
-        .ok_or("invalid selection")?;
+    if index == 0 || index > total {
+        return Err("invalid selection".into());
+    }
 
-    print!("Enter {} (or press Enter to cancel): ", provider.env_var);
+    // Built-in provider selected
+    if index <= builtin_count {
+        let provider = BUILTIN_PROVIDERS.get(index - 1).expect("valid builtin index");
+
+        // Offer OAuth if available
+        if let Some(ref oauth) = provider.oauth {
+            if prompt_oauth_or_api_key(provider.label, true)? {
+                run_pkce_oauth_flow(provider.id, oauth)?;
+                return Ok(Some(format!("{}/{}", provider.id, provider.default_model)));
+            }
+        }
+
+        print!("Enter {} (or press Enter to cancel): ", provider.env_var);
+        std::io::stdout().flush()?;
+        let mut key = String::new();
+        std::io::stdin().read_line(&mut key)?;
+        let key = key.trim();
+
+        if key.is_empty() {
+            println!("Cancelled.");
+            return Ok(None);
+        }
+
+        std::env::set_var(provider.env_var, key);
+
+        // Optionally save to ~/.claw/settings.json as a simple model config.
+        if let Some(home) = std::env::var_os("HOME") {
+            let claw_dir = std::path::PathBuf::from(home).join(".claw");
+            if claw_dir.exists() || std::fs::create_dir_all(&claw_dir).is_ok() {
+                let settings_path = claw_dir.join("settings.json");
+                let model_str = format!("{}/{}", provider.id, provider.default_model);
+                let content = format!("{{\"model\": \"{model_str}\"}}");
+                let _ = std::fs::write(&settings_path, content);
+            }
+        }
+
+        return Ok(Some(format!("{}/{}", provider.id, provider.default_model)));
+    }
+
+    // Template provider selected
+    let template = LOGIN_PROVIDER_TEMPLATES
+        .get(index - builtin_count - 1)
+        .expect("valid template index");
+
+    // Offer OAuth if available
+    if let Some(ref oauth) = template.oauth {
+        if prompt_oauth_or_api_key(template.label, true)? {
+            match oauth.flow {
+                OAuthFlowType::Pkce { .. } => {
+                    run_pkce_oauth_flow(template.id, oauth)?;
+                }
+                OAuthFlowType::Device { .. } => {
+                    run_device_oauth_flow(template.id, oauth)?;
+                }
+            }
+            return Ok(Some(format!("{}/{}", template.id, template.default_model)));
+        }
+    }
+
+    print!(
+        "Enter {} (or press Enter to cancel): ",
+        template.api_key_env
+    );
     std::io::stdout().flush()?;
     let mut key = String::new();
     std::io::stdin().read_line(&mut key)?;
@@ -8344,65 +8485,376 @@ fn run_provider_welcome(
         return Ok(None);
     }
 
-    std::env::set_var(provider.env_var, key);
+    std::env::set_var(template.api_key_env, key);
+    save_model_provider_profile(
+        template.id,
+        template.provider_type,
+        template.base_url,
+        template.api_key_env,
+        Some(key),
+        &template.models.iter().map(|m| (*m).to_string()).collect::<Vec<_>>(),
+        template.default_model,
+    )?;
 
-    // Optionally save to ~/.claw/settings.json as a simple model config.
-    if let Some(home) = std::env::var_os("HOME") {
-        let claw_dir = std::path::PathBuf::from(home).join(".claw");
-        if claw_dir.exists() || std::fs::create_dir_all(&claw_dir).is_ok() {
-            let settings_path = claw_dir.join("settings.json");
-            let model_str = format!("{}/{}", provider.id, provider.default_model);
-            let content = format!("{{\"model\": \"{model_str}\"}}");
-            let _ = std::fs::write(&settings_path, content);
-        }
-    }
-
-    Ok(Some(format!("{}/{}", provider.id, provider.default_model)))
+    Ok(Some(format!("{}/{}", template.id, template.default_model)))
 }
 
 fn run_auth_command(provider: Option<&str>) -> Result<(), Box<dyn std::error::Error>> {
     if let Some(provider_id) = provider {
-        let builtin = BUILTIN_PROVIDERS
-            .iter()
-            .find(|p| p.id == provider_id)
-            .ok_or_else(|| format!("unknown provider: {provider_id}"))?;
+        // Try built-in provider first
+        if let Some(builtin) = BUILTIN_PROVIDERS.iter().find(|p| p.id == provider_id) {
+            if !std::io::stdin().is_terminal() || !std::io::stdout().is_terminal() {
+                return Err(format!(
+                    "Authentication requires a terminal. Set the environment variable instead:\n\
+                     \n\
+                     export {}=<key>",
+                    builtin.env_var
+                )
+                .into());
+            }
 
-        if !std::io::stdin().is_terminal() || !std::io::stdout().is_terminal() {
-            return Err(format!(
-                "Authentication requires a terminal. Set the environment variable instead:\n\
-                 \n\
-                 export {}=<key>",
-                builtin.env_var
-            )
-            .into());
-        }
+            // Offer OAuth if available
+            if let Some(ref oauth) = builtin.oauth {
+                if prompt_oauth_or_api_key(builtin.label, true)? {
+                    run_pkce_oauth_flow(builtin.id, oauth)?;
+                    println!("Authenticated with {} via OAuth.", builtin.label);
+                    return Ok(());
+                }
+            }
 
-        print!("Enter {} (or press Enter to cancel): ", builtin.env_var);
-        std::io::stdout().flush()?;
-        let mut key = String::new();
-        std::io::stdin().read_line(&mut key)?;
-        let key = key.trim();
+            print!("Enter {} (or press Enter to cancel): ", builtin.env_var);
+            std::io::stdout().flush()?;
+            let mut key = String::new();
+            std::io::stdin().read_line(&mut key)?;
+            let key = key.trim();
 
-        if key.is_empty() {
-            println!("Cancelled.");
+            if key.is_empty() {
+                println!("Cancelled.");
+                return Ok(());
+            }
+
+            std::env::set_var(builtin.env_var, key);
+            println!("Authentication set for {}.", builtin.label);
             return Ok(());
         }
 
-        std::env::set_var(builtin.env_var, key);
-        println!("Authentication set for {}.", builtin.label);
-        Ok(())
-    } else {
-        match run_provider_welcome(DEFAULT_MODEL)? {
-            Some(model) => {
-                println!("Authentication configured. Model set to {model}.");
-                Ok(())
+        // Try template provider
+        if let Some(template) = LOGIN_PROVIDER_TEMPLATES.iter().find(|p| p.id == provider_id) {
+            if !std::io::stdin().is_terminal() || !std::io::stdout().is_terminal() {
+                return Err(format!(
+                    "Authentication requires a terminal. Set the environment variable instead:\n\
+                     \n\
+                     export {}=<key>",
+                    template.api_key_env
+                )
+                .into());
             }
-            None => {
+
+            // Offer OAuth if available
+            if let Some(ref oauth) = template.oauth {
+                if prompt_oauth_or_api_key(template.label, true)? {
+                    match oauth.flow {
+                        OAuthFlowType::Pkce { .. } => {
+                            run_pkce_oauth_flow(template.id, oauth)?;
+                        }
+                        OAuthFlowType::Device { .. } => {
+                            run_device_oauth_flow(template.id, oauth)?;
+                        }
+                    }
+                    println!(
+                        "Authenticated with {label} via OAuth. Model: {id}/{model}",
+                        label = template.label,
+                        id = template.id,
+                        model = template.default_model
+                    );
+                    return Ok(());
+                }
+            }
+
+            print!(
+                "Enter {} (or press Enter to cancel): ",
+                template.api_key_env
+            );
+            std::io::stdout().flush()?;
+            let mut key = String::new();
+            std::io::stdin().read_line(&mut key)?;
+            let key = key.trim();
+
+            if key.is_empty() {
                 println!("Cancelled.");
-                Ok(())
+                return Ok(());
             }
+
+            std::env::set_var(template.api_key_env, key);
+            save_model_provider_profile(
+                template.id,
+                template.provider_type,
+                template.base_url,
+                template.api_key_env,
+                Some(key),
+                &template.models.iter().map(|m| (*m).to_string()).collect::<Vec<_>>(),
+                template.default_model,
+            )?;
+            println!(
+                "Authenticated with {label}. Model: {id}/{model}",
+                label = template.label,
+                id = template.id,
+                model = template.default_model
+            );
+            return Ok(());
+        }
+
+        return Err(format!(
+            "unknown provider: '{provider_id}'. Run `claw auth` to see available providers."
+        )
+        .into());
+    }
+
+    match run_provider_welcome(DEFAULT_MODEL)? {
+        Some(model) => {
+            println!("Authentication configured. Model set to {model}.");
+            Ok(())
+        }
+        None => {
+            println!("Cancelled.");
+            Ok(())
         }
     }
+}
+
+// ---------------------------------------------------------------------------
+// OAuth flow implementations
+// ---------------------------------------------------------------------------
+
+fn run_pkce_oauth_flow(
+    provider_id: &str,
+    oauth: &ProviderOAuthConfig,
+) -> Result<runtime::OAuthTokenSet, Box<dyn std::error::Error>> {
+    use runtime::{
+        generate_pkce_pair, generate_state, loopback_redirect_uri, open_browser,
+        run_oauth_callback_server, OAuthAuthorizationRequest, OAuthTokenExchangeRequest,
+    };
+
+    let pkce = generate_pkce_pair()?;
+    let state = generate_state()?;
+
+    let (authorize_url, token_url, scopes) = match oauth.flow {
+        OAuthFlowType::Pkce {
+            authorize_url,
+            token_url,
+            scopes,
+        } => (authorize_url, token_url, scopes),
+        _ => return Err("Expected PKCE flow".into()),
+    };
+
+    let config = runtime::OAuthConfig {
+        client_id: oauth.client_id.to_string(),
+        authorize_url: authorize_url.to_string(),
+        token_url: token_url.to_string(),
+        callback_port: Some(oauth.callback_port),
+        manual_redirect_url: None,
+        scopes: scopes.iter().map(|s| (*s).to_string()).collect(),
+    };
+
+    let auth_request =
+        OAuthAuthorizationRequest::from_config(&config, loopback_redirect_uri(oauth.callback_port), &state, &pkce);
+    let auth_url = auth_request.build_url();
+
+    println!("Opening browser for OAuth authentication...");
+    println!("If the browser doesn't open automatically, visit:");
+    println!("  {auth_url}");
+    open_browser(&auth_url)?;
+
+    println!("Waiting for authentication...");
+    let callback = run_oauth_callback_server(oauth.callback_port, std::time::Duration::from_secs(300))?;
+
+    if callback.state != state {
+        return Err("OAuth state mismatch. Possible CSRF attack.".into());
+    }
+
+    println!("Exchanging authorization code for tokens...");
+
+    let rt = tokio::runtime::Runtime::new()?;
+    let token_set = rt.block_on(async {
+        let client = reqwest::Client::new();
+        let exchange = OAuthTokenExchangeRequest::from_config(
+            &config,
+            &callback.code,
+            &state,
+            &pkce.verifier,
+            &loopback_redirect_uri(oauth.callback_port),
+        );
+
+        let response = client
+            .post(&config.token_url)
+            .form(&exchange.form_params())
+            .send()
+            .await
+            .map_err(|e| format!("Token exchange request failed: {e}"))?;
+
+        let status = response.status();
+        let body = response
+            .text()
+            .await
+            .map_err(|e| format!("Failed to read token response: {e}"))?;
+
+        if !status.is_success() {
+            return Err(format!("Token exchange failed ({status}): {body}").into());
+        }
+
+        let json: serde_json::Value = serde_json::from_str(&body)
+            .map_err(|e| format!("Invalid token response JSON: {e}"))?;
+
+        let access_token = json["access_token"]
+            .as_str()
+            .ok_or("access_token missing from response")?
+            .to_string();
+        let refresh_token = json["refresh_token"].as_str().map(String::from);
+        let expires_at = json["expires_in"].as_u64().map(|secs| {
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_secs()
+                + secs
+        });
+        let scopes = json["scope"]
+            .as_str()
+            .map(|s| s.split(' ').map(String::from).collect())
+            .unwrap_or_default();
+
+        Ok::<_, Box<dyn std::error::Error>>(runtime::OAuthTokenSet {
+            access_token,
+            refresh_token,
+            expires_at,
+            scopes,
+        })
+    })?;
+
+    runtime::save_provider_oauth(provider_id, &token_set)?;
+    println!("✓ OAuth authentication successful. Tokens saved.");
+
+    Ok(token_set)
+}
+
+fn run_device_oauth_flow(
+    provider_id: &str,
+    oauth: &ProviderOAuthConfig,
+) -> Result<runtime::OAuthTokenSet, Box<dyn std::error::Error>> {
+    use runtime::{open_browser, poll_device_token, DeviceAuthRequest};
+
+    let (device_auth_url, token_url, scopes) = match oauth.flow {
+        OAuthFlowType::Device {
+            device_auth_url,
+            token_url,
+            scopes,
+        } => (device_auth_url, token_url, scopes),
+        _ => return Err("Expected Device flow".into()),
+    };
+
+    let rt = tokio::runtime::Runtime::new()?;
+
+    // Step 1: Request device code
+    let device_response = rt.block_on(async {
+        let client = reqwest::Client::new();
+        let scope_str = scopes.join(" ");
+        let params = [
+            ("client_id", oauth.client_id),
+            ("scope", scope_str.as_str()),
+        ];
+        let response = client
+            .post(device_auth_url)
+            .form(&params)
+            .send()
+            .await
+            .map_err(|e| format!("Device auth request failed: {e}"))?;
+
+        let status = response.status();
+        let body = response
+            .text()
+            .await
+            .map_err(|e| format!("Failed to read device auth response: {e}"))?;
+
+        if !status.is_success() {
+            return Err(format!("Device auth failed ({status}): {body}").into());
+        }
+
+        let resp: runtime::DeviceAuthResponse = serde_json::from_str(&body)
+            .map_err(|e| format!("Invalid device auth response: {e}"))?;
+        Ok::<_, Box<dyn std::error::Error>>(resp)
+    })?;
+
+    println!("\nDevice authentication started.");
+    println!("User code: {}", device_response.user_code);
+    println!(
+        "Please visit: {}",
+        device_response
+            .verification_uri_complete
+            .as_deref()
+            .unwrap_or(&device_response.verification_uri)
+    );
+
+    if let Some(ref complete_uri) = device_response.verification_uri_complete {
+        open_browser(complete_uri)?;
+    } else {
+        open_browser(&device_response.verification_uri)?;
+    }
+
+    // Step 2: Poll for token
+    let start = std::time::Instant::now();
+    let expires_in = std::time::Duration::from_secs(device_response.expires_in);
+    let interval = std::time::Duration::from_secs(device_response.interval);
+
+    let token_set = rt.block_on(async {
+        let client = reqwest::Client::new();
+        loop {
+            if start.elapsed() > expires_in {
+                return Err::<_, Box<dyn std::error::Error>>(
+                    "Device authorization expired. Please try again.".into(),
+                );
+            }
+
+            tokio::time::sleep(interval).await;
+
+            match poll_device_token(
+                &client,
+                &device_response.device_code,
+                oauth.client_id,
+                token_url,
+            )
+            .await
+            {
+                Ok(Some(token_set)) => return Ok(token_set),
+                Ok(None) => {
+                    println!("Waiting for authorization...");
+                    continue;
+                }
+                Err(e) => return Err(e.into()),
+            }
+        }
+    })?;
+
+    runtime::save_provider_oauth(provider_id, &token_set)?;
+    println!("✓ OAuth authentication successful. Tokens saved.");
+
+    Ok(token_set)
+}
+
+fn prompt_oauth_or_api_key(provider_label: &str, has_oauth: bool) -> Result<bool, Box<dyn std::error::Error>> {
+    if !has_oauth {
+        return Ok(false);
+    }
+
+    println!("\nChoose authentication method for {provider_label}:");
+    println!("  1. Sign in with {provider_label} account (OAuth) — recommended");
+    println!("  2. Enter API key manually");
+    print!("Select [1]: ");
+    std::io::stdout().flush()?;
+
+    let mut choice = String::new();
+    std::io::stdin().read_line(&mut choice)?;
+    let choice = choice.trim();
+
+    Ok(choice.is_empty() || choice == "1")
 }
 
 impl ApiClient for AnthropicRuntimeClient {
