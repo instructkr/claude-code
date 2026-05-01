@@ -16,6 +16,10 @@ pub struct OAuthTokenSet {
     pub refresh_token: Option<String>,
     pub expires_at: Option<u64>,
     pub scopes: Vec<String>,
+    /// OpenID token from auth.openai.com, needed to extract `chatgpt_account_id`
+    /// for the WHAM backend (`ChatGPT-Account-Id` header).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub id_token: Option<String>,
 }
 
 /// PKCE verifier/challenge pair generated for an OAuth authorization flow.
@@ -93,6 +97,8 @@ struct StoredOAuthCredentials {
     expires_at: Option<u64>,
     #[serde(default)]
     scopes: Vec<String>,
+    #[serde(default)]
+    id_token: Option<String>,
 }
 
 impl From<OAuthTokenSet> for StoredOAuthCredentials {
@@ -102,6 +108,7 @@ impl From<OAuthTokenSet> for StoredOAuthCredentials {
             refresh_token: value.refresh_token,
             expires_at: value.expires_at,
             scopes: value.scopes,
+            id_token: value.id_token,
         }
     }
 }
@@ -113,6 +120,7 @@ impl From<StoredOAuthCredentials> for OAuthTokenSet {
             refresh_token: value.refresh_token,
             expires_at: value.expires_at,
             scopes: value.scopes,
+            id_token: value.id_token,
         }
     }
 }
@@ -615,11 +623,13 @@ pub async fn poll_device_token(
             .as_str()
             .map(|s| s.split(' ').map(String::from).collect())
             .unwrap_or_default();
+        let id_token = token["id_token"].as_str().map(String::from);
         return Ok(Some(OAuthTokenSet {
             access_token,
             refresh_token,
             expires_at,
             scopes,
+            id_token,
         }));
     }
 
@@ -761,6 +771,110 @@ fn base64url_encode(bytes: &[u8]) -> String {
         _ => {}
     }
     output
+}
+
+/// Extract `chatgpt_account_id` from a JWT payload (id_token or access_token).
+/// No signature verification — just base64-decode the payload section.
+pub fn extract_chatgpt_account_id(token: &str) -> Option<String> {
+    let payload_b64 = token.split('.').nth(1)?;
+    let payload_json = base64_decode_urlsafe(payload_b64).ok()?;
+    let payload: serde_json::Value = serde_json::from_slice(&payload_json).ok()?;
+
+    // 3-level fallback, matching Codex CLI behaviour:
+    // 1. top-level `chatgpt_account_id`
+    if let Some(id) = payload.get("chatgpt_account_id").and_then(|v| v.as_str()) {
+        return Some(id.to_string());
+    }
+    // 2. `https://api.openai.com/auth` -> `chatgpt_account_id`
+    if let Some(auth) = payload.get("https://api.openai.com/auth").and_then(|v| v.as_object()) {
+        if let Some(id) = auth.get("chatgpt_account_id").and_then(|v| v.as_str()) {
+            return Some(id.to_string());
+        }
+    }
+    // 3. `organizations[0].id`
+    if let Some(orgs) = payload.get("organizations").and_then(|v| v.as_array()) {
+        if let Some(first) = orgs.first() {
+            if let Some(id) = first.get("id").and_then(|v| v.as_str()) {
+                return Some(id.to_string());
+            }
+        }
+    }
+    None
+}
+
+fn base64_decode_urlsafe(input: &str) -> Result<Vec<u8>, String> {
+    let padded = match input.len() % 4 {
+        0 => input.to_string(),
+        2 => format!("{input}=="),
+        3 => format!("{input}="),
+        _ => return Err("invalid base64url length".to_string()),
+    };
+    let standard = padded.replace('-', "+").replace('_', "/");
+    base64::Engine::decode(&base64::engine::general_purpose::STANDARD, &standard)
+        .map_err(|e| e.to_string())
+}
+
+/// Refresh an OAuth token set using the refresh_token grant.
+/// Returns a new token set on success.
+pub async fn refresh_oauth_token(
+    client: &reqwest::Client,
+    token_url: &str,
+    client_id: &str,
+    refresh_token: &str,
+) -> io::Result<OAuthTokenSet> {
+    let params = [
+        ("grant_type", "refresh_token"),
+        ("client_id", client_id),
+        ("refresh_token", refresh_token),
+    ];
+
+    let response = client
+        .post(token_url)
+        .form(&params)
+        .send()
+        .await
+        .map_err(|e| io::Error::new(io::ErrorKind::Other, format!("HTTP request failed: {e}")))?;
+
+    let status = response.status();
+    let body = response.text().await.map_err(|e| {
+        io::Error::new(io::ErrorKind::Other, format!("Failed to read response body: {e}"))
+    })?;
+
+    if !status.is_success() {
+        return Err(io::Error::new(
+            io::ErrorKind::Other,
+            format!("Token refresh failed ({status}): {body}"),
+        ));
+    }
+
+    let token: serde_json::Value = serde_json::from_str(&body)
+        .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
+
+    let access_token = token["access_token"]
+        .as_str()
+        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "access_token missing from refresh response"))?
+        .to_string();
+    let refresh_token = token["refresh_token"].as_str().map(String::from);
+    let id_token = token["id_token"].as_str().map(String::from);
+    let expires_at = token["expires_in"].as_u64().map(|secs| {
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs()
+            + secs
+    });
+    let scopes = token["scope"]
+        .as_str()
+        .map(|s| s.split(' ').map(String::from).collect())
+        .unwrap_or_default();
+
+    Ok(OAuthTokenSet {
+        access_token,
+        refresh_token,
+        expires_at,
+        scopes,
+        id_token,
+    })
 }
 
 fn percent_encode(value: &str) -> String {
@@ -920,6 +1034,7 @@ mod tests {
             refresh_token: Some("refresh-token".to_string()),
             expires_at: Some(123),
             scopes: vec!["scope:a".to_string()],
+            id_token: None,
         };
         save_oauth_credentials(&token_set).expect("save credentials");
         assert_eq!(
@@ -969,12 +1084,14 @@ mod tests {
             refresh_token: Some("openai-refresh".to_string()),
             expires_at: Some(1000),
             scopes: vec!["openid".to_string()],
+            id_token: None,
         };
         let moonshot_tokens = OAuthTokenSet {
             access_token: "moonshot-access".to_string(),
             refresh_token: None,
             expires_at: Some(2000),
             scopes: vec!["profile".to_string()],
+            id_token: None,
         };
 
         save_provider_oauth("openai", &openai_tokens).expect("save openai");
@@ -1026,6 +1143,7 @@ mod tests {
             refresh_token: Some("legacy-refresh".to_string()),
             expires_at: Some(999),
             scopes: vec!["org:read".to_string()],
+            id_token: None,
         };
         save_oauth_credentials(&legacy).expect("save legacy");
 
@@ -1034,6 +1152,7 @@ mod tests {
             refresh_token: None,
             expires_at: Some(888),
             scopes: vec!["user:read".to_string()],
+            id_token: None,
         };
         save_provider_oauth("openai", &provider).expect("save provider");
 

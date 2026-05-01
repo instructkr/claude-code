@@ -707,6 +707,7 @@ fn resolve_saved_oauth_token_set(
         refresh_token: resolved.refresh_token.clone(),
         expires_at: resolved.expires_at,
         scopes: resolved.scopes.clone(),
+        id_token: None,
     })
     .map_err(ApiError::from)?;
     Ok(resolved)
@@ -1165,6 +1166,7 @@ mod tests {
             refresh_token: Some("refresh".to_string()),
             expires_at: Some(now_unix_timestamp() + 300),
             scopes: vec!["scope:a".to_string()],
+            id_token: None,
         })
         .expect("save oauth credentials");
 
@@ -1204,6 +1206,7 @@ mod tests {
             refresh_token: Some("refresh-token".to_string()),
             expires_at: Some(1),
             scopes: vec!["scope:a".to_string()],
+            id_token: None,
         })
         .expect("save expired oauth credentials");
 
@@ -1236,6 +1239,7 @@ mod tests {
             refresh_token: Some("refresh".to_string()),
             expires_at: Some(now_unix_timestamp() + 300),
             scopes: vec!["scope:a".to_string()],
+            id_token: None,
         })
         .expect("save oauth credentials");
 
@@ -1260,6 +1264,7 @@ mod tests {
             refresh_token: Some("refresh-token".to_string()),
             expires_at: Some(1),
             scopes: vec!["scope:a".to_string()],
+            id_token: None,
         })
         .expect("save expired oauth credentials");
 

@@ -113,12 +113,13 @@ pub use mcp_stdio::{
 };
 pub use oauth::{
     clear_oauth_credentials, clear_provider_oauth, code_challenge_s256, credentials_path,
-    generate_pkce_pair, generate_state, load_oauth_credentials, load_provider_oauth,
-    loopback_redirect_uri, loopback_redirect_uri_with_path, open_browser, parse_oauth_callback_query,
-    parse_oauth_callback_request_target, poll_device_token, run_oauth_callback_server,
-    save_oauth_credentials, save_provider_oauth, DeviceAuthRequest, DeviceAuthResponse,
-    OAuthAuthorizationRequest, OAuthCallbackParams, OAuthCallbackResult, OAuthRefreshRequest,
-    OAuthTokenExchangeRequest, OAuthTokenSet, PkceChallengeMethod, PkceCodePair,
+    extract_chatgpt_account_id, generate_pkce_pair, generate_state, load_oauth_credentials,
+    load_provider_oauth, loopback_redirect_uri, loopback_redirect_uri_with_path, open_browser,
+    parse_oauth_callback_query, parse_oauth_callback_request_target, poll_device_token,
+    refresh_oauth_token, run_oauth_callback_server, save_oauth_credentials, save_provider_oauth,
+    DeviceAuthRequest, DeviceAuthResponse, OAuthAuthorizationRequest, OAuthCallbackParams,
+    OAuthCallbackResult, OAuthRefreshRequest, OAuthTokenExchangeRequest, OAuthTokenSet,
+    PkceChallengeMethod, PkceCodePair,
 };
 pub use permissions::{
     PermissionContext, PermissionMode, PermissionOutcome, PermissionOverride, PermissionPolicy,

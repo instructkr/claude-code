@@ -2,6 +2,7 @@ use crate::error::ApiError;
 use crate::prompt_cache::{PromptCache, PromptCacheRecord, PromptCacheStats};
 use crate::providers::anthropic::{self, AnthropicClient, AuthSource};
 use crate::providers::openai_compat::{self, OpenAiCompatClient, OpenAiCompatConfig};
+use crate::providers::wham::{self, WhamClient};
 use crate::providers::{self, ProviderKind};
 use crate::types::{MessageRequest, MessageResponse, StreamEvent};
 
@@ -11,6 +12,8 @@ pub enum ProviderClient {
     Anthropic(AnthropicClient),
     Xai(OpenAiCompatClient),
     OpenAi(OpenAiCompatClient),
+    /// OpenAI WHAM backend (chatgpt.com/backend-api/wham) using ChatGPT OAuth tokens.
+    Wham(WhamClient),
 }
 
 impl ProviderClient {
@@ -42,13 +45,29 @@ impl ProviderClient {
                     Some(meta) if meta.auth_env == "MOONSHOT_API_KEY" => {
                         (OpenAiCompatConfig::moonshot(), Some("moonshot"))
                     }
-                    // OpenAI Platform API requires API keys, not OAuth tokens.
-                    // OAuth tokens from auth.openai.com are WHAM-backend tokens
-                    // (for chatgpt.com/backend-api) and return 401 on api.openai.com.
-                    _ => (OpenAiCompatConfig::openai(), None),
+                    _ => (OpenAiCompatConfig::openai(), Some("openai")),
                 };
                 // Try OAuth if the provider supports it and env var is not set
                 if let Some(provider_id) = oauth_provider_id {
+                    if provider_id == "openai" {
+                        // OpenAI OAuth tokens are WHAM-backend tokens (chatgpt.com/backend-api/wham),
+                        // NOT Platform API tokens. Route to WhamClient when using OAuth.
+                        if let Ok(Some(token_set)) = runtime::load_provider_oauth(provider_id) {
+                            let account_id = token_set
+                                .id_token
+                                .as_deref()
+                                .and_then(runtime::extract_chatgpt_account_id)
+                                .or_else(|| {
+                                    runtime::extract_chatgpt_account_id(&token_set.access_token)
+                                });
+                            return Ok(Self::Wham(WhamClient::from_oauth_token_set(
+                                token_set,
+                                account_id,
+                                "https://auth.openai.com/oauth/token",
+                                "app_EMoamEEZ73f0CkXaXp7hrann",
+                            )));
+                        }
+                    }
                     Ok(Self::OpenAi(OpenAiCompatClient::from_env_or_oauth(
                         config, provider_id,
                     )?))
@@ -82,7 +101,7 @@ impl ProviderClient {
         match self {
             Self::Anthropic(_) => ProviderKind::Anthropic,
             Self::Xai(_) => ProviderKind::Xai,
-            Self::OpenAi(_) => ProviderKind::OpenAi,
+            Self::OpenAi(_) | Self::Wham(_) => ProviderKind::OpenAi,
         }
     }
 
@@ -98,7 +117,7 @@ impl ProviderClient {
     pub fn prompt_cache_stats(&self) -> Option<PromptCacheStats> {
         match self {
             Self::Anthropic(client) => client.prompt_cache_stats(),
-            Self::Xai(_) | Self::OpenAi(_) => None,
+            Self::Xai(_) | Self::OpenAi(_) | Self::Wham(_) => None,
         }
     }
 
@@ -106,7 +125,7 @@ impl ProviderClient {
     pub fn take_last_prompt_cache_record(&self) -> Option<PromptCacheRecord> {
         match self {
             Self::Anthropic(client) => client.take_last_prompt_cache_record(),
-            Self::Xai(_) | Self::OpenAi(_) => None,
+            Self::Xai(_) | Self::OpenAi(_) | Self::Wham(_) => None,
         }
     }
 
@@ -117,6 +136,7 @@ impl ProviderClient {
         match self {
             Self::Anthropic(client) => client.send_message(request).await,
             Self::Xai(client) | Self::OpenAi(client) => client.send_message(request).await,
+            Self::Wham(client) => client.send_message(request).await,
         }
     }
 
@@ -133,6 +153,10 @@ impl ProviderClient {
                 .stream_message(request)
                 .await
                 .map(MessageStream::OpenAiCompat),
+            Self::Wham(client) => client
+                .stream_message(request)
+                .await
+                .map(MessageStream::Wham),
         }
     }
 }
@@ -141,6 +165,7 @@ impl ProviderClient {
 pub enum MessageStream {
     Anthropic(anthropic::MessageStream),
     OpenAiCompat(openai_compat::MessageStream),
+    Wham(wham::WhamMessageStream),
 }
 
 impl MessageStream {
@@ -149,6 +174,7 @@ impl MessageStream {
         match self {
             Self::Anthropic(stream) => stream.request_id(),
             Self::OpenAiCompat(stream) => stream.request_id(),
+            Self::Wham(stream) => stream.request_id(),
         }
     }
 
@@ -156,6 +182,7 @@ impl MessageStream {
         match self {
             Self::Anthropic(stream) => stream.next_event().await,
             Self::OpenAiCompat(stream) => stream.next_event().await,
+            Self::Wham(stream) => stream.next_event().await,
         }
     }
 }

@@ -6,6 +6,7 @@ license.workspace = true
 publish.workspace = true
 
 [dependencies]
+base64 = "0.22"
 sha2 = "0.10"
 glob = "0.3"
 plugins = { path = "../plugins" }
