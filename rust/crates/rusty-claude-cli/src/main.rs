@@ -424,6 +424,22 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
                 None
             };
             let effective_prompt = merge_prompt_with_stdin(&prompt, stdin_context.as_deref());
+
+            // If no auth is configured, show the welcome screen before running the prompt
+            if !check_model_auth_available(&model)? {
+                if let Some(welcome_model) = run_provider_welcome(&model)? {
+                    let model = if welcome_model.contains('/') || welcome_model != model {
+                        welcome_model
+                    } else {
+                        model
+                    };
+                    let mut cli = LiveCli::new(model, true, allowed_tools, permission_mode)?;
+                    cli.set_reasoning_effort(reasoning_effort);
+                    cli.run_turn_with_output(&effective_prompt, output_format, compact)?;
+                }
+                return Ok(());
+            }
+
             let mut cli = LiveCli::new(model, true, allowed_tools, permission_mode)?;
             cli.set_reasoning_effort(reasoning_effort);
             cli.run_turn_with_output(&effective_prompt, output_format, compact)?;
@@ -436,6 +452,9 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
                     "Provider saved. Run `claw --model {model}` or `/model {model}` to use it."
                 );
             }
+        }
+        CliAction::Auth { provider } => {
+            run_auth_command(provider.as_deref())?;
         }
         CliAction::Update => run_update()?,
         CliAction::Acp { output_format } => print_acp_status(output_format)?,
@@ -563,6 +582,9 @@ enum CliAction {
         output_format: CliOutputFormat,
     },
     Login,
+    Auth {
+        provider: Option<String>,
+    },
     Update,
     Acp {
         output_format: CliOutputFormat,
@@ -977,6 +999,10 @@ fn parse_args(args: &[String]) -> Result<CliAction, String> {
         "system-prompt" => parse_system_prompt_args(&rest[1..], output_format),
         "acp" => parse_acp_args(&rest[1..], output_format),
         "login" => Ok(CliAction::Login),
+        "auth" => {
+            let provider = rest.get(1).cloned();
+            Ok(CliAction::Auth { provider })
+        }
         "update" => parse_update_args(&rest[1..]),
         "logout" => Err(removed_auth_surface_error(rest[0].as_str())),
         "init" => Ok(CliAction::Init { output_format }),
@@ -1595,6 +1621,7 @@ fn suggest_similar_subcommand(input: &str) -> Option<Vec<String>> {
         "init",
         "export",
         "prompt",
+        "auth",
     ];
 
     let normalized_input = input.to_ascii_lowercase();
@@ -2123,6 +2150,280 @@ fn save_model_provider_profile(
         fs::set_permissions(&settings_path, permissions)?;
     }
     Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// Built-in providers for the welcome screen and `claw auth` command
+// ---------------------------------------------------------------------------
+
+struct BuiltinProvider {
+    id: &'static str,
+    label: &'static str,
+    env_var: &'static str,
+    provider_type: &'static str,
+    base_url: &'static str,
+    default_model: &'static str,
+}
+
+const BUILTIN_PROVIDERS: &[BuiltinProvider] = &[
+    BuiltinProvider {
+        id: "anthropic",
+        label: "Anthropic (Claude)",
+        env_var: "ANTHROPIC_API_KEY",
+        provider_type: "anthropic-compatible",
+        base_url: "https://api.anthropic.com",
+        default_model: "claude-opus-4-6",
+    },
+    BuiltinProvider {
+        id: "openai",
+        label: "OpenAI",
+        env_var: "OPENAI_API_KEY",
+        provider_type: "openai-compatible",
+        base_url: "https://api.openai.com/v1",
+        default_model: "gpt-5.5",
+    },
+    BuiltinProvider {
+        id: "xai",
+        label: "xAI (Grok)",
+        env_var: "XAI_API_KEY",
+        provider_type: "openai-compatible",
+        base_url: "https://api.x.ai/v1",
+        default_model: "grok-3",
+    },
+];
+
+/// Check whether authentication is available for the given model.
+/// Returns `true` if the required API key env var is set.
+fn check_model_auth_available(model: &str) -> Result<bool, Box<dyn std::error::Error>> {
+    // Custom provider configured in .claw.json (provider/model format)
+    if model.contains('/') {
+        match configured_provider_for_model(model) {
+            Ok(_) => return Ok(true),
+            Err(e) => {
+                let msg = e.to_string();
+                if msg.contains("requires env var") || msg.contains("requires apiKeyEnv or apiKey")
+                {
+                    return Ok(false);
+                }
+                return Err(e);
+            }
+        }
+    }
+
+    // Built-in provider
+    let resolved = api::resolve_model_alias(model);
+    match api::detect_provider_kind(&resolved) {
+        ProviderKind::Anthropic => Ok(api::anthropic_has_auth().unwrap_or(false)),
+        ProviderKind::Xai => Ok(api::has_api_key("XAI_API_KEY")),
+        ProviderKind::OpenAi => {
+            // OpenAI-compat path covers OpenAI, DashScope, and custom endpoints.
+            Ok(api::has_api_key("OPENAI_API_KEY") || api::has_api_key("DASHSCOPE_API_KEY"))
+        }
+    }
+}
+
+/// Interactive welcome screen shown when no provider auth is configured.
+/// Lets the user pick a provider, enter an API key, sets the env var,
+/// and optionally persists the provider profile to ~/.claw/settings.json.
+/// Returns the model string to use (e.g. "claude-opus-4-6" or "openai/gpt-5.5").
+fn run_provider_welcome(default_model: &str) -> Result<Option<String>, Box<dyn std::error::Error>> {
+    if !io::stdin().is_terminal() {
+        return Err(
+            "Authentication required. Set the appropriate API key env var and try again.\n\n\
+             Examples:\n\
+               export ANTHROPIC_API_KEY=sk-ant-...\n\
+               export OPENAI_API_KEY=sk-...\n\
+               export XAI_API_KEY=xai-..."
+                .into(),
+        );
+    }
+
+    println!();
+    println!("\x1b[38;5;196m \\x1b[0m \x1b[38;5;208mWelcome to Claw Code\x1b[0m 🦞");
+    println!();
+    println!("No API key found for the current model ({default_model}).");
+    println!("To get started, select a provider and enter your API key.");
+    println!();
+
+    // Build unified list: built-ins first, then login templates, then custom
+    let mut all_providers: Vec<(usize, &str, &str, &str)> = Vec::new();
+    for (i, p) in BUILTIN_PROVIDERS.iter().enumerate() {
+        all_providers.push((i + 1, p.id, p.label, p.env_var));
+    }
+    let builtin_count = BUILTIN_PROVIDERS.len();
+    for (i, p) in LOGIN_PROVIDER_TEMPLATES.iter().enumerate() {
+        all_providers.push((builtin_count + i + 1, p.id, p.label, p.api_key_env));
+    }
+    let template_count = LOGIN_PROVIDER_TEMPLATES.len();
+    let custom_index = builtin_count + template_count + 1;
+    all_providers.push((custom_index, "custom", "Custom compatible endpoint", "OPENAI_API_KEY"));
+
+    for (num, _id, label, env_var) in &all_providers {
+        println!("  [{num}] {label}  — env: {env_var}");
+    }
+    println!();
+
+    let choice = read_prompt("Select provider [1]: ")?;
+    let choice = if choice.trim().is_empty() {
+        1
+    } else {
+        choice.trim().parse::<usize>()?
+    };
+
+    if choice == custom_index {
+        // Custom endpoint — delegate to the existing login wizard
+        return run_login_wizard();
+    }
+
+    // Find selected provider
+    let selected = all_providers
+        .iter()
+        .find(|(num, ..)| *num == choice)
+        .ok_or_else(|| format!("invalid provider choice: {choice}"))?;
+
+    let provider_id = selected.1;
+
+    // Built-in provider
+    if let Some(builtin) = BUILTIN_PROVIDERS.iter().find(|p| p.id == provider_id) {
+        let api_key = read_prompt(&format!("Paste your {} API key (or press Enter to cancel): ", builtin.label))?;
+        let api_key = api_key.trim().to_string();
+        if api_key.is_empty() {
+            println!("Cancelled. Set the env var manually and try again.");
+            return Ok(None);
+        }
+        // Set env var for the current process so the REPL can continue immediately
+        env::set_var(builtin.env_var, &api_key);
+        println!();
+        println!("✓ API key set for {label}.", label = builtin.label);
+        println!(
+            "  Env var: {env}={stars}",
+            env = builtin.env_var,
+            stars = "*".repeat(api_key.len().min(8))
+        );
+        // Optionally save as a provider profile so it persists across sessions
+        let save = read_prompt("Save this provider to ~/.claw/settings.json? [Y/n]: ")?;
+        if !save.trim().eq_ignore_ascii_case("n") {
+            save_model_provider_profile(
+                builtin.id,
+                builtin.provider_type,
+                builtin.base_url,
+                builtin.env_var,
+                Some(&api_key),
+                &[builtin.default_model.to_string()],
+                builtin.default_model,
+            )?;
+            println!("  Provider profile saved.");
+            return Ok(Some(format!("{}/{}", builtin.id, builtin.default_model)));
+        }
+        return Ok(Some(builtin.default_model.to_string()));
+    }
+
+    // Template provider from LOGIN_PROVIDER_TEMPLATES
+    if let Some(template) = LOGIN_PROVIDER_TEMPLATES.iter().find(|p| p.id == provider_id) {
+        let api_key = read_prompt(&format!("Paste your {} API key (or press Enter to cancel): ", template.label))?;
+        let api_key = api_key.trim().to_string();
+        if api_key.is_empty() {
+            println!("Cancelled. Set the env var manually and try again.");
+            return Ok(None);
+        }
+        env::set_var(template.api_key_env, &api_key);
+        println!();
+        println!("✓ API key set for {label}.", label = template.label);
+        save_model_provider_profile(
+            template.id,
+            template.provider_type,
+            template.base_url,
+            template.api_key_env,
+            Some(&api_key),
+            &template.models.iter().map(|m| (*m).to_string()).collect::<Vec<_>>(),
+            template.default_model,
+        )?;
+        println!("  Provider profile saved.");
+        return Ok(Some(format!("{}/{}", template.id, template.default_model)));
+    }
+
+    Err(format!("unknown provider: {provider_id}").into())
+}
+
+/// CLI handler for `claw auth [PROVIDER]`.
+/// If a provider id is given, authenticate directly.
+/// Otherwise show the interactive provider picker.
+fn run_auth_command(provider: Option<&str>) -> Result<(), Box<dyn std::error::Error>> {
+    if !io::stdin().is_terminal() {
+        return Err("auth requires an interactive terminal".into());
+    }
+
+    match provider {
+        Some(id) => {
+            // Built-in provider
+            if let Some(builtin) = BUILTIN_PROVIDERS.iter().find(|p| p.id == id) {
+                let api_key =
+                    read_prompt(&format!("Paste your {} API key (or press Enter to cancel): ", builtin.label))?;
+                let api_key = api_key.trim().to_string();
+                if api_key.is_empty() {
+                    println!("Cancelled.");
+                    return Ok(());
+                }
+                env::set_var(builtin.env_var, &api_key);
+                save_model_provider_profile(
+                    builtin.id,
+                    builtin.provider_type,
+                    builtin.base_url,
+                    builtin.env_var,
+                    Some(&api_key),
+                    &[builtin.default_model.to_string()],
+                    builtin.default_model,
+                )?;
+                println!(
+                    "Authenticated with {label}. Model: {id}/{model}",
+                    label = builtin.label,
+                    id = builtin.id,
+                    model = builtin.default_model
+                );
+                return Ok(());
+            }
+            // Template provider
+            if let Some(template) = LOGIN_PROVIDER_TEMPLATES.iter().find(|p| p.id == id) {
+                let api_key =
+                    read_prompt(&format!("Paste your {} API key (or press Enter to cancel): ", template.label))?;
+                let api_key = api_key.trim().to_string();
+                if api_key.is_empty() {
+                    println!("Cancelled.");
+                    return Ok(());
+                }
+                env::set_var(template.api_key_env, &api_key);
+                save_model_provider_profile(
+                    template.id,
+                    template.provider_type,
+                    template.base_url,
+                    template.api_key_env,
+                    Some(&api_key),
+                    &template.models.iter().map(|m| (*m).to_string()).collect::<Vec<_>>(),
+                    template.default_model,
+                )?;
+                println!(
+                    "Authenticated with {label}. Model: {id}/{model}",
+                    label = template.label,
+                    id = template.id,
+                    model = template.default_model
+                );
+                return Ok(());
+            }
+            return Err(format!(
+                "unknown provider: '{id}'. Run `claw auth` to see available providers."
+            )
+            .into());
+        }
+        None => {
+            // Interactive picker — reuse the welcome flow with a default model
+            let default_model = config_model_for_current_dir()
+                .unwrap_or_else(|| DEFAULT_MODEL.to_string());
+            if let Some(model) = run_provider_welcome(&default_model)? {
+                println!("Authenticated. Run `claw --model {model}` to use it.");
+            }
+            Ok(())
+        }
+    }
 }
 
 /// Validate model syntax at parse time.
@@ -4460,6 +4761,31 @@ fn run_repl(
     enforce_broad_cwd_policy(allow_broad_cwd, CliOutputFormat::Text)?;
     run_stale_base_preflight(base_commit.as_deref());
     let resolved_model = resolve_repl_model(model);
+
+    // If no auth is configured for the resolved model, show the welcome screen
+    // so the user can pick a provider and enter an API key without leaving claw.
+    if !check_model_auth_available(&resolved_model)? {
+        if let Some(welcome_model) = run_provider_welcome(&resolved_model)? {
+            // If the welcome screen selected a different model (e.g. a profiled
+            // provider), use it. Otherwise keep the original resolved model.
+            let new_model = if welcome_model.contains('/') || welcome_model != resolved_model {
+                welcome_model
+            } else {
+                resolved_model
+            };
+            return run_repl(
+                new_model,
+                allowed_tools,
+                permission_mode,
+                base_commit,
+                reasoning_effort,
+                allow_broad_cwd,
+            );
+        }
+        // User cancelled the welcome screen
+        return Ok(());
+    }
+
     let mut cli = LiveCli::new(resolved_model, true, allowed_tools, permission_mode)?;
 
     // Read config for LSP auto-start setting
@@ -10082,6 +10408,12 @@ fn print_help_to(out: &mut impl Write) -> io::Result<()> {
         out,
         "      Configure an OpenAI-compatible model provider profile"
     )?;
+    writeln!(out, "  claw auth [PROVIDER]")?;
+    writeln!(
+        out,
+        "      Authenticate with a model provider (openai, anthropic, xai, etc.)"
+    )?;
+    writeln!(out, "      If PROVIDER is omitted, shows an interactive provider picker.")?;
     writeln!(out, "  claw update")?;
     writeln!(
         out,
@@ -14772,4 +15104,35 @@ mod dump_manifests_tests {
 
         let _ = fs::remove_dir_all(&root);
     }
+}
+
+
+#[cfg(test)]
+mod auth_tests {
+    use super::{check_model_auth_available, parse_args, CliAction};
+
+    // ------------------------------------------------------------------
+    // parse_args auth subcommand
+    // ------------------------------------------------------------------
+
+    #[test]
+    fn parse_args_auth_without_provider() {
+        let args = vec!["auth".to_string()];
+        let action = parse_args(&args).expect("should parse");
+        match action {
+            CliAction::Auth { provider } => assert!(provider.is_none()),
+            other => panic!("expected CliAction::Auth, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parse_args_auth_with_provider() {
+        let args = vec!["auth".to_string(), "openai".to_string()];
+        let action = parse_args(&args).expect("should parse");
+        match action {
+            CliAction::Auth { provider } => assert_eq!(provider, Some("openai".to_string())),
+            other => panic!("expected CliAction::Auth, got {other:?}"),
+        }
+    }
+
 }
