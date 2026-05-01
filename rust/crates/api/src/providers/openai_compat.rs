@@ -139,6 +139,31 @@ impl OpenAiCompatClient {
         Ok(Self::new(api_key, config))
     }
 
+    /// Create a client using an OAuth access token instead of an API key.
+    /// The token is sent as `Authorization: Bearer {token}`.
+    #[must_use]
+    pub fn from_oauth_token(token: impl Into<String>, config: OpenAiCompatConfig) -> Self {
+        Self::new(token, config)
+    }
+
+    /// Try env var first, then fall back to saved OAuth token for the provider.
+    /// `provider_id` is the key used in `~/.claw/credentials.json` under `oauth_providers`.
+    pub fn from_env_or_oauth(
+        config: OpenAiCompatConfig,
+        provider_id: &str,
+    ) -> Result<Self, ApiError> {
+        if let Some(api_key) = read_env_non_empty(config.api_key_env)? {
+            return Ok(Self::new(api_key, config));
+        }
+        if let Ok(Some(token_set)) = runtime::load_provider_oauth(provider_id) {
+            return Ok(Self::from_oauth_token(token_set.access_token, config));
+        }
+        Err(ApiError::missing_credentials(
+            config.provider_name,
+            config.credential_env_vars(),
+        ))
+    }
+
     #[must_use]
     pub fn with_base_url(mut self, base_url: impl Into<String>) -> Self {
         self.base_url = base_url.into();
