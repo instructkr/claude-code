@@ -5567,13 +5567,24 @@ impl AnthropicRuntimeClient {
                             input.push_str(&partial_json);
                         }
                     }
-                    ContentBlockDelta::ThinkingDelta { .. } => {
+                    ContentBlockDelta::ThinkingDelta { thinking } => {
                         if !block_has_thinking_summary {
                             render_thinking_block_summary(out, None, false)?;
                             block_has_thinking_summary = true;
                         }
+                        if !thinking.is_empty() {
+                            events.push(AssistantEvent::ThinkingDelta {
+                                thinking,
+                                signature: None,
+                            });
+                        }
                     }
-                    ContentBlockDelta::SignatureDelta { .. } => {}
+                    ContentBlockDelta::SignatureDelta { signature } => {
+                        events.push(AssistantEvent::ThinkingDelta {
+                            thinking: String::new(),
+                            signature: Some(signature),
+                        });
+                    }
                 },
                 ApiStreamEvent::ContentBlockStop(_) => {
                     block_has_thinking_summary = false;
@@ -5614,6 +5625,7 @@ impl AnthropicRuntimeClient {
             && events.iter().any(|event| {
                 matches!(event, AssistantEvent::TextDelta(text) if !text.is_empty())
                     || matches!(event, AssistantEvent::ToolUse { .. })
+                    || matches!(event, AssistantEvent::ThinkingDelta { thinking, .. } if !thinking.is_empty())
             })
         {
             events.push(AssistantEvent::MessageStop);
@@ -6495,13 +6507,20 @@ fn push_output_block(
             };
             *pending_tool = Some((id, name, initial_input));
         }
-        OutputContentBlock::Thinking { thinking, .. } => {
+        OutputContentBlock::Thinking { thinking, signature } => {
             render_thinking_block_summary(out, Some(thinking.chars().count()), false)?;
             *block_has_thinking_summary = true;
+            if !thinking.is_empty() {
+                events.push(AssistantEvent::ThinkingDelta {
+                    thinking,
+                    signature,
+                });
+            }
         }
         OutputContentBlock::RedactedThinking { .. } => {
             render_thinking_block_summary(out, None, true)?;
             *block_has_thinking_summary = true;
+            // Redacted thinking is intentionally not emitted as content
         }
     }
     Ok(())
